@@ -1,0 +1,11 @@
+.env
+.venv
+volumes/
+
+# Bỏ qua các file rác của Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.vscode/
+.idea/
