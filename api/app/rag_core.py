@@ -3,24 +3,29 @@ import logging
 import sys
 import time
 
+# LangChain Imports
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_milvus import Milvus
+# Assuming langchain_classic is your local folder/module. 
+# If not, change to: from langchain.chains import ...
 from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 
 # --- CONFIGURATION FROM ENV ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-2.0-flash")
-FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gemma2:2b")
+# Defaulting to 'gemini-1.5-flash' or 'gemini-2.0-flash' if available
+PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-1.5-flash") 
+# Default changed to a lighter model to prevent OOM/Timeouts
+FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gemma2:2b") 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_demo")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "embeddinggemma")
 
-
+# Logging Setup
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ConversationalRAG:
@@ -34,15 +39,19 @@ class ConversationalRAG:
         self.rag_chain_primary = None
         self.rag_chain_fallback = None
 
+        # Initialize Primary Chain
         try:
             if self.primary_llm and self.retriever:
                 self.rag_chain_primary = self._create_full_rag_chain(self.primary_llm)
+                logging.info("✓ Primary Chain (Gemini) initialized.")
         except Exception as e:
             logging.warning(f"Cannot initialize Primary RAG chain: {e}")
 
+        # Initialize Fallback Chain
         try:
             if self.fallback_llm and self.retriever:
                 self.rag_chain_fallback = self._create_full_rag_chain(self.fallback_llm)
+                logging.info("✓ Fallback Chain (Ollama) initialized.")
         except Exception as e:
             logging.warning(f"Cannot initialize Fallback RAG chain: {e}")
             
@@ -54,10 +63,18 @@ class ConversationalRAG:
     def _init_primary_llm(self):
         try:
             logging.info(f"Loading Primary LLM: {PRIMARY_LLM_MODEL}")
+            # CRITICAL FIX: Disable Safety Filters to prevent empty responses causing KeyErrors
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            }
             return ChatGoogleGenerativeAI(
                 model=PRIMARY_LLM_MODEL, 
                 google_api_key=GOOGLE_API_KEY,
-                temperature=0.3
+                temperature=0.3,
+                safety_settings=safety_settings
             )
         except Exception as e:
             logging.error(f"Failed to load Gemini: {e}")
@@ -70,6 +87,7 @@ class ConversationalRAG:
                 model=FALLBACK_LLM_MODEL, 
                 base_url=OLLAMA_BASE_URL,
                 temperature=0.3
+                # keep_alive="5m" # Optional: keep model in memory for 5 mins
             )
         except Exception as e:
             logging.error(f"Failed to load Ollama: {e}")
@@ -99,6 +117,8 @@ class ConversationalRAG:
                     auto_id=True
                 )
                 
+                # Force a check to ensure connection is real
+                # vector_store.col.num_entities # Accessing this property triggers a connection check
                 logging.info("✓ Connected to Milvus Collection.")
                 
                 return vector_store.as_retriever(
@@ -163,19 +183,36 @@ class ConversationalRAG:
         logging.info(f"Processing question: {user_input}")
         chain_input = {"input": user_input, "chat_history": chat_history}
         
+        # --- ATTEMPT 1: PRIMARY CHAIN (GEMINI) ---
         if self.rag_chain_primary:
             try:
                 logging.info("Invoking Primary Chain (Gemini)...")
-                return self.rag_chain_primary.invoke(chain_input)
+                result = self.rag_chain_primary.invoke(chain_input)
+                
+                # Check validity of result
+                if isinstance(result, dict) and "answer" in result:
+                    return result
+                else:
+                    logging.warning(f"Gemini returned invalid format: {result}")
+                    raise ValueError("Invalid Gemini Response format")
+
             except Exception as e:
                 logging.error(f"Gemini Error: {e}. Switching to Fallback...")
         
+        # --- ATTEMPT 2: FALLBACK CHAIN (OLLAMA) ---
         if self.rag_chain_fallback:
             try:
                 logging.info("Invoking Fallback Chain (Ollama)...")
-                return self.rag_chain_fallback.invoke(chain_input)
+                result = self.rag_chain_fallback.invoke(chain_input)
+                
+                if isinstance(result, dict) and "answer" in result:
+                    return result
+                else:
+                    logging.error(f"Ollama returned invalid format: {result}")
+                    return {"answer": "Error: Fallback model produced invalid output."}
+                    
             except Exception as e:
                 logging.error(f"Ollama Error: {e}")
-                return {"answer": "Error: Both systems failed."}
+                return {"answer": "Error: Both systems failed to process request."}
         
-        return {"answer": "System not initialized."}
+        return {"answer": "System not initialized. Check logs."}
