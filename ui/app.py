@@ -4,7 +4,7 @@ import os
 import time
 
 # Page Configuration
-st.set_page_config(page_title="Financial RAG Agent", layout="wide")
+st.set_page_config(page_title="Financial RAG Agent", layout="wide", page_icon="📈")
 
 # --- API CONFIGURATION ---
 # Use 'http://api:8000' if running via Docker Compose (service name 'api')
@@ -30,7 +30,7 @@ with st.sidebar:
         if not uploaded_files:
             st.warning("Please select files first.")
         else:
-            with st.spinner(f"Processing {len(uploaded_files)} files..."):
+            with st.spinner(f"Uploading and processing {len(uploaded_files)} files..."):
                 try:
                     # Prepare file list for multipart/form-data
                     files_payload = [
@@ -42,7 +42,7 @@ with st.sidebar:
                     
                     if response.status_code == 200:
                         st.success(f"Success! {response.json().get('message', '')}")
-                        # Clear history to avoid stale context
+                        # Clear history to avoid stale context since data has changed
                         st.session_state.messages = [] 
                     else:
                         st.error(f"Server Error: {response.text}")
@@ -111,7 +111,7 @@ if prompt := st.chat_input("Ex: What is the revenue of VTS in 2025?"):
                 answer = f"API Error ({response.status_code}): {response.text}"
                 
         except requests.exceptions.ConnectionError:
-            answer = f"Cannot connect to Backend at {CHAT_ENDPOINT}."
+            answer = f"Cannot connect to Backend at {CHAT_ENDPOINT}. Is the API container running?"
         except requests.exceptions.ReadTimeout:
             answer = "Request timed out. The model is taking too long to respond."
         except Exception as e:
