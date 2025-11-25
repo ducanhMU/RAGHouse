@@ -3,23 +3,27 @@ import logging
 import sys
 import time
 
-# LangChain Imports
+# --- LangChain Imports ---
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_milvus import Milvus
-# Assuming langchain_classic is your local folder/module. 
-# If not, change to: from langchain.chains import ...
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+
+# --- Tools & Agents Imports ---
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain.tools.retriever import create_retriever_tool
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain import hub
 
 # --- CONFIGURATION FROM ENV ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# Defaulting to 'gemini-1.5-flash' or 'gemini-2.0-flash' if available
-PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-1.5-flash") 
-# Default changed to a lighter model to prevent OOM/Timeouts
-FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gemma2:2b") 
+# Defaulting to 'gemini-2.0-flash' for speed and cost efficiency
+PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-2.0-flash") 
+FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gpt-oss:20b") 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+
+# Database Config
 MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_demo")
@@ -30,40 +34,56 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s -
 
 class ConversationalRAG:
     def __init__(self):
-        logging.info("Initializing ConversationalRAG...")
+        logging.info("Initializing ConversationalRAG with Agentic capabilities...")
 
+        # 1. Initialize LLMs
         self.primary_llm = self._init_primary_llm()
         self.fallback_llm = self._init_fallback_llm()
+        
+        # 2. Initialize Retriever (Connection to Milvus)
         self.retriever = self._init_retriever()
         
-        self.rag_chain_primary = None
-        self.rag_chain_fallback = None
+        # 3. Initialize Tools (Search + Knowledge Base)
+        self.tools = self._init_tools()
+        
+        # 4. Initialize History Awareness Chains
+        # These chains are responsible for rewriting questions based on chat history
+        self.history_chain_primary = None
+        self.history_chain_fallback = None
 
-        # Initialize Primary Chain
-        try:
-            if self.primary_llm and self.retriever:
-                self.rag_chain_primary = self._create_full_rag_chain(self.primary_llm)
-                logging.info("✓ Primary Chain (Gemini) initialized.")
-        except Exception as e:
-            logging.warning(f"Cannot initialize Primary RAG chain: {e}")
+        if self.primary_llm:
+            self.history_chain_primary = self._create_history_chain(self.primary_llm)
+        if self.fallback_llm:
+            self.history_chain_fallback = self._create_history_chain(self.fallback_llm)
 
-        # Initialize Fallback Chain
+        # 5. Initialize Agents (ReAct Executors)
+        self.agent_executor_primary = None
+        self.agent_executor_fallback = None
+
         try:
-            if self.fallback_llm and self.retriever:
-                self.rag_chain_fallback = self._create_full_rag_chain(self.fallback_llm)
-                logging.info("✓ Fallback Chain (Ollama) initialized.")
+            if self.primary_llm and self.tools:
+                self.agent_executor_primary = self._create_agent_executor(self.primary_llm)
+                logging.info("Primary Agent (Gemini + Tools) initialized.")
         except Exception as e:
-            logging.warning(f"Cannot initialize Fallback RAG chain: {e}")
+            logging.warning(f"Cannot initialize Primary Agent: {e}")
+
+        try:
+            if self.fallback_llm and self.tools:
+                self.agent_executor_fallback = self._create_agent_executor(self.fallback_llm)
+                logging.info("Fallback Agent (Ollama + Tools) initialized.")
+        except Exception as e:
+            logging.warning(f"Cannot initialize Fallback Agent: {e}")
             
-        if not self.rag_chain_primary and not self.rag_chain_fallback:
-            logging.error("CRITICAL: No RAG chains available.")
+        if not self.agent_executor_primary and not self.agent_executor_fallback:
+            logging.error("CRITICAL: No Agents available.")
         else:
             logging.info("ConversationalRAG is ready.")
 
     def _init_primary_llm(self):
+        """Initializes Google Gemini with safety filters disabled."""
         try:
             logging.info(f"Loading Primary LLM: {PRIMARY_LLM_MODEL}")
-            # CRITICAL FIX: Disable Safety Filters to prevent empty responses causing KeyErrors
+            # Disable safety filters to prevent empty responses on benign topics
             safety_settings = {
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -73,7 +93,7 @@ class ConversationalRAG:
             return ChatGoogleGenerativeAI(
                 model=PRIMARY_LLM_MODEL, 
                 google_api_key=GOOGLE_API_KEY,
-                temperature=0.3,
+                temperature=0.3, # Low temp for factual accuracy
                 safety_settings=safety_settings
             )
         except Exception as e:
@@ -81,19 +101,20 @@ class ConversationalRAG:
             return None
 
     def _init_fallback_llm(self):
+        """Initializes Local Ollama Model."""
         try:
             logging.info(f"Loading Fallback LLM: {FALLBACK_LLM_MODEL}")
             return ChatOllama(
                 model=FALLBACK_LLM_MODEL, 
                 base_url=OLLAMA_BASE_URL,
-                temperature=0.3
-                # keep_alive="5m" # Optional: keep model in memory for 5 mins
+                temperature=0.1 # Very low temp for stable tool calling
             )
         except Exception as e:
             logging.error(f"Failed to load Ollama: {e}")
             return None
 
     def _init_retriever(self):
+        """Initializes connection to Milvus Vector DB."""
         logging.info("Initializing Retriever connection...")
         embeddings = OllamaEmbeddings(
             model=EMBEDDING_MODEL_NAME,
@@ -113,20 +134,16 @@ class ConversationalRAG:
                     collection_name=MILVUS_COLLECTION_NAME,
                     connection_args={"uri": URI},
                     consistency_level="Strong",
-                    index_params={"metric_type": "L2"},
                     auto_id=True
                 )
                 
-                # Force a check to ensure connection is real
-                # vector_store.col.num_entities # Accessing this property triggers a connection check
-                logging.info("✓ Connected to Milvus Collection.")
+                # Check connection
+                # vector_store.col.num_entities 
+                logging.info("Connected to Milvus Collection.")
                 
                 return vector_store.as_retriever(
                     search_type="similarity",
-                    search_kwargs={
-                        'k': 3, 
-                        'param': {'ef': 64} 
-                    }
+                    search_kwargs={'k': 3}
                 )
                 
             except Exception as e:
@@ -137,82 +154,111 @@ class ConversationalRAG:
                     logging.error("Failed to connect to Milvus after retries")
                     return None
 
-    def _create_full_rag_chain(self, llm):
-        # 1. Contextualize History
+    def _init_tools(self):
+        """Defines the tools available to the Agent."""
+        tools = []
+        
+        # 1. Internet Search Tool (DuckDuckGo)
+        try:
+            search_tool = DuckDuckGoSearchRun(
+                name="internet_search",
+                description="Useful for when you need to answer questions about current events, news, realtime data, or topics NOT found in the internal database."
+            )
+            tools.append(search_tool)
+            logging.info("Internet Search tool loaded.")
+        except Exception as e:
+            logging.error(f"Failed to load Search Tool: {e}")
+
+        # 2. Internal Knowledge Tool (Milvus)
+        if self.retriever:
+            retriever_tool = create_retriever_tool(
+                self.retriever,
+                "internal_knowledge_base",
+                "Useful for searching internal uploaded documents, company reports, and specific private data stored in Milvus."
+            )
+            tools.append(retriever_tool)
+            logging.info("Milvus Retriever tool loaded.")
+            
+        return tools
+
+    def _create_history_chain(self, llm):
+        """Creates a chain to rewrite user questions based on history."""
         contextualize_q_system_prompt = (
             "Given a chat history and the latest user question "
             "which might reference context in the chat history, "
             "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
+            "without the chat history. \n"
+            "Do NOT answer the question, just reformulate it if needed and otherwise return it as is."
         )
         contextualize_q_prompt = ChatPromptTemplate.from_messages([
             ("system", contextualize_q_system_prompt),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
         ])
-        history_aware_retriever = create_history_aware_retriever(
-            llm, self.retriever, contextualize_q_prompt
-        )
+        
+        return contextualize_q_prompt | llm | StrOutputParser()
 
-        # 2. Answer Question
-        qa_system_prompt = (
-            "You are a helpful AI assistant. "
-            "Use the following pieces of retrieved context to answer the question. "
-            "\n\n"
-            "{context}"
-            "\n\n"
-            "INSTRUCTIONS:"
-            "\n1. If the context provides the answer, use it to answer in detail."
-            "\n2. If the context is missing, empty, or not relevant, "
-            "you MUST answer using your own internal knowledge."
-            "\n3. CRITICAL: If you answer without using the provided context, "
-            "start your response with: 'I don't have context, please be careful or find other sources'."
-            "\n4. Provide a comprehensive answer. Do not limit length."
+    def _create_agent_executor(self, llm):
+        """Creates a ReAct Agent Executor."""
+        prompt = hub.pull("hwchase17/react")
+        agent = create_react_agent(llm, self.tools, prompt)
+        return AgentExecutor(
+            agent=agent, 
+            tools=self.tools, 
+            verbose=True, 
+            handle_parsing_errors=True,
+            max_iterations=5
         )
-        qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", qa_system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-        ])
-        question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-
-        return create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
     def invoke(self, user_input, chat_history):
-        logging.info(f"Processing question: {user_input}")
-        chain_input = {"input": user_input, "chat_history": chat_history}
+        """
+        Main entry point.
+        1. Contextualize (Rewrite) the question using history.
+        2. Pass the rewritten question to the Agent.
+        """
+        logging.info(f"Original Input: {user_input}")
         
-        # --- ATTEMPT 1: PRIMARY CHAIN (GEMINI) ---
-        if self.rag_chain_primary:
-            try:
-                logging.info("Invoking Primary Chain (Gemini)...")
-                result = self.rag_chain_primary.invoke(chain_input)
-                
-                # Check validity of result
-                if isinstance(result, dict) and "answer" in result:
-                    return result
-                else:
-                    logging.warning(f"Gemini returned invalid format: {result}")
-                    raise ValueError("Invalid Gemini Response format")
+        refined_query = user_input
 
-            except Exception as e:
-                logging.error(f"Gemini Error: {e}. Switching to Fallback...")
-        
-        # --- ATTEMPT 2: FALLBACK CHAIN (OLLAMA) ---
-        if self.rag_chain_fallback:
+        # --- STEP 1: QUERY REFINEMENT (HISTORY AWARENESS) ---
+        if chat_history and len(chat_history) > 0:
+            logging.info("History detected. Reformulating question...")
             try:
-                logging.info("Invoking Fallback Chain (Ollama)...")
-                result = self.rag_chain_fallback.invoke(chain_input)
-                
-                if isinstance(result, dict) and "answer" in result:
-                    return result
-                else:
-                    logging.error(f"Ollama returned invalid format: {result}")
-                    return {"answer": "Error: Fallback model produced invalid output."}
-                    
+                # Prefer Primary LLM for better reformulation logic
+                if self.history_chain_primary:
+                    refined_query = self.history_chain_primary.invoke({
+                        "chat_history": chat_history,
+                        "input": user_input
+                    })
+                elif self.history_chain_fallback:
+                    refined_query = self.history_chain_fallback.invoke({
+                        "chat_history": chat_history,
+                        "input": user_input
+                    })
+                logging.info(f"Refined Query: {refined_query}")
             except Exception as e:
-                logging.error(f"Ollama Error: {e}")
-                return {"answer": "Error: Both systems failed to process request."}
+                logging.error(f"Failed to contextualize query: {e}. Using original input.")
+        
+        # --- STEP 2: AGENT EXECUTION ---
+        chain_input = {"input": refined_query}
+        
+        # Attempt 1: Primary Agent (Gemini)
+        if self.agent_executor_primary:
+            try:
+                logging.info("Invoking Primary Agent (Gemini)...")
+                result = self.agent_executor_primary.invoke(chain_input)
+                return {"answer": result.get("output", "No output generated")}
+            except Exception as e:
+                logging.error(f"Gemini Agent Error: {e}. Switching to Fallback...")
+        
+        # Attempt 2: Fallback Agent (Ollama)
+        if self.agent_executor_fallback:
+            try:
+                logging.info("Invoking Fallback Agent (Ollama)...")
+                result = self.agent_executor_fallback.invoke(chain_input)
+                return {"answer": result.get("output", "No output generated")}
+            except Exception as e:
+                logging.error(f"Ollama Agent Error: {e}")
+                return {"answer": "Error: Both systems failed to process the request."}
         
         return {"answer": "System not initialized. Check logs."}

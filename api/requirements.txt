@@ -22,3 +22,6 @@ uvicorn[standard]
 pydantic
 python-dotenv
 
+# --- Add this for Internet Search ---
+duckduckgo-search
+langchainhub
