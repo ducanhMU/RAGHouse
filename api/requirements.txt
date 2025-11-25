@@ -7,6 +7,7 @@ langchain-google-genai
 langchain-milvus
 langchain-ollama
 langchainhub
+langchain-classic
 
 # --- Tools ---
 duckduckgo-search

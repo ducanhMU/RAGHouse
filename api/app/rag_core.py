@@ -12,8 +12,8 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_milvus import Milvus
 
 # --- Reranking Imports ---
-from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import FlashrankRerank
+from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import FlashrankRerank
 
 # --- CONFIGURATION FROM ENV ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
