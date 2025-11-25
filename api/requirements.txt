@@ -6,6 +6,10 @@ langchain-experimental
 langchain-google-genai
 langchain-milvus
 langchain-ollama
+langchainhub
+
+# --- Tools & Search ---
+duckduckgo-search
 
 # --- Vector DB & Embeddings ---
 pymilvus
@@ -21,7 +25,7 @@ fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
+python-multipart  # <--- CRITICAL: Required for file uploads
 
-# --- Add this for Internet Search ---
-duckduckgo-search
-langchainhub
+# --- Database ---
+# sqlite3 is built-in to Python, so no install needed.

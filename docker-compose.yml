@@ -9,8 +9,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./api/data:/app/data
-      - ./api/app:/app/app
+      - ./api/data:/app/data # Map local data folder to container to persist DB and uploaded files
+      - ./api/app:/app/app # Map app code for hot-reloading during development
     env_file:
       - .env
     depends_on:
@@ -19,7 +19,7 @@ services:
       ollama:
         condition: service_started
     environment:
-      - PYTHONUNBUFFERED=1 # Để log hiện ngay lập tức
+      - PYTHONUNBUFFERED=1 # Ensure logs appear immediately
     command: >
       sh -c "sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app"
     networks:
