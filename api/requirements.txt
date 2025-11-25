@@ -1,7 +1,7 @@
 # --- LangChain ecosystem ---
-langchain
-langchain-core
-langchain-community
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-community>=0.0.10
 langchain-experimental
 langchain-google-genai
 langchain-milvus

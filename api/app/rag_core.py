@@ -12,20 +12,25 @@ from langchain_milvus import Milvus
 
 # --- Tools & Agents Imports ---
 from langchain_community.tools import DuckDuckGoSearchRun
-
-from langchain.agents import create_react_agent, AgentExecutor
 from langchain import hub
 
+# Robust Import for Retriever Tool (Handles version differences)
 try:
-    #  (LangChain >= 0.1.0)
     from langchain.tools.retriever import create_retriever_tool
 except ImportError:
-    #  fallback  (LangChain < 0.1.0)
     from langchain.agents.agent_toolkits import create_retriever_tool
+
+# Robust Import for Agent Creation
+# If this fails, it means LangChain < 0.1.0 is installed. 
+# The requirements.txt update should fix this, but this check helps debug.
+try:
+    from langchain.agents import create_react_agent, AgentExecutor
+except ImportError:
+    logging.critical("CRITICAL ERROR: Your LangChain version is too old. Please rebuild Docker with 'docker-compose up -d --build --no-cache'.")
+    raise
 
 # --- CONFIGURATION FROM ENV ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# Defaulting to 'gemini-2.0-flash' for speed and cost efficiency
 PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-2.0-flash") 
 FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gpt-oss:20b") 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
@@ -43,7 +48,7 @@ class ConversationalRAG:
     def __init__(self):
         logging.info("Initializing ConversationalRAG with Agentic capabilities...")
 
-        # 1. Initialize LLMs
+        # 1. Initialize LLMs (Primary & Fallback)
         self.primary_llm = self._init_primary_llm()
         self.fallback_llm = self._init_fallback_llm()
         
@@ -144,7 +149,7 @@ class ConversationalRAG:
                     auto_id=True
                 )
                 
-                # Check connection
+                # Force check connection
                 # vector_store.col.num_entities 
                 logging.info("Connected to Milvus Collection.")
                 
@@ -207,7 +212,9 @@ class ConversationalRAG:
 
     def _create_agent_executor(self, llm):
         """Creates a ReAct Agent Executor."""
+        # Pull standard prompt from LangChain Hub
         prompt = hub.pull("hwchase17/react")
+        
         agent = create_react_agent(llm, self.tools, prompt)
         return AgentExecutor(
             agent=agent, 
