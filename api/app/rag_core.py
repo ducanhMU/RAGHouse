@@ -12,7 +12,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_milvus import Milvus
 
 # --- Reranking Imports ---
-from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import FlashrankRerank
 
 # --- CONFIGURATION FROM ENV ---
