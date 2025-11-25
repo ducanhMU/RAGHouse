@@ -3,10 +3,11 @@ import requests
 import os
 import time
 
-# Page Configuration
+# --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Financial Assistant", layout="wide")
 
-# API Configuration
+# --- API CONFIGURATION ---
+# Use 'http://api:8000' inside Docker network, or 'http://localhost:8000' for local dev
 API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
 CHAT_ENDPOINT = f"{API_BASE_URL}/chat"
 UPLOAD_ENDPOINT = f"{API_BASE_URL}/upload"
@@ -14,21 +15,21 @@ SESSIONS_ENDPOINT = f"{API_BASE_URL}/sessions"
 
 # --- STATE MANAGEMENT ---
 # current_session_id: 
-#   - None: User is starting a completely new chat.
-#   - String (UUID): User is viewing an existing chat history.
+#   - None: User is in 'New Chat' mode.
+#   - String: User is in an active session.
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- SIDEBAR: HISTORY & UPLOAD ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("Knowledge & History")
     
-    # --- PART 1: FILE UPLOAD ---
+    # --- 1. FILE UPLOAD ---
     with st.expander("Upload Documents", expanded=False):
-        uploaded_files = st.file_uploader("Select PDF/TXT files", accept_multiple_files=True)
+        uploaded_files = st.file_uploader("Select PDF/TXT", accept_multiple_files=True)
         if st.button("Upload & Ingest", type="primary"):
             if uploaded_files:
                 with st.spinner("Uploading..."):
@@ -38,43 +39,44 @@ with st.sidebar:
                         if res.status_code == 200:
                             st.success("Upload successful!")
                         else:
-                            st.error(res.text)
+                            st.error(f"Error: {res.text}")
                     except Exception as e:
-                        st.error(str(e))
+                        st.error(f"Connection failed: {e}")
     
     st.divider()
 
-    # --- PART 2: CHAT HISTORY LIST ---
+    # --- 2. SESSION MANAGEMENT ---
     if st.button("New Chat", use_container_width=True):
         st.session_state.current_session_id = None
         st.session_state.messages = []
         st.rerun()
     
-    st.caption("Chat History:")
+    st.caption("Recent Conversations:")
     
-    # Fetch Sessions from API
+    # Fetch and display sessions
     try:
         res = requests.get(SESSIONS_ENDPOINT)
         if res.status_code == 200:
             sessions = res.json()
             for sess in sessions:
-                # Render a button for each session
+                # Button logic to switch sessions
                 if st.button(f"{sess['title']}", key=sess['id'], use_container_width=True):
                     st.session_state.current_session_id = sess['id']
                     
-                    # Fetch messages for this session immediately
+                    # Fetch history for the selected session
                     msg_res = requests.get(f"{API_BASE_URL}/sessions/{sess['id']}/messages")
                     if msg_res.status_code == 200:
                         st.session_state.messages = msg_res.json()
                     st.rerun()
     except Exception:
-        st.warning("Cannot connect to Backend.")
+        st.warning("Cannot connect to Backend API.")
 
-# --- MAIN INTERFACE ---
+# --- MAIN CHAT INTERFACE ---
 st.title("Financial AI Assistant")
 
+# Display current status
 if st.session_state.current_session_id is None:
-    st.caption("You are starting a new conversation.")
+    st.caption("Start a new conversation...")
 else:
     st.caption(f"Session ID: {st.session_state.current_session_id}")
 
@@ -84,41 +86,46 @@ for msg in st.session_state.messages:
         st.markdown(msg['content'])
 
 # 2. Handle User Input
-if prompt := st.chat_input("Ask a question about finance..."):
-    # Render User Message Immediately
+if prompt := st.chat_input("Ask a question..."):
+    # Display User Message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Call API
+    # Display Assistant Response
     with st.chat_message("assistant"):
         placeholder = st.empty()
-        placeholder.markdown("Agent is thinking...")
+        placeholder.markdown("Thinking...")
         
         try:
+            # Prepare Payload
             payload = {
                 "session_id": st.session_state.current_session_id, 
                 "input": prompt
             }
+            
+            # Call API
             res = requests.post(CHAT_ENDPOINT, json=payload, timeout=120)
             
             if res.status_code == 200:
                 data = res.json()
                 answer = data['answer']
+                new_session_id = data['session_id']
                 
-                # Update Session ID if this was a new chat
-                if st.session_state.current_session_id is None:
-                    st.session_state.current_session_id = data['session_id']
-                    
-                    placeholder.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                    
-                    # Rerun to update the Sidebar title with the new session
+                # Check if we just started a new session
+                is_new_session = st.session_state.current_session_id is None
+                
+                # Update State
+                st.session_state.current_session_id = new_session_id
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+                # Render Answer
+                placeholder.markdown(answer)
+                
+                # If it was a new session, rerun to update the Sidebar title immediately
+                if is_new_session:
                     time.sleep(0.1)
                     st.rerun()
-                else:
-                    placeholder.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
             else:
                 placeholder.error(f"API Error: {res.text}")
                 
