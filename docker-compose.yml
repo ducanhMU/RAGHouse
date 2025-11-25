@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # --- APPLICATION SERVICES ---
   api:
     build:
       context: ./api
@@ -9,8 +10,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./api/data:/app/data # Map local data folder to container to persist DB and uploaded files
-      - ./api/app:/app/app # Map app code for hot-reloading during development
+      - ./api/data:/app/data
+      - ./api/app:/app/app
     env_file:
       - .env
     depends_on:
@@ -19,7 +20,7 @@ services:
       ollama:
         condition: service_started
     environment:
-      - PYTHONUNBUFFERED=1 # Ensure logs appear immediately
+      - PYTHONUNBUFFERED=1
     command: >
       sh -c "sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app"
     networks:
@@ -42,6 +43,7 @@ services:
       - milvus
     restart: unless-stopped
 
+  # --- MILVUS ECOSYSTEM ---
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.18
@@ -106,8 +108,24 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+    # Added resource limits to prevent random crashes if RAM is tight
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     networks:
       - milvus
+
+  # --- NEW SERVICE: JAEGER (Fixes the "lookup jaeger" error) ---
+  jaeger:
+    container_name: jaeger
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # UI
+      - "14268:14268" # Collector (This is the port Milvus was looking for)
+    networks:
+      - milvus
+    restart: unless-stopped
 
   attu:
       container_name: milvus-attu
