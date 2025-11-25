@@ -11,7 +11,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_milvus import Milvus
 
 # --- Tools & Agents Imports ---
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.tools import DuckDuckGoSearchResults
 from langchain import hub
 
 # Robust Import for Retriever Tool (Handles version differences)
@@ -172,7 +172,7 @@ class ConversationalRAG:
         
         # 1. Internet Search Tool (DuckDuckGo)
         try:
-            search_tool = DuckDuckGoSearchRun(
+            search_tool = DuckDuckGoSearchResults(
                 name="internet_search",
                 description="Useful for when you need to answer questions about current events, news, realtime data, or topics NOT found in the internal database."
             )
