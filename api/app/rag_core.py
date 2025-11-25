@@ -16,7 +16,7 @@ from langchain import hub
 
 # Robust Import for Retriever Tool (Handles version differences)
 try:
-    from langchain.tools.retriever import create_retriever_tool
+    from langchain_core.tools.retriever import create_retriever_tool
 except ImportError:
     from langchain.agents.agent_toolkits import create_retriever_tool
 
