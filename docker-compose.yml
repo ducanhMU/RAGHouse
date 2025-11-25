@@ -71,7 +71,7 @@ services:
       MINIO_SECRET_KEY: minioadmin
     ports:
       - "9001:9001"
-      - "9000:9000"
+      - "9002:9000" # avoid conflict port
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
@@ -141,7 +141,7 @@ services:
     image: ollama/ollama
     container_name: ollama
     ports:
-      - "11435:11434"
+      - "11435:11434" # avoid conflict port
     volumes:
       - ollama_data:/root/.ollama
     entrypoint: ["/bin/bash", "-c", "\
