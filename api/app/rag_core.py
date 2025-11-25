@@ -12,9 +12,16 @@ from langchain_milvus import Milvus
 
 # --- Tools & Agents Imports ---
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain.tools.retriever import create_retriever_tool
+
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain import hub
+
+try:
+    #  (LangChain >= 0.1.0)
+    from langchain.tools.retriever import create_retriever_tool
+except ImportError:
+    #  fallback  (LangChain < 0.1.0)
+    from langchain.agents.agent_toolkits import create_retriever_tool
 
 # --- CONFIGURATION FROM ENV ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
