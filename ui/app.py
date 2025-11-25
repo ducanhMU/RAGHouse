@@ -2,21 +2,18 @@ import streamlit as st
 import requests
 import os
 import time
+import json
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Financial Assistant", layout="wide")
+# Page Configuration
+st.set_page_config(page_title="Financial Assistant", layout="wide", page_icon="📈")
 
-# --- API CONFIGURATION ---
-# Use 'http://api:8000' inside Docker network, or 'http://localhost:8000' for local dev
+# API Configuration
 API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
 CHAT_ENDPOINT = f"{API_BASE_URL}/chat"
 UPLOAD_ENDPOINT = f"{API_BASE_URL}/upload"
 SESSIONS_ENDPOINT = f"{API_BASE_URL}/sessions"
 
 # --- STATE MANAGEMENT ---
-# current_session_id: 
-#   - None: User is in 'New Chat' mode.
-#   - String: User is in an active session.
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
 
@@ -25,9 +22,9 @@ if "messages" not in st.session_state:
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.title("Knowledge & History")
+    st.title("🗂️ Knowledge & History")
     
-    # --- 1. FILE UPLOAD ---
+    # 1. File Upload
     with st.expander("Upload Documents", expanded=False):
         uploaded_files = st.file_uploader("Select PDF/TXT", accept_multiple_files=True)
         if st.button("Upload & Ingest", type="primary"):
@@ -39,95 +36,107 @@ with st.sidebar:
                         if res.status_code == 200:
                             st.success("Upload successful!")
                         else:
-                            st.error(f"Error: {res.text}")
+                            st.error(res.text)
                     except Exception as e:
-                        st.error(f"Connection failed: {e}")
+                        st.error(str(e))
     
     st.divider()
 
-    # --- 2. SESSION MANAGEMENT ---
+    # 2. Session List
     if st.button("New Chat", use_container_width=True):
         st.session_state.current_session_id = None
         st.session_state.messages = []
         st.rerun()
     
-    st.caption("Recent Conversations:")
-    
-    # Fetch and display sessions
+    st.caption("Recent Chats:")
     try:
         res = requests.get(SESSIONS_ENDPOINT)
         if res.status_code == 200:
             sessions = res.json()
             for sess in sessions:
-                # Button logic to switch sessions
                 if st.button(f"{sess['title']}", key=sess['id'], use_container_width=True):
                     st.session_state.current_session_id = sess['id']
-                    
-                    # Fetch history for the selected session
                     msg_res = requests.get(f"{API_BASE_URL}/sessions/{sess['id']}/messages")
                     if msg_res.status_code == 200:
                         st.session_state.messages = msg_res.json()
                     st.rerun()
     except Exception:
-        st.warning("Cannot connect to Backend API.")
+        st.warning("Backend offline.")
 
-# --- MAIN CHAT INTERFACE ---
+# --- MAIN INTERFACE ---
 st.title("Financial AI Assistant")
 
-# Display current status
 if st.session_state.current_session_id is None:
-    st.caption("Start a new conversation...")
+    st.caption("Start a new conversation.")
 else:
-    st.caption(f"Session ID: {st.session_state.current_session_id}")
+    st.caption(f"Session: {st.session_state.current_session_id}")
 
-# 1. Render Chat History
+# Render History
 for msg in st.session_state.messages:
     with st.chat_message(msg['role']):
         st.markdown(msg['content'])
 
-# 2. Handle User Input
-if prompt := st.chat_input("Ask a question..."):
-    # Display User Message
+# Handle Input
+if prompt := st.chat_input("Ask a financial question..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Display Assistant Response
+    # Stream Response
     with st.chat_message("assistant"):
         placeholder = st.empty()
-        placeholder.markdown("Thinking...")
+        full_response = ""
+        sources_data = []
+        new_session_id = None
         
         try:
-            # Prepare Payload
-            payload = {
-                "session_id": st.session_state.current_session_id, 
-                "input": prompt
-            }
+            payload = {"session_id": st.session_state.current_session_id, "input": prompt}
             
-            # Call API
-            res = requests.post(CHAT_ENDPOINT, json=payload, timeout=120)
-            
-            if res.status_code == 200:
-                data = res.json()
-                answer = data['answer']
-                new_session_id = data['session_id']
-                
-                # Check if we just started a new session
-                is_new_session = st.session_state.current_session_id is None
-                
-                # Update State
-                st.session_state.current_session_id = new_session_id
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-                # Render Answer
-                placeholder.markdown(answer)
-                
-                # If it was a new session, rerun to update the Sidebar title immediately
-                if is_new_session:
-                    time.sleep(0.1)
-                    st.rerun()
-            else:
-                placeholder.error(f"API Error: {res.text}")
-                
+            # POST request with stream=True
+            with requests.post(CHAT_ENDPOINT, json=payload, stream=True, timeout=120) as r:
+                if r.status_code == 200:
+                    for line in r.iter_lines():
+                        if line:
+                            decoded_line = line.decode('utf-8')
+                            
+                            # Handle Metadata (Session ID)
+                            if decoded_line.startswith("meta:"):
+                                new_session_id = decoded_line[5:]
+
+                            # Handle Text Chunk
+                            elif decoded_line.startswith("text:"):
+                                chunk_text = decoded_line[5:] 
+                                full_response += chunk_text
+                                placeholder.markdown(full_response + "▌")
+                            
+                            # Handle Sources Chunk (JSON)
+                            elif decoded_line.startswith("sources:"):
+                                json_str = decoded_line[8:]
+                                try:
+                                    sources_data = json.loads(json_str)
+                                except json.JSONDecodeError:
+                                    pass
+
+                    # Final Render
+                    placeholder.markdown(full_response)
+                    
+                    # Render Citations
+                    if sources_data:
+                        with st.expander("📚 Sources / Citations", expanded=True):
+                            for idx, src in enumerate(sources_data):
+                                st.markdown(f"**{idx+1}. {src['file']}** (Page {src['page']})")
+
+                    # Update State
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    
+                    # Handle New Session Logic
+                    if st.session_state.current_session_id is None and new_session_id:
+                        st.session_state.current_session_id = new_session_id
+                        time.sleep(0.5)
+                        st.rerun()
+
+                else:
+                    st.error(f"API Error: {r.text}")
+                    
         except Exception as e:
-            placeholder.error(f"Connection Error: {e}")
+            st.error(f"Connection Error: {e}")

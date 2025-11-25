@@ -1,4 +1,4 @@
-# --- LangChain ecosystem ---
+# --- LangChain Core ---
 langchain>=0.1.0
 langchain-core>=0.1.0
 langchain-community>=0.0.10
@@ -8,24 +8,24 @@ langchain-milvus
 langchain-ollama
 langchainhub
 
-# --- Tools & Search ---
+# --- Tools ---
 duckduckgo-search
 
-# --- Vector DB & Embeddings ---
+# --- Vector DB ---
 pymilvus
 ollama
 
-# --- Utilities for document parsing ---
+# --- Document Parsing ---
 unstructured[pdf]
 pypdf
 pytesseract
 
-# --- Web backend ---
+# --- Web Framework ---
 fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
-python-multipart  # <--- CRITICAL: Required for file uploads
+python-multipart
 
-# --- Database ---
-# sqlite3 is built-in to Python, so no install needed.
+# --- Reranking (New) ---
+flashrank
