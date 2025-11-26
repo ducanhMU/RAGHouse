@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # ===== DATABASE =====
+  # ===== DATABASES =====
   postgres:
     image: postgres:15-alpine
     container_name: rag_postgres
@@ -9,26 +9,41 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-rag_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
       POSTGRES_DB: ${POSTGRES_DB:-rag_db}
-      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
       - ./volumes/postgres:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user} -d ${POSTGRES_DB:-rag_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user}"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
     networks:
       - rag_network
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
+
+  # V2 NEW: ClickHouse for Analytics
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: rag_clickhouse
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_pass}
+    volumes:
+      - ./volumes/clickhouse:/var/lib/clickhouse
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
+    ports:
+      - "8123:8123"  # HTTP
+      - "9000:9000"  # Native
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag_network
+    restart: unless-stopped
 
   # ===== VECTOR DATABASE (MILVUS) =====
   etcd:
@@ -82,7 +97,6 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
       MQ_TYPE: woodpecker
-      COMMON_STORAGETYPE: minio
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
     healthcheck:
@@ -102,12 +116,6 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-        reservations:
-          memory: 2G
 
   # ===== LLM SERVICE =====
   ollama:
@@ -129,14 +137,7 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    # Initialize models on startup
+    # V2: Pull required models
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -145,14 +146,13 @@ services:
         echo "Waiting for Ollama to start..."
         sleep 10
         
-        # Pull models
-        echo "Pulling nomic-embed-text for embeddings..."
-        ollama pull nomic-embed-text
+        echo "Pulling EmbeddingGemma for embeddings..."
+        ollama pull embeddinggemma
         
-        echo "Pulling llama3.2:3b for inference..."
-        ollama pull llama3.2:3b
+        echo "Pulling gpt-oss:20b for inference (quantized)..."
+        ollama pull gpt-oss:20b
         
-        echo "Models ready!"
+        echo "All models ready!"
         wait $$OLLAMA_PID
 
   # ===== API SERVICE =====
@@ -160,7 +160,7 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
-    container_name: rag_api
+    container_name: rag_api_v2
     ports:
       - "8000:8000"
     volumes:
@@ -171,17 +171,23 @@ services:
       # Database
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
       
+      # ClickHouse (V2 NEW)
+      - CLICKHOUSE_URL=clickhouse://default:${CLICKHOUSE_PASSWORD:-clickhouse_pass}@clickhouse:8123/analytics
+      
       # Milvus
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - MILVUS_COLLECTION_NAME=rag_collection
+      - MILVUS_COLLECTION_NAME=rag_collection_v2
       
       # Ollama
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=llama3.2:3b
+      - OLLAMA_MODEL=gpt-oss:20b
       
-      # Google AI (Optional)
+      # Google AI
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      
+      # Superset (V2 NEW)
+      - SUPERSET_BASE_URL=http://superset:8088
       
       # Application
       - DATA_PATH=/app/data
@@ -193,6 +199,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
       milvus:
         condition: service_healthy
       ollama:
@@ -202,15 +210,15 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 40s
     networks:
       - rag_network
     restart: unless-stopped
     command: >
       sh -c "
         echo 'Waiting for dependencies...' &&
-        sleep 15 &&
-        echo 'Starting API server...' &&
+        sleep 20 &&
+        echo 'Starting RAG V2 API...' &&
         uvicorn app.main:app 
           --host 0.0.0.0 
           --port 8000 
@@ -218,27 +226,17 @@ services:
           --reload-dir /app/app
           --log-level info
       "
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
 
   # ===== UI SERVICE =====
   ui:
     build:
       context: ./ui
       dockerfile: Dockerfile
-    container_name: rag_ui
+    container_name: rag_ui_v2
     ports:
       - "8501:8501"
     environment:
       - API_BASE_URL=http://api:8000
-      - STREAMLIT_SERVER_PORT=8501
-      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
-      - STREAMLIT_SERVER_ENABLE_CORS=false
-      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
     env_file:
       - .env
     depends_on:
@@ -249,7 +247,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
     networks:
       - rag_network
     restart: unless-stopped
@@ -258,16 +255,47 @@ services:
         --server.port 8501
         --server.address 0.0.0.0
         --server.enableCORS false
-        --server.enableXsrfProtection false
-        --browser.gatherUsageStats false
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
 
-  # ===== MANAGEMENT UI =====
+  # ===== V2 NEW: SUPERSET (Visualization) =====
+  superset:
+    image: apache/superset:latest
+    container_name: rag_superset
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your_secret_key_here}
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_DATABASE_URL: postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/superset
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset_home:/app/superset_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - rag_network
+    restart: unless-stopped
+    command: >
+      sh -c "
+        superset db upgrade &&
+        superset fab create-admin \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --email admin@superset.com \
+          --password admin &&
+        superset init &&
+        gunicorn \
+          --bind 0.0.0.0:8088 \
+          --workers 4 \
+          --timeout 120 \
+          --limit-request-line 0 \
+          --limit-request-field_size 0 \
+          'superset.app:create_app()'
+      "
+
+  # ===== MANAGEMENT UIS =====
   attu:
     container_name: rag_milvus_attu
     image: zilliz/attu:v2.4
@@ -282,27 +310,26 @@ services:
       - rag_network
     restart: unless-stopped
 
-  # ===== MONITORING (OPTIONAL) =====
+  # ===== MONITORING =====
   jaeger:
     container_name: rag_jaeger
     image: jaegertracing/all-in-one:latest
     environment:
-      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"  # Jaeger UI
-      - "14268:14268"  # Jaeger collector
-      - "14250:14250"  # Jaeger gRPC
-      - "6831:6831/udp"  # Jaeger agent
+      - "16686:16686"
+      - "14268:14268"
     networks:
       - rag_network
     restart: unless-stopped
 
 networks:
   rag_network:
-    name: rag_network
+    name: rag_network_v2
     driver: bridge
 
 volumes:
   ollama_data:
-    name: rag_ollama_data
+    name: rag_ollama_data_v2
+  superset_home:
+    name: rag_superset_home

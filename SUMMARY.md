@@ -395,5 +395,411 @@ This implementation provides a **production-ready** RAG system with:
 ---
 
 **Version**: 1.0.0
-**Last Updated**: 2024
-**Author**: RAG Team
+
+# Migration Guide: V1 → V2
+
+## Overview
+
+This guide helps you upgrade from RAG V1 to V2 with minimal downtime.
+
+## What's Changing
+
+### New Features
+- ✅ Hybrid Search (Vector + BM25)
+- ✅ Cross-Encoder Reranking
+- ✅ Text-to-SQL with ClickHouse
+- ✅ Apache Superset Integration
+- ✅ Dynamic Milvus Schema
+
+### Breaking Changes
+- ⚠️ Milvus collection name changed: `rag_collection` → `rag_collection_v2`
+- ⚠️ New services added: ClickHouse, Superset
+- ⚠️ Embedding model changed: `nomic-embed-text` → `embeddinggemma`
+- ⚠️ API response format includes intent metadata
+
+### Compatible (No Changes)
+- ✅ PostgreSQL schema (conversations)
+- ✅ File upload format
+- ✅ Session management
+- ✅ Memory 3-5 rule
+
+## Migration Strategies
+
+### Strategy 1: Clean Install (Recommended)
+
+**Use when**: Testing V2 or fresh start acceptable
+
+```bash
+# 1. Backup V1 data
+cd v1-installation
+docker-compose exec postgres pg_dump -U rag_user rag_db > backup_v1.sql
+
+# 2. Stop V1
+docker-compose down
+
+# 3. Clone V2
+cd ..
+git clone <v2-repo-url> rag-v2
+cd rag-v2
+
+# 4. Configure
+cp .env.example .env
+# Edit with your settings
+
+# 5. Start V2
+docker-compose up -d
+
+# 6. Re-upload documents
+# Documents will be re-processed with new embedding model
+```
+
+**Time**: ~30 minutes  
+**Downtime**: Yes  
+**Data Loss**: Documents need re-upload
+
+### Strategy 2: Side-by-Side (Zero Downtime)
+
+**Use when**: Production system, need gradual migration
+
+```bash
+# 1. Deploy V2 on different ports
+cd rag-v2
+nano docker-compose.yml
+# Change ports:
+#   API: 8000 → 8001
+#   UI: 8501 → 8502
+#   etc.
+
+# 2. Start V2 alongside V1
+docker-compose up -d
+
+# 3. Test V2 thoroughly
+# Access: http://localhost:8502
+
+# 4. Migrate data incrementally
+# - Export conversations from V1
+# - Import to V2
+# - Re-upload documents to V2
+
+# 5. Switch traffic (Update nginx/load balancer)
+# Point users to V2 when ready
+
+# 6. Shutdown V1
+cd ../v1-installation
+docker-compose down
+```
+
+**Time**: 1-2 hours  
+**Downtime**: None  
+**Data Loss**: None (if properly migrated)
+
+### Strategy 3: In-Place Upgrade (Advanced)
+
+**Use when**: Same server, minimal reconfiguration
+
+```bash
+# 1. Backup everything
+./backup_all.sh
+
+# 2. Stop V1 services (keep databases)
+docker-compose stop api ui
+
+# 3. Update code
+git fetch origin v2
+git checkout v2
+
+# 4. Update dependencies
+cd api
+pip install -r requirements.txt
+
+# 5. Add new services
+docker-compose up -d clickhouse superset
+
+# 6. Restart with new code
+docker-compose up -d api ui
+
+# 7. Verify
+curl http://localhost:8000/health
+```
+
+**Time**: 20-30 minutes  
+**Downtime**: 5-10 minutes  
+**Risk**: Medium (rollback if issues)
+
+## Detailed Migration Steps
+
+### Step 1: Data Backup
+
+```bash
+# Backup PostgreSQL (conversations)
+docker exec rag_postgres pg_dump -U rag_user rag_db | gzip > postgres_backup.sql.gz
+
+# Backup uploaded files
+tar -czf data_backup.tar.gz ./api/data/
+
+# Backup Milvus (optional - will re-index)
+tar -czf milvus_backup.tar.gz ./volumes/milvus/
+
+# Backup environment
+cp .env .env.v1.backup
+```
+
+### Step 2: Environment Configuration
+
+```bash
+# Copy V1 env
+cp .env.v1.backup .env
+
+# Add V2 variables
+cat >> .env << EOF
+
+# === V2 NEW SETTINGS ===
+CLICKHOUSE_PASSWORD=clickhouse_pass
+CLICKHOUSE_URL=clickhouse://default:clickhouse_pass@clickhouse:8123/analytics
+SUPERSET_BASE_URL=http://superset:8088
+SUPERSET_SECRET_KEY=$(openssl rand -hex 32)
+EMBEDDING_MODEL=embeddinggemma
+ENABLE_HYBRID_SEARCH=true
+ENABLE_RERANKING=true
+ENABLE_TEXT_TO_SQL=true
+ENABLE_VISUALIZATION=true
+EOF
+```
+
+### Step 3: Database Migration
+
+**PostgreSQL** (No changes needed - compatible)
+
+```bash
+# Verify schema compatibility
+docker exec rag_postgres psql -U rag_user -d rag_db -c "\dt"
+# Should show: file_registry, chat_sessions, chat_events
+```
+
+**Milvus** (New collection with dynamic schema)
+
+```bash
+# V2 creates new collection automatically
+# Old collection (rag_collection) remains intact
+# Both can coexist
+
+# To migrate old embeddings (optional):
+# 1. Export V1 documents
+# 2. Re-upload to V2 (re-embed with new model)
+```
+
+### Step 4: Document Re-indexing
+
+Since embedding model changed, documents should be re-indexed:
+
+```bash
+# Option A: Bulk re-upload via API
+for file in ./api/data/*.pdf; do
+  echo "Uploading $file"
+  curl -X POST http://localhost:8000/upload -F "file=@$file"
+  sleep 2
+done
+
+# Option B: Manual via UI
+# Visit http://localhost:8501
+# Upload documents through interface
+```
+
+### Step 5: ClickHouse Setup
+
+```bash
+# Initialize sample data
+docker exec -i rag_clickhouse clickhouse-client < clickhouse-init/init.sql
+
+# Verify
+docker exec rag_clickhouse clickhouse-client --query "SELECT count(*) FROM analytics.sales"
+# Should return: 12
+```
+
+### Step 6: Superset Configuration
+
+```bash
+# Access Superset
+# URL: http://localhost:8088
+# User: admin
+# Pass: admin
+
+# 1. Add ClickHouse connection
+#    Settings → Database Connections → + Database
+#    Choose: ClickHouse
+#    URI: clickhouse://default:clickhouse_pass@clickhouse:8123/analytics
+
+# 2. Create sample dashboard
+#    Dashboards → + Dashboard
+#    Add charts based on sales/revenue data
+
+# 3. Note dashboard URLs for integration
+```
+
+### Step 7: Testing
+
+```bash
+# Test hybrid search
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Find document XYZ-123"}'
+
+# Test text-to-SQL
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What is total revenue in Q4?"}'
+
+# Test features endpoint
+curl http://localhost:8000/features | jq .
+
+# Test Milvus stats
+curl http://localhost:8000/stats/milvus | jq .
+```
+
+## Rollback Plan
+
+If issues occur during migration:
+
+```bash
+# Stop V2
+docker-compose down
+
+# Restore V1 code
+git checkout v1
+
+# Restore databases
+gunzip -c postgres_backup.sql.gz | \
+  docker exec -i rag_postgres psql -U rag_user -d rag_db
+
+tar -xzf data_backup.tar.gz
+
+# Restart V1
+docker-compose up -d
+
+# Verify
+curl http://localhost:8000/health
+```
+
+## Post-Migration Checklist
+
+- [ ] All services healthy (`docker-compose ps`)
+- [ ] API health check passes
+- [ ] V2 features enabled (`/features` endpoint)
+- [ ] Documents uploaded and indexed
+- [ ] Hybrid search working (test exact keyword match)
+- [ ] ClickHouse accessible (test SQL query)
+- [ ] Superset dashboards configured
+- [ ] Conversation history preserved
+- [ ] User sessions functional
+- [ ] Monitor logs for errors (`docker-compose logs -f`)
+
+## Performance Tuning
+
+### After Migration
+
+```bash
+# 1. Monitor resource usage
+docker stats
+
+# 2. Adjust worker counts if needed
+# In docker-compose.yml:
+services:
+  api:
+    environment:
+      - WORKERS=4  # Increase for high load
+
+# 3. Tune search weights
+# In .env:
+HYBRID_VECTOR_WEIGHT=0.6  # Adjust based on use case
+HYBRID_BM25_WEIGHT=0.4
+
+# 4. Adjust reranker batch size
+RERANKER_BATCH_SIZE=16  # Lower if OOM
+
+# 5. Monitor query latency
+# Check /metrics endpoint (if Prometheus enabled)
+```
+
+## Common Issues & Solutions
+
+### Issue 1: Ollama Models Not Pulling
+
+```bash
+# Manual pull
+docker exec rag_ollama ollama pull embeddinggemma
+docker exec rag_ollama ollama pull gpt-oss:20b
+
+# Verify
+docker exec rag_ollama ollama list
+```
+
+### Issue 2: ClickHouse Tables Empty
+
+```bash
+# Re-run initialization
+docker exec -i rag_clickhouse clickhouse-client < clickhouse-init/init.sql
+```
+
+### Issue 3: Reranker OOM
+
+```bash
+# Disable reranking temporarily
+ENABLE_RERANKING=false
+docker-compose restart api
+
+# Or use lighter model
+RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2
+```
+
+### Issue 4: Milvus Schema Conflict
+
+```bash
+# Drop old collection (WARNING: deletes data)
+docker exec rag_milvus python -c "
+from pymilvus import connections, utility
+connections.connect(host='localhost', port='19530')
+utility.drop_collection('rag_collection')
+"
+
+# Or use new collection name (default)
+MILVUS_COLLECTION_NAME=rag_collection_v2
+```
+
+## Migration Timeline Example
+
+**Small System** (<1000 documents, <100 conversations)
+- Backup: 5 minutes
+- Configuration: 10 minutes
+- Deployment: 15 minutes
+- Testing: 10 minutes
+- **Total: ~40 minutes**
+
+**Medium System** (1000-10000 documents, <1000 conversations)
+- Backup: 15 minutes
+- Configuration: 15 minutes
+- Deployment: 20 minutes
+- Re-indexing: 60 minutes
+- Testing: 20 minutes
+- **Total: ~2 hours**
+
+**Large System** (>10000 documents, >1000 conversations)
+- Backup: 30 minutes
+- Configuration: 20 minutes
+- Deployment: 30 minutes
+- Re-indexing: 4-8 hours (can be done post-deployment)
+- Testing: 30 minutes
+- **Total: ~6-10 hours**
+
+## Support During Migration
+
+If you encounter issues:
+
+1. Check logs: `docker-compose logs -f api`
+2. Verify health: `curl http://localhost:8000/health`
+3. Review this guide
+4. Check GitHub Issues
+5. Contact support: support@example.com
+
+---
+
+**Recommended**: Test migration on staging environment first!
