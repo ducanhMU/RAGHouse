@@ -1,107 +1,102 @@
+# file: api/app/ingest.py
+
 import os
 import logging
-import sys
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+import hashlib
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings 
 from langchain_milvus import Milvus
+from sqlalchemy.orm import Session
+from app.database import SessionLocal, FileRegistry
 
-# --- CONFIGURATION FROM ENV ---
-DATA_PATH = os.getenv("DATA_PATH", "./data")
-MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_demo")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "embeddinggemma")
+# --- CONFIG ---
+MILVUS_URI = f"http://{os.getenv('MILVUS_HOST', 'milvus')}:{os.getenv('MILVUS_PORT', '19530')}"
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_collection")
+OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+EMBEDDING_MODEL = "nomic-embed-text" # Using a dedicated embedding model
 
-# Logging Setup
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO, 
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-def ingest_docs():
-    """
-    Loads documents from the data directory, splits them, and ingests them into Milvus.
-    This function appends data to the existing collection; it does not overwrite.
-    """
-    
-    # 1. Load Data
-    logger.info(f"Checking for documents in: {DATA_PATH}...")
-    if not os.path.exists(DATA_PATH):
-        os.makedirs(DATA_PATH)
-        
-    loader = DirectoryLoader(
-        DATA_PATH,
-        glob="**/*.pdf",
-        loader_cls=PyPDFLoader,
-        use_multithreading=True
-    )
-    docs = loader.load()
-    
-    if not docs:
-        logger.warning("No documents found in the data directory.")
-        return
-    logger.info(f"Loaded {len(docs)} documents.")
+def calculate_md5(file_path: str) -> str:
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
-    # 2. Chunking
-    logger.info("Splitting documents into chunks...")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, 
-        chunk_overlap=200, 
-        add_start_index=True
-    )
-    chunks = text_splitter.split_documents(docs)
-    logger.info(f"Total chunks created: {len(chunks)}")
-
-    # 3. Embeddings Setup
-    logger.info(f"Initializing Embedding Model: {EMBEDDING_MODEL_NAME}")
-    embeddings = OllamaEmbeddings(
-        model=EMBEDDING_MODEL_NAME,
-        base_url=OLLAMA_BASE_URL
-    )
-    
-    # 4. Initialize Milvus Connection
-    milvus_uri = f"http://{MILVUS_HOST}:{MILVUS_PORT}"
-    logger.info(f"Connecting to Milvus at {milvus_uri}...")
-
-    # We initialize the Milvus object with drop_old=False to ensure we APPEND data.
-    # If the collection does not exist, it will be created with the specified index_params.
-    vector_db = Milvus(
+def get_vector_store():
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_URL)
+    return Milvus(
         embedding_function=embeddings,
-        collection_name=MILVUS_COLLECTION_NAME,
-        connection_args={"uri": milvus_uri},
-        drop_old=False,  # CRITICAL: Ensures we do not delete existing data
-        auto_id=True,
-        consistency_level="Strong",
-        index_params={
-            "index_type": "HNSW", 
-            "metric_type": "L2", 
-            "params": {"M": 8, "efConstruction": 64}
-        }
+        collection_name=COLLECTION_NAME,
+        connection_args={"uri": MILVUS_URI},
+        drop_old=False,
+        auto_id=True
     )
 
-    # 5. Ingest with Batching
-    BATCH_SIZE = 64
-    total_chunks = len(chunks)
+def process_file_task(file_id: str):
+    """
+    Background Task: 
+    1. Fetch file info from DB.
+    2. Parse -> Chunk -> Embed -> Ingest to Milvus.
+    3. Update Status.
+    """
+    db = SessionLocal()
+    file_record = db.query(FileRegistry).filter(FileRegistry.id == file_id).first()
     
+    if not file_record:
+        logger.error(f"File ID {file_id} not found.")
+        db.close()
+        return
+
     try:
-        for i in range(0, total_chunks, BATCH_SIZE):
-            batch = chunks[i : i + BATCH_SIZE]
-            current_batch_num = (i // BATCH_SIZE) + 1
-            total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
-            
-            logger.info(f"Ingesting Batch [{current_batch_num}/{total_batches}] - {len(batch)} chunks...")
-            
-            # Since vector_db is already initialized, we just add documents
-            vector_db.add_documents(batch)
+        logger.info(f"Processing file: {file_record.filename}")
+        file_record.status = "PROCESSING"
+        db.commit()
 
-        logger.info("Ingestion process completed successfully.")
-        
+        # 1. Load
+        if file_record.filename.lower().endswith(".pdf"):
+            loader = PyPDFLoader(file_record.file_path)
+        else:
+            loader = TextLoader(file_record.file_path)
+        docs = loader.load()
+
+        # 2. Split
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
+
+        # 3. Add Metadata
+        for chunk in chunks:
+            chunk.metadata["file_id"] = str(file_record.id)
+            chunk.metadata["filename"] = file_record.filename
+            chunk.metadata["source_hash"] = file_record.file_hash
+
+        # 4. Ingest
+        if chunks:
+            vector_db = get_vector_store()
+            vector_db.add_documents(chunks)
+
+        file_record.status = "COMPLETED"
+        logger.info(f"Finished processing {file_record.filename}. Ingested {len(chunks)} chunks.")
+
     except Exception as e:
-        logger.error(f"Failed to ingest into Milvus: {e}")
+        logger.error(f"Failed to process {file_record.filename}: {e}")
+        file_record.status = "FAILED"
+        file_record.error_log = str(e)
+    
+    finally:
+        db.commit()
+        db.close()
 
-if __name__ == "__main__":
-    ingest_docs()
+def resume_stuck_files():
+    """Run on startup to reset any files stuck in PROCESSING state due to crash."""
+    db = SessionLocal()
+    stuck_files = db.query(FileRegistry).filter(FileRegistry.status == "PROCESSING").all()
+    if stuck_files:
+        logger.info(f"Found {len(stuck_files)} stuck files. Resetting to PENDING.")
+        for f in stuck_files:
+            f.status = "PENDING"
+            # In a real production system, we would re-queue these tasks here.
+        db.commit()
+    db.close()

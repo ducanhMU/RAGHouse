@@ -8,6 +8,7 @@ langchain-milvus
 langchain-ollama
 langchainhub
 langchain-classic
+langchain-text-splitters
 
 # --- Tools ---
 duckduckgo-search
@@ -30,3 +31,8 @@ python-multipart
 
 # --- Reranking (New) ---
 flashrank
+
+# --- Database & ORM ---
+sqlalchemy>=2.0.0
+psycopg2-binary
+alembic  # Optional for migrations

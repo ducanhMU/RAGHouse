@@ -1,432 +1,269 @@
+# file: api/app/rag_core.py
+
 import os
 import logging
-import sys
-import json
-from typing import Generator, List
+from typing import AsyncGenerator, List, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import desc, func
 
-# --- LangChain Imports ---
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_milvus import Milvus
-from langchain_core.documents import Document # <--- Added for search result wrapping
+# LangChain Imports
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
 
-# --- Tools Imports ---
-from langchain_community.tools import DuckDuckGoSearchRun # <--- Added Search Tool
+# Internal Imports
+from app.database import ChatEvent, SessionLocal
+from app import ingest  # To reuse get_vector_store
 
-# --- Reranking Imports ---
-from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors import FlashrankRerank
-
-# --- CONFIGURATION FROM ENV ---
+# --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-PRIMARY_LLM_MODEL = os.getenv("PRIMARY_LLM_MODEL", "gemini-2.0-flash") 
-FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "gpt-oss:20b") 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-MILVUS_COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_demo")
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "embeddinggemma")
 
-# Logging Setup
-logging.basicConfig(
-    stream=sys.stdout, 
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Logging
+logger = logging.getLogger(__name__)
 
-class ConversationalRAG:
+class HybridRAG:
     """
-    RAG System with all features:
-    1. Milvus vector database for internal knowledge
-    2. DuckDuckGo for internet search (handled via tools - not used in streaming)
-    3. Query rewriting with historical context using summary technique
-    4. FlashRank reranking for better relevance
-    5. Streaming responses with token-by-token delivery
-    6. Citation tracking with source metadata
+    Core RAG Engine for Version 1.
+    Features:
+    - Hybrid Inference (Gemini Primary -> Ollama Fallback)
+    - Hierarchical Memory Assembly (The 3-5 Rule)
+    - Milvus Vector Retrieval
     """
     
     def __init__(self):
-        logging.info("=" * 80)
-        logging.info("Initializing ConversationalRAG with Full Feature Set")
-        logging.info("=" * 80)
-
-        # 1. Initialize LLMs (Primary + Fallback)
-        self.primary_llm = self._init_primary_llm()
-        self.fallback_llm = self._init_fallback_llm()
-        
-        # 2. Initialize Search Tool
-        self.search_tool = self._init_search_tool() # <--- New Initialization Method
-
-        # 3. Initialize Milvus Vector Store & Base Retriever
-        self.base_retriever = self._init_milvus_retriever()
-        
-        # 4. Initialize FlashRank Reranker (wraps base retriever)
-        self.reranker = self._init_reranker()
-        
-        # 5. Initialize Query Rewriting Chain (with summary support)
-        self.query_rewriter = self._init_query_rewriter()
-        
-        # 6. Initialize Summarization Chain (for progressive memory)
-        self.summarizer = self._init_summarizer()
-        
-        logging.info("✓ ConversationalRAG initialized successfully with all features")
-        logging.info("=" * 80)
-
-    # ==================== LLM INITIALIZATION ====================
-    
-    def _init_primary_llm(self):
-        """Initialize primary LLM (Gemini) with streaming support."""
-        try:
-            logging.info(f"Loading Primary LLM: {PRIMARY_LLM_MODEL}")
-            safety_settings = {
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            }
-            llm = ChatGoogleGenerativeAI(
-                model=PRIMARY_LLM_MODEL, 
-                google_api_key=GOOGLE_API_KEY,
-                temperature=0.3,
-                safety_settings=safety_settings,
-                streaming=True  # Enable streaming
-            )
-            logging.info("✓ Primary LLM (Gemini) loaded successfully")
-            return llm
-        except Exception as e:
-            logging.error(f"✗ Failed to load Gemini: {e}")
-            return None
-
-    def _init_fallback_llm(self):
-        """Initialize fallback LLM (Ollama)."""
-        try:
-            logging.info(f"Loading Fallback LLM: {FALLBACK_LLM_MODEL}")
-            llm = ChatOllama(
-                model=FALLBACK_LLM_MODEL, 
-                base_url=OLLAMA_BASE_URL,
-                temperature=0.1,
-                streaming=True
-            )
-            logging.info("✓ Fallback LLM (Ollama) loaded successfully")
-            return llm
-        except Exception as e:
-            logging.error(f"✗ Failed to load Ollama: {e}")
-            return None
-        
-    # ==================== TOOLS & RETRIEVAL ====================
-    
-    def _init_search_tool(self):
-        """Initialize DuckDuckGo search tool."""
-        try:
-            tool = DuckDuckGoSearchRun()
-            logging.info("✓ Internet Search Tool (DuckDuckGo) loaded")
-            return tool
-        except Exception as e:
-            logging.warning(f"⚠ Search tool failed to load: {e}")
-            return None
-        
-    def _init_milvus_retriever(self):
-        """Initialize Milvus vector database retriever."""
-        logging.info("Initializing Milvus Vector Store...")
-        try:
-            embeddings = OllamaEmbeddings(
-                model=EMBEDDING_MODEL_NAME, 
-                base_url=OLLAMA_BASE_URL
-            )
-            URI = f"http://{MILVUS_HOST}:{MILVUS_PORT}"
-            
-            vector_store = Milvus(
-                embedding_function=embeddings,
-                collection_name=MILVUS_COLLECTION_NAME,
-                connection_args={"uri": URI},
-                consistency_level="Strong",
-                auto_id=True
-            )
-            
-            # Retrieve top 10 for reranking (will be filtered down to top 4)
-            retriever = vector_store.as_retriever(
-                search_type="similarity", 
-                search_kwargs={'k': 10}
-            )
-            
-            logging.info(f"✓ Milvus retriever initialized (collection: {MILVUS_COLLECTION_NAME})")
-            return retriever
-            
-        except Exception as e:
-            logging.error(f"✗ Milvus initialization failed: {e}")
-            return None
-
-    def _init_reranker(self):
-        """Initialize FlashRank reranker for improved relevance."""
-        if not self.base_retriever:
-            logging.warning("⚠ Base retriever not available, skipping reranker")
-            return None
-            
-        try:
-            logging.info("Loading FlashRank Reranker (ms-marco-MiniLM-L-12-v2)...")
-            compressor = FlashrankRerank(model="ms-marco-MiniLM-L-12-v2")
-            reranker = ContextualCompressionRetriever(
-                base_compressor=compressor, 
-                base_retriever=self.base_retriever
-            )
-            logging.info("✓ FlashRank reranker loaded successfully")
-            return reranker
-        except Exception as e:
-            logging.warning(f"⚠ Reranker failed to load: {e}. Using base retriever.")
-            return self.base_retriever
-
-    # ==================== QUERY REWRITING ====================
-    
-    def _init_query_rewriter(self):
-        """Initialize chain for query rewriting with historical context."""
-        llm = self.primary_llm if self.primary_llm else self.fallback_llm
-        if not llm:
-            logging.warning("⚠ No LLM available for query rewriting")
-            return None
-            
-        try:
-            system_prompt = (
-                "You are a query reformulation assistant. Given a conversation summary and recent chat history, "
-                "rewrite the user's latest question to be self-contained and include relevant context.\n\n"
-                "Guidelines:\n"
-                "- Incorporate key entities and topics from the summary and history\n"
-                "- Resolve pronouns and references (e.g., 'it', 'that', 'the company')\n"
-                "- Keep the reformulated question concise and focused\n"
-                "- If the question is already clear and standalone, return it as-is\n\n"
-                "Conversation Summary: {summary}\n"
-            )
-            
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "Reformulate this question: {input}"),
-            ])
-            
-            chain = prompt | llm | StrOutputParser()
-            logging.info("✓ Query rewriter initialized")
-            return chain
-            
-        except Exception as e:
-            logging.error(f"✗ Failed to initialize query rewriter: {e}")
-            return None
-
-    # ==================== SUMMARIZATION ====================
-    
-    def _init_summarizer(self):
-        """Initialize chain for progressive conversation summarization."""
-        llm = self.primary_llm if self.primary_llm else self.fallback_llm
-        if not llm:
-            logging.warning("⚠ No LLM available for summarization")
-            return None
-            
-        try:
-            prompt_template = (
-                "Progressively summarize the conversation below, adding to the existing summary.\n\n"
-                "Guidelines:\n"
-                "- Keep the summary concise but informative\n"
-                "- Focus on key topics, decisions, and context needed for future questions\n"
-                "- Preserve important entities, numbers, and facts\n\n"
-                "EXAMPLE:\n"
-                "Current summary: The user asked about Q3 revenue. It was $2.5M, up 15% YoY.\n"
-                "New conversation:\n"
-                "Human: What about Q4 projections?\n"
-                "AI: Q4 is projected at $3.1M, driven by holiday sales.\n"
-                "New summary: The user asked about Q3 revenue ($2.5M, +15% YoY) and Q4 projections ($3.1M, driven by holiday sales).\n\n"
-                "Current summary:\n{summary}\n\n"
-                "New conversation:\n{new_lines}\n\n"
-                "New summary:"
-            )
-            
-            prompt = ChatPromptTemplate.from_template(prompt_template)
-            chain = prompt | llm | StrOutputParser()
-            logging.info("✓ Summarizer initialized")
-            return chain
-            
-        except Exception as e:
-            logging.error(f"✗ Failed to initialize summarizer: {e}")
-            return None
-
-    # ==================== SUMMARIZATION PUBLIC METHOD ====================
-    
-    def summarize_messages(self, current_summary: str, new_messages: List[BaseMessage]) -> str:
-        """
-        Progressively summarize new messages into existing summary.
-        
-        Args:
-            current_summary: Existing conversation summary
-            new_messages: List of new HumanMessage/AIMessage objects
-            
-        Returns:
-            Updated summary string
-        """
-        if not self.summarizer:
-            logging.warning("⚠ Summarizer not available, returning current summary")
-            return current_summary
-            
-        # Convert messages to readable format
-        new_lines = ""
-        for msg in new_messages:
-            role = "Human" if isinstance(msg, HumanMessage) else "AI"
-            new_lines += f"{role}: {msg.content}\n"
-            
-        try:
-            logging.info(f"Summarizing {len(new_messages)} messages...")
-            new_summary = self.summarizer.invoke({
-                "summary": current_summary,
-                "new_lines": new_lines
-            })
-            logging.info(f"✓ Summary updated: {len(current_summary)} → {len(new_summary)} chars")
-            return new_summary
-            
-        except Exception as e:
-            logging.error(f"✗ Summarization failed: {e}")
-            return current_summary
-
-    # ==================== CORE STREAMING METHOD ====================
-    
-    def stream_answer(
-        self, 
-        user_input: str, 
-        chat_history: List[BaseMessage], 
-        current_summary: str = ""
-    ) -> Generator[str, None, None]:
-        """
-        Main streaming method with all features:
-        1. Query rewriting with summary + history
-        2. Milvus retrieval with reranking
-        3. Token-by-token streaming
-        4. Citation extraction and streaming
-        
-        Yields strings in custom protocol:
-        - "text:<content>" for response tokens
-        - "sources:<json>" for citations at the end
-        
-        Args:
-            user_input: User's question
-            chat_history: List of recent messages (buffer)
-            current_summary: Compressed older conversation summary
-        """
-        
-        logging.info("=" * 80)
-        logging.info(f"Processing query: {user_input[:100]}...")
-        
-        # ===== STEP 1: QUERY REWRITING =====
-        refined_query = user_input
-        
-        if (chat_history or current_summary) and self.query_rewriter:
-            try:
-                logging.info("Rewriting query with historical context...")
-                refined_query = self.query_rewriter.invoke({
-                    "summary": current_summary or "No previous context.",
-                    "chat_history": chat_history,
-                    "input": user_input
-                })
-                logging.info(f"✓ Query rewritten: {refined_query[:100]}...")
-            except Exception as e:
-                logging.error(f"✗ Query rewriting failed: {e}, using original")
-
-        # ===== STEP 2: RETRIEVAL & RERANKING =====
-        docs = []
-        if self.reranker:
-            try:
-                logging.info("Retrieving documents from Milvus...")
-                docs = self.reranker.invoke(refined_query)
-                # Keep top 4 after reranking
-                docs = docs[:4]
-                logging.info(f"✓ Retrieved and reranked to {len(docs)} documents")
-            except Exception as e:
-                logging.error(f"✗ Retrieval/reranking failed: {e}")
-
-        # ===== STEP 3: INTERNET SEARCH (EXTERNAL) =====
-        if self.search_tool:
-            try:
-                logging.info("Searching internet for external context...")
-                # Using refined_query ensures the search is context-aware
-                search_result = self.search_tool.invoke(refined_query)
-                
-                if search_result:
-                    # Wrap result as a Document to treat it uniformly
-                    search_doc = Document(
-                        page_content=f"Internet Search Results (Current Info):\n{search_result}",
-                        metadata={"source": "Internet Search (DuckDuckGo)", "page": "Web"}
-                    )
-                    docs.append(search_doc)
-                    logging.info("✓ Internet search results added to context")
-            except Exception as e:
-                logging.error(f"✗ Internet search failed: {e}")
-
-        # ===== STEP 4: EXTRACT CITATIONS =====
-        sources = []
-        seen_sources = set()
-        context_text = ""
-        
-        for doc in docs:
-            context_text += f"{doc.page_content}\n\n"
-            
-            # Extract metadata for citations
-            src = doc.metadata.get("source", "Unknown")
-            page = doc.metadata.get("page", "N/A")
-            src_name = os.path.basename(src)
-            identifier = f"{src_name}|{page}"
-            
-            if identifier not in seen_sources:
-                sources.append({
-                    "file": src_name,
-                    "page": str(page)
-                })
-                seen_sources.add(identifier)
-        
-        logging.info(f"✓ Extracted {len(sources)} unique sources")
-
-        # ===== STEP 5: PREPARE GENERATION PROMPT =====
-        system_prompt = (
-            "You are a helpful and knowledgeable financial AI assistant.\n\n"
-            "Use the following retrieved context to answer the user's question accurately. "
-            "If the context doesn't contain relevant information, clearly state that you don't have that information "
-            "rather than making assumptions.\n\n"
-            "Retrieved Context:\n" + (context_text or "No relevant context found.")
+        # 1. Primary Model: Gemini 1.5 Flash (Fast, Cheap, Long Context)
+        self.primary_llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash", 
+            temperature=0.3,
+            google_api_key=GOOGLE_API_KEY,
+            convert_system_message_to_human=True, # Often needed for Gemini compatibility
+            stream=True
         )
         
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}")
-        ])
+        # 2. Fallback Model: Ollama (Local Llama 3 or Mistral)
+        self.fallback_llm = ChatOllama(
+            model="llama3.2:3b", # Ensure you pulled this model in docker-compose
+            base_url=OLLAMA_BASE_URL,
+            temperature=0.3
+        )
+        
+        logger.info("HybridRAG Engine Initialized (Gemini + Ollama)")
 
-        # ===== STEP 6: STREAM RESPONSE =====
-        llm = self.primary_llm if self.primary_llm else self.fallback_llm
+    def build_hierarchical_context(self, db: Session, session_id: str) -> str:
+        """
+        Constructs the 'Memory Context' based on the 3-5 Rule.
+        Structure: [Checkpoint] -> [Summaries] -> [Recent Raw Messages]
+        """
+        # 
+
+        # A. Get latest Checkpoint (Global Context)
+        # We look for the most recent event with type 'CHECKPOINT_5'
+        checkpoint = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id,
+            ChatEvent.event_type == 'CHECKPOINT_5'
+        ).order_by(desc(ChatEvent.sequence_num)).first()
         
-        if not llm:
-            yield "text:Error: No LLM available.\n"
-            return
-            
-        chain = prompt | llm | StrOutputParser()
+        checkpoint_txt = checkpoint.content if checkpoint else "No long-term history yet."
+        last_seq = checkpoint.sequence_num if checkpoint else 0
+
+        # B. Get Summaries generated *after* the last Checkpoint
+        summaries = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id,
+            ChatEvent.event_type == 'SUMMARY_3',
+            ChatEvent.sequence_num > last_seq
+        ).order_by(ChatEvent.sequence_num).all()
         
+        summary_txt = "\n".join([f"- {s.content}" for s in summaries]) if summaries else "No mid-term summaries."
+        
+        # Update last_seq to the end of summaries (if any)
+        if summaries:
+            last_seq = summaries[-1].sequence_num
+
+        # C. Get Recent Raw Messages (since last Summary or Checkpoint)
+        # These are the immediate conversation turns that haven't been summarized yet
+        raw_msgs = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id,
+            ChatEvent.event_type == 'NORMAL',
+            ChatEvent.sequence_num > last_seq
+        ).order_by(ChatEvent.sequence_num).all()
+        
+        recent_txt = "\n".join([f"{msg.role.upper()}: {msg.content}" for msg in raw_msgs])
+
+        # D. Assemble Final String
+        return f"""
+        [LONG-TERM MEMORY (CHECKPOINT)]:
+        {checkpoint_txt}
+
+        [MID-TERM CONTEXT (SUMMARIES)]:
+        {summary_txt}
+
+        [RECENT INTERACTION (RAW)]:
+        {recent_txt}
+        """
+
+    def get_retrieval_context(self, query: str, k: int = 5) -> str:
+        """
+        Fetches relevant documents from Milvus.
+        """
         try:
-            logging.info("Streaming response...")
-            token_count = 0
+            vector_db = ingest.get_vector_store()
+            docs = vector_db.similarity_search(query, k=k)
             
-            # Stream tokens with custom protocol
-            for chunk in chain.stream({
-                "chat_history": chat_history,
-                "input": refined_query
-            }):
-                yield f"text:{chunk}\n"
-                token_count += 1
+            if not docs:
+                return "No relevant documents found in knowledge base."
             
-            logging.info(f"✓ Streamed {token_count} tokens")
+            # Format docs with Source Metadata
+            context_parts = []
+            for d in docs:
+                source = d.metadata.get('filename', 'Unknown Source')
+                context_parts.append(f"[Source: {source}]: {d.page_content}")
             
-            # ===== STEP 7: STREAM CITATIONS =====
-            if sources:
-                sources_json = json.dumps(sources)
-                yield f"sources:{sources_json}\n"
-                logging.info(f"✓ Streamed {len(sources)} citations")
+            return "\n\n".join(context_parts)
+            
+        except Exception as e:
+            logger.error(f"Milvus Retrieval Failed: {e}")
+            return "Error retrieving documents from knowledge base."
+
+    async def generate_stream(self, memory_ctx: str, rag_ctx: str, user_query: str) -> AsyncGenerator[str, None]:
+        """
+        The Main Generator: Combines Context -> Prompts LLM -> Streams Response.
+        Implements the Failover Logic.
+        """
+        
+        # 1. Construct System Prompt
+        system_instruction = f"""You are an intelligent AI assistant. 
+        Answer the user's question using the provided Knowledge Base and Conversation History.
+        
+        GUIDELINES:
+        1. Priority: Use [KNOWLEDGE BASE] facts first.
+        2. Fallback: If facts are missing, use your general knowledge but state "Based on my general knowledge...".
+        3. Memory: Use [HISTORY] to understand context (e.g., if user says "it", look at history).
+        4. Citations: Mention the source filename if you use data from [KNOWLEDGE BASE].
+
+        [KNOWLEDGE BASE]:
+        {rag_ctx}
+
+        [HISTORY & MEMORY]:
+        {memory_ctx}
+        """
+
+        messages = [
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=user_query)
+        ]
+
+        # 2. Hybrid Inference Execution
+        try:
+            # Attempt Primary (Gemini)
+            async for chunk in self.primary_llm.astream(messages):
+                yield chunk.content
                 
         except Exception as e:
-            logging.error(f"✗ Streaming failed: {e}")
-            yield f"text:Error generating response: {str(e)}\n"
+            logger.error(f"Primary LLM (Gemini) failed: {e}. Switching to Fallback (Ollama).")
+            try:
+                # Attempt Fallback (Ollama)
+                async for chunk in self.fallback_llm.astream(messages):
+                    yield chunk.content
+            except Exception as e2:
+                logger.critical(f"Both LLMs failed. Ollama Error: {e2}")
+                yield "I apologize, but I am currently unable to process your request due to system overload."
+
+    def trigger_memory_consolidation(self, session_id: str):
+        """
+        Background Task: Implements the 'Write' side of the 3-5 Rule.
+        - Every 3 turns (6 messages) -> Create Summary.
+        - Every 5 summaries -> Create Checkpoint.
+        """
+        db = SessionLocal()
+        try:
+            # --- CHECK 1: Short-term Summary (Needs 3 completed turns = 6 normal messages) ---
+            
+            # Find the sequence number of the last Summary or Checkpoint
+            last_summary_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
+                ChatEvent.session_id == session_id,
+                ChatEvent.event_type.in_(['SUMMARY_3', 'CHECKPOINT_5'])
+            ).scalar() or 0
+
+            # Count NORMAL messages after that point
+            new_msgs = db.query(ChatEvent).filter(
+                ChatEvent.session_id == session_id,
+                ChatEvent.event_type == 'NORMAL',
+                ChatEvent.sequence_num > last_summary_seq
+            ).order_by(ChatEvent.sequence_num).all()
+
+            # Rule: 3 Turns = 3 User + 3 Assistant = 6 Messages
+            if len(new_msgs) >= 6:
+                logger.info(f"Session {session_id}: Triggering Summary_3 generation.")
+                self._create_summary(db, session_id, new_msgs, "SUMMARY_3")
+
+            # --- CHECK 2: Long-term Checkpoint (Needs 5 Summaries) ---
+            
+            # Find the sequence number of the last Checkpoint
+            last_checkpoint_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
+                ChatEvent.session_id == session_id,
+                ChatEvent.event_type == 'CHECKPOINT_5'
+            ).scalar() or 0
+
+            # Count SUMMARY_3 events after that point
+            new_summaries = db.query(ChatEvent).filter(
+                ChatEvent.session_id == session_id,
+                ChatEvent.event_type == 'SUMMARY_3',
+                ChatEvent.sequence_num > last_checkpoint_seq
+            ).order_by(ChatEvent.sequence_num).all()
+
+            # Rule: 5 Summaries
+            if len(new_summaries) >= 5:
+                logger.info(f"Session {session_id}: Triggering Checkpoint_5 generation.")
+                self._create_summary(db, session_id, new_summaries, "CHECKPOINT_5")
+                
+        except Exception as e:
+            logger.error(f"Memory Consolidation Failed: {e}")
+        finally:
+            db.close()
+
+    def _create_summary(self, db: Session, session_id: str, events: list, target_type: str):
+        """
+        Helper to call LLM to summarize a list of events and insert into DB.
+        """
+        # 1. Prepare Text
+        text_chunk = "\n".join([f"{e.role}: {e.content}" for e in events])
         
-        logging.info("=" * 80)
+        prompt = f"""
+        Please summarize the following conversation segment concisely. 
+        Focus on facts, user intent, and key decisions. 
+        Keep it under 100 words.
+        
+        TEXT:
+        {text_chunk}
+        """
+
+        # 2. Call LLM (Non-streaming)
+        summary_content = "Summary generation failed."
+        try:
+            summary_content = self.primary_llm.invoke(prompt).content
+        except:
+            try:
+                summary_content = self.fallback_llm.invoke(prompt).content
+            except Exception as e:
+                logger.error(f"Summarization failed completely: {e}")
+                return # Skip insertion if failed
+
+        # 3. Insert into DB (Hidden Event)
+        # Get next sequence ID
+        next_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
+            ChatEvent.session_id == session_id
+        ).scalar() + 1
+        
+        new_event = ChatEvent(
+            session_id=session_id,
+            sequence_num=next_seq,
+            role='system',
+            content=summary_content,
+            event_type=target_type,
+            visibility='HIDDEN' # User doesn't see this in UI
+        )
+        db.add(new_event)
+        db.commit()
+        logger.info(f"Session {session_id}: Created {target_type} successfully.")
