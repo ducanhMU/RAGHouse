@@ -1,0 +1,25 @@
+# create a new session
+
+tmux new -s s_name
+
+# attach
+
+tmux a -t s_name
+
+# list sessions
+
+tmux ls 
+
+# delete a session
+
+tmux kill-session -t s_name
+
+# rename
+
+tmux rename-session -t s_name new_name
+
+# watch the current time
+
+ctrl + b t      # start render time
+q               # quit
+

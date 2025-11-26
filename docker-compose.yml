@@ -54,7 +54,7 @@ services:
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
-    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd --heartbeat-interval=500 --election-timeout=5000
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
@@ -85,7 +85,7 @@ services:
 
   milvus:
     container_name: milvus
-    image: milvusdb/milvus:v2.6.0-rc1
+    image: milvusdb/milvus:v2.5.1
     command: ["milvus", "run", "standalone"]
     security_opt:
     - seccomp:unconfined
@@ -112,7 +112,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 8G
     networks:
       - milvus
 
