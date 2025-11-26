@@ -15,7 +15,7 @@ services:
     env_file:
       - .env
     depends_on:
-      milvus:
+      milvus: 
         condition: service_healthy
       ollama:
         condition: service_started
@@ -43,7 +43,7 @@ services:
       - milvus
     restart: unless-stopped
 
-  # --- MILVUS ECOSYSTEM ---
+  # --- MILVUS ECOSYSTEM (Updated to v2.6.6) ---
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.18
@@ -54,7 +54,7 @@ services:
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
-    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd --heartbeat-interval=500 --election-timeout=5000
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
@@ -65,13 +65,13 @@ services:
 
   minio:
     container_name: milvus-minio
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
     ports:
       - "9001:9001"
-      - "9002:9000" # avoid conflict port
+      - "9002:9000" # avoid conflict
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
@@ -84,8 +84,8 @@ services:
       - milvus
 
   milvus:
-    container_name: milvus
-    image: milvusdb/milvus:v2.5.1
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.6
     command: ["milvus", "run", "standalone"]
     security_opt:
     - seccomp:unconfined
@@ -95,7 +95,6 @@ services:
       MQ_TYPE: woodpecker
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
-      - ./milvus.yaml:/milvus/configs/milvus.yaml
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -108,21 +107,16 @@ services:
     depends_on:
       - "etcd"
       - "minio"
-    # Added resource limits to prevent random crashes if RAM is tight
-    deploy:
-      resources:
-        limits:
-          memory: 8G
     networks:
       - milvus
 
-  # --- NEW SERVICE: JAEGER (Fixes the "lookup jaeger" error) ---
+  # --- SUPPORTING SERVICES ---
   jaeger:
     container_name: jaeger
     image: jaegertracing/all-in-one:latest
     ports:
-      - "16686:16686" # UI
-      - "14268:14268" # Collector (This is the port Milvus was looking for)
+      - "16686:16686"
+      - "14268:14268"
     networks:
       - milvus
     restart: unless-stopped
@@ -134,6 +128,8 @@ services:
         MILVUS_URL: milvus:19530
       ports:
         - "3000:3000"
+      depends_on:
+        - milvus
       networks:
         - milvus
 
@@ -141,7 +137,7 @@ services:
     image: ollama/ollama
     container_name: ollama
     ports:
-      - "11435:11434" # avoid conflict port
+      - "11435:11434" # avoid conflict
     volumes:
       - ollama_data:/root/.ollama
     entrypoint: ["/bin/bash", "-c", "\
@@ -160,5 +156,4 @@ networks:
     driver: bridge
 
 volumes:
-  milvus_data:
   ollama_data:
