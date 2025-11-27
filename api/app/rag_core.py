@@ -10,13 +10,13 @@ from sqlalchemy import desc, func, text
 # LangChain Imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain.messages import SystemMessage, HumanMessage
+from langchain_community.cross_encoders.huggingface import HuggingFaceCrossEncoder
+from langchain.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
 
 # SQL Integration
 from langchain_community.utilities import SQLDatabase
-from langchain.chains import create_sql_query_chain
+from langchain_classic.chains import create_sql_query_chain
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 
 # Internal Imports
@@ -26,7 +26,7 @@ from app import ingest
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL")
 SUPERSET_BASE_URL = os.getenv("SUPERSET_BASE_URL", "http://superset:8088")
 
@@ -519,7 +519,7 @@ GUIDELINES:
         ):
             yield chunk, model, metadata
 
-    async def trigger_memory_consolidation_async(self, session_id: str):
+    async def trigger_memory_consolidation(self, session_id: str):
         """
         ASYNC MEMORY CONSOLIDATION
         Runs in background, doesn't block user response

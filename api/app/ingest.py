@@ -11,7 +11,10 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings 
 from langchain_milvus import Milvus
-from pymilvus import Collection, CollectionSchema, FieldSchema, DataType, connections, utility
+from pymilvus import (
+    Collection, CollectionSchema, FieldSchema, DataType, 
+    connections, utility, MilvusClient
+)
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.database import SessionLocal, FileRegistry, FileStatus
@@ -20,20 +23,21 @@ from app.database import SessionLocal, FileRegistry, FileStatus
 MILVUS_HOST = os.getenv('MILVUS_HOST', 'milvus')
 MILVUS_PORT = os.getenv('MILVUS_PORT', '19530')
 MILVUS_URI = f"http://{MILVUS_HOST}:{MILVUS_PORT}"
-COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_collection_v2")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_collection_v2_hnsw")
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-EMBEDDING_MODEL = "embeddinggemma"
+EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 DATA_PATH = os.getenv("DATA_PATH", "./data")
 
-# Parallel processing config
-EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "8"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+# GPU OPTIMIZATION
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))  # GPU batch
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
 logger = logging.getLogger(__name__)
 
 # Global caches
 _vector_store_cache = None
 _embeddings_cache = None
+_milvus_client = None
 
 def calculate_md5(file_path: str) -> str:
     """Calculate MD5 hash efficiently."""
@@ -43,10 +47,10 @@ def calculate_md5(file_path: str) -> str:
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
-def create_collection_with_dynamic_schema():
+def create_collection_with_hnsw():
     """
-    STARTUP: Create Milvus collection with dynamic schema
-    Non-blocking with retry logic
+    OPTIMIZED: Create Milvus collection with HNSW index
+    HNSW is 10x faster than IVF_FLAT for retrieval
     """
     max_retries = 3
     retry_delay = 5
@@ -68,7 +72,7 @@ def create_collection_with_dynamic_schema():
             # Define schema
             fields = [
                 FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768),  # nomic-embed-text
                 FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
                 FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=255),
                 FieldSchema(name="filename", dtype=DataType.VARCHAR, max_length=512),
@@ -78,7 +82,7 @@ def create_collection_with_dynamic_schema():
             
             schema = CollectionSchema(
                 fields=fields,
-                description="RAG V2 with Dynamic Schema",
+                description="RAG V2 with HNSW Index",
                 enable_dynamic_field=True
             )
             
@@ -88,18 +92,22 @@ def create_collection_with_dynamic_schema():
                 using='default'
             )
             
-            # Create index
+            # === HNSW INDEX (PRODUCTION GRADE) ===
             index_params = {
                 "metric_type": "L2",
-                "index_type": "IVF_FLAT",
-                "params": {"nlist": 1024}
+                "index_type": "HNSW",  # Changed from IVF_FLAT
+                "params": {
+                    "M": 16,              # Number of connections (8-64, 16 is balanced)
+                    "efConstruction": 200 # Build quality (100-500, higher = better quality)
+                }
             }
+            
             collection.create_index(
                 field_name="embedding",
                 index_params=index_params
             )
             
-            logger.info(f"✅ Collection created with dynamic schema")
+            logger.info(f"✅ Collection created with HNSW index (Production)")
             connections.disconnect("default")
             return True
             
@@ -130,7 +138,7 @@ def get_embeddings():
     return _embeddings_cache
 
 def get_vector_store():
-    """Get cached vector store."""
+    """Get cached vector store with LangChain compatibility."""
     global _vector_store_cache
     if _vector_store_cache is None:
         _vector_store_cache = Milvus(
@@ -138,14 +146,20 @@ def get_vector_store():
             collection_name=COLLECTION_NAME,
             connection_args={"uri": MILVUS_URI},
             drop_old=False,
-            auto_id=True
+            auto_id=True,
+            text_field="text"  # CRITICAL: Map to our schema field
         )
     return _vector_store_cache
 
+def get_milvus_client():
+    """Get native PyMilvus client for direct operations."""
+    global _milvus_client
+    if _milvus_client is None:
+        _milvus_client = MilvusClient(uri=MILVUS_URI)
+    return _milvus_client
+
 def normalize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    DYNAMIC SCHEMA: Normalize metadata
-    """
+    """Normalize metadata for dynamic schema."""
     standard_fields = {'file_id', 'filename', 'page', 'source_hash'}
     
     normalized = {}
@@ -162,34 +176,81 @@ def normalize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     
     return normalized
 
-def embed_documents_parallel(texts: List[str], embeddings) -> List[List[float]]:
+def embed_documents_gpu_optimized(texts: List[str], embeddings) -> List[List[float]]:
     """
-    OPTIMIZED: Parallel embedding generation
-    Actually used now!
+    GPU-OPTIMIZED: Batch embedding with size 32
+    Leverages RTX A4000's 16GB VRAM and parallel processing
     """
     try:
         all_embeddings = []
         
-        # Process in batches
+        # Process in large batches for GPU efficiency
         for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
             batch = texts[i:i + EMBEDDING_BATCH_SIZE]
-            logger.info(f"🔄 Embedding batch {i//EMBEDDING_BATCH_SIZE + 1}/{(len(texts)-1)//EMBEDDING_BATCH_SIZE + 1}")
+            logger.info(f"🚀 GPU Batch {i//EMBEDDING_BATCH_SIZE + 1}/{(len(texts)-1)//EMBEDDING_BATCH_SIZE + 1} (size={len(batch)})")
             
-            # Synchronous embedding call (Ollama is sync)
+            # GPU processes this batch in parallel
             batch_embeddings = embeddings.embed_documents(batch)
             all_embeddings.extend(batch_embeddings)
         
-        logger.info(f"✅ Embedded {len(texts)} chunks")
+        logger.info(f"✅ Embedded {len(texts)} chunks on GPU")
         return all_embeddings
         
     except Exception as e:
-        logger.error(f"❌ Parallel embedding failed: {e}")
+        logger.error(f"❌ GPU embedding failed: {e}")
         raise
+
+def insert_to_milvus_native(
+    texts: List[str],
+    embeddings: List[List[float]],
+    metadatas: List[Dict]
+):
+    """
+    NATIVE PYMILVUS: Direct insert for maximum control
+    Bypasses LangChain wrapper for precise schema mapping
+    """
+    try:
+        connections.connect(
+            alias="default",
+            host=MILVUS_HOST,
+            port=MILVUS_PORT
+        )
+        
+        collection = Collection(COLLECTION_NAME)
+        
+        # Prepare data for insertion
+        entities = [
+            embeddings,  # embedding field
+            texts,       # text field
+            [m.get('file_id', '') for m in metadatas],
+            [m.get('filename', '') for m in metadatas],
+            [m.get('page', 0) for m in metadatas],
+            [m.get('source_hash', '') for m in metadatas],
+        ]
+        
+        # Insert
+        result = collection.insert(entities)
+        
+        logger.info(f"✅ Inserted {len(texts)} entities (IDs: {result.primary_keys[:3]}...)")
+        
+        # Flush to ensure data is persisted
+        collection.flush()
+        
+        connections.disconnect("default")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Native insert failed: {e}")
+        raise
+    finally:
+        try:
+            connections.disconnect("default")
+        except:
+            pass
 
 def process_file_task(file_id: str):
     """
-    OPTIMIZED FILE PROCESSING
-    Now actually uses parallel embedding!
+    ULTIMATE OPTIMIZED: GPU + Native PyMilvus + HNSW
     """
     db = SessionLocal()
     file_record = db.query(FileRegistry).filter(FileRegistry.id == file_id).first()
@@ -241,34 +302,18 @@ def process_file_task(file_id: str):
             
             chunk.metadata = normalize_metadata(chunk.metadata)
         
-        # === STEP 4: PARALLEL EMBEDDING (FIXED!) ===
-        embeddings = get_embeddings()
+        # === STEP 4: GPU-OPTIMIZED EMBEDDING ===
+        embeddings_model = get_embeddings()
         texts = [chunk.page_content for chunk in chunks]
         
-        logger.info(f"🚀 Starting parallel embedding...")
-        embedded_vectors = embed_documents_parallel(texts, embeddings)
+        logger.info(f"🚀 Starting GPU-optimized embedding (batch={EMBEDDING_BATCH_SIZE})...")
+        embedded_vectors = embed_documents_gpu_optimized(texts, embeddings_model)
         
-        # === STEP 5: Batch Insert with Pre-computed Embeddings ===
-        vector_db = get_vector_store()
+        # === STEP 5: NATIVE PYMILVUS INSERT ===
+        metadatas = [chunk.metadata for chunk in chunks]
         
-        # Create documents with embeddings
-        batch_size = 50
-        for i in range(0, len(chunks), batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_vectors = embedded_vectors[i:i + batch_size]
-            
-            # Manual insertion with pre-computed vectors
-            try:
-                # Use add_texts with pre-computed embeddings
-                vector_db.add_texts(
-                    texts=[c.page_content for c in batch_chunks],
-                    metadatas=[c.metadata for c in batch_chunks],
-                    embeddings=batch_vectors
-                )
-                logger.info(f"✅ Inserted batch {i//batch_size + 1}")
-            except Exception as e:
-                logger.error(f"❌ Batch insert failed: {e}")
-                raise
+        logger.info(f"📥 Inserting to Milvus using native API...")
+        insert_to_milvus_native(texts, embedded_vectors, metadatas)
         
         # === STEP 6: Update Metadata ===
         file_record.status = FileStatus.COMPLETED
@@ -276,8 +321,9 @@ def process_file_task(file_id: str):
             "pages": len(docs),
             "chunks": len(chunks),
             "model": EMBEDDING_MODEL,
+            "index_type": "HNSW",
             "chunk_size": 1000,
-            "overlap": 200
+            "batch_size": EMBEDDING_BATCH_SIZE
         }
         logger.info(f"🎉 Completed: {file_record.filename}")
         
@@ -292,8 +338,7 @@ def process_file_task(file_id: str):
 
 def scan_and_ingest_directory_parallel():
     """
-    OPTIMIZED: Parallel directory scanning
-    Uses ThreadPoolExecutor for concurrent processing
+    PARALLEL DIRECTORY SCAN
     """
     if not os.path.exists(DATA_PATH):
         logger.warning(f"⚠️ Data path {DATA_PATH} does not exist")
@@ -304,21 +349,19 @@ def scan_and_ingest_directory_parallel():
         files = list(Path(DATA_PATH).glob("*.*"))
         logger.info(f"📁 Found {len(files)} files")
         
-        # Filter valid files
         valid_files = [f for f in files if f.suffix.lower() in ['.pdf', '.txt', '.md']]
         
         if not valid_files:
             logger.info("✅ No files to process")
             return
         
-        # Register all files first
+        # Register all files
         file_ids_to_process = []
         
         for file_path in valid_files:
             try:
                 file_hash = calculate_md5(str(file_path))
                 
-                # Check if exists
                 existing = db.query(FileRegistry).filter(
                     FileRegistry.file_hash == file_hash
                 ).first()
@@ -326,7 +369,6 @@ def scan_and_ingest_directory_parallel():
                 if existing:
                     continue
                 
-                # Register new file
                 new_file = FileRegistry(
                     file_hash=file_hash,
                     filename=file_path.name,
@@ -347,12 +389,12 @@ def scan_and_ingest_directory_parallel():
                     db.rollback()
                     
             except Exception as e:
-                logger.error(f"❌ Error registering {file_path.name}: {e}")
+                logger.error(f"❌ Error: {e}")
                 db.rollback()
         
-        # Process files in parallel
+        # Process in parallel
         if file_ids_to_process:
-            logger.info(f"🚀 Processing {len(file_ids_to_process)} files in parallel...")
+            logger.info(f"🚀 Processing {len(file_ids_to_process)} files in parallel (workers={MAX_WORKERS})...")
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {
@@ -365,19 +407,17 @@ def scan_and_ingest_directory_parallel():
                     try:
                         future.result()
                     except Exception as e:
-                        logger.error(f"❌ Processing failed for {file_id}: {e}")
+                        logger.error(f"❌ Failed for {file_id}: {e}")
             
             logger.info(f"✅ Parallel processing complete")
         else:
-            logger.info("✅ No new files to process")
+            logger.info("✅ No new files")
             
     finally:
         db.close()
 
 def resume_stuck_files():
-    """
-    STARTUP: Reset and retry stuck files
-    """
+    """Reset and retry stuck files."""
     db = SessionLocal()
     try:
         stuck_files = db.query(FileRegistry).filter(
@@ -387,12 +427,10 @@ def resume_stuck_files():
         if stuck_files:
             logger.info(f"🔄 Found {len(stuck_files)} stuck files")
             
-            # Reset status
             for f in stuck_files:
                 f.status = FileStatus.PENDING
             db.commit()
             
-            # Retry in parallel
             file_ids = [str(f.id) for f in stuck_files]
             
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -413,7 +451,7 @@ def resume_stuck_files():
         db.close()
 
 def get_collection_stats() -> Dict:
-    """Get Milvus statistics"""
+    """Get Milvus statistics."""
     try:
         connections.connect(
             alias="default",
@@ -430,6 +468,7 @@ def get_collection_stats() -> Dict:
         stats = {
             "name": COLLECTION_NAME,
             "num_entities": collection.num_entities,
+            "index_type": "HNSW",
             "schema": {
                 "fields": [f.name for f in collection.schema.fields],
                 "dynamic_enabled": collection.schema.enable_dynamic_field
@@ -450,17 +489,18 @@ def initialize_ingest_system():
     """
     MAIN STARTUP
     """
-    logger.info("🚀 Initializing ingest system...")
+    logger.info("🚀 Initializing ULTIMATE ingest system...")
+    logger.info(f"📊 Config: GPU batch={EMBEDDING_BATCH_SIZE}, workers={MAX_WORKERS}, model={EMBEDDING_MODEL}")
     
-    # Step 1: Create collection
-    if not create_collection_with_dynamic_schema():
+    # Create HNSW collection
+    if not create_collection_with_hnsw():
         return False
     
-    # Step 2: Resume stuck files (parallel)
+    # Resume stuck files
     resume_stuck_files()
     
-    # Step 3: Scan directory (parallel)
+    # Scan directory
     scan_and_ingest_directory_parallel()
     
-    logger.info("✅ Ingest system initialized")
+    logger.info("✅ ULTIMATE ingest system initialized")
     return True

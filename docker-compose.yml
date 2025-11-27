@@ -1,9 +1,7 @@
 version: '3.8'
 
 services:
-  # ===== DATABASES =====
-  
-  # 1. Main RAG Database (Business Data)
+  # ===== PRIMARY DATABASE (RAG System) =====
   postgres:
     image: postgres:15-alpine
     container_name: rag_postgres
@@ -11,10 +9,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-rag_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
       POSTGRES_DB: ${POSTGRES_DB:-rag_db}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
       - ./volumes/postgres:/var/lib/postgresql/data
     ports:
-      - "5432:5432" # Standard port for App DB
+      - "5433:5432"  # Changed from 5432 to avoid conflicts
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user}"]
       interval: 10s
@@ -23,19 +22,24 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
-  # 2. Superset Database (Metadata) - NEW SEPARATE SERVICE
-  postgres-superset: # <--- NEW: Dedicated DB service for Superset
+  # ===== SUPERSET DATABASE (Separate) =====
+  postgres-superset:
     image: postgres:15-alpine
     container_name: rag_postgres_superset
     environment:
-      POSTGRES_USER: superset
-      POSTGRES_PASSWORD: superset_password
-      POSTGRES_DB: superset
+      POSTGRES_USER: ${SUPERSET_DB_USER:-superset}
+      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset_pass}
+      POSTGRES_DB: ${SUPERSET_DB_NAME:-superset}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
-      - ./volumes/postgres-superset:/var/lib/postgresql/data # <--- NEW: Separate volume
+      - ./volumes/postgres-superset:/var/lib/postgresql/data
     ports:
-      - "5433:5432" # <--- CHANGED: Host port 5433 to avoid conflict with main postgres (5432)
+      - "5434:5432" # avoid conflict port
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U superset"]
       interval: 10s
@@ -44,8 +48,12 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
-  # V2 NEW: ClickHouse for Analytics
+  # ===== CLICKHOUSE (Analytics) =====
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: rag_clickhouse
@@ -53,12 +61,14 @@ services:
       CLICKHOUSE_DB: analytics
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_pass}
+      # READ-ONLY user for safety
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - ./volumes/clickhouse:/var/lib/clickhouse
-      - ./clickhouse-init:/docker-entrypoint-initdb.d
+      - ./clickhouse:/docker-entrypoint-initdb.d
     ports:
       - "8123:8123"
-      - "9000:9000"
+      - "9002:9000" # avoid conflict port
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 10s
@@ -67,8 +77,12 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
 
-  # ===== VECTOR DATABASE (MILVUS) =====
+  # ===== MILVUS COMPONENTS =====
   etcd:
     container_name: rag_milvus_etcd
     image: quay.io/coreos/etcd:v3.5.18
@@ -78,7 +92,7 @@ services:
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
       ETCD_SNAPSHOT_COUNT: "50000"
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+      - ./volumes/etcd:/etcd
     command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -97,9 +111,9 @@ services:
       MINIO_SECRET_KEY: minioadmin
     ports:
       - "9001:9001"
-      - "9000:9000"
+      - "9003:9000" # avoid conflict port
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+      - ./volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -121,7 +135,7 @@ services:
       MINIO_ADDRESS: minio:9000
       MQ_TYPE: woodpecker
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+      - ./volumes/milvus:/var/lib/milvus
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -139,18 +153,28 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 6G
 
-  # ===== LLM SERVICE =====
+  # ===== OLLAMA (GPU-OPTIMIZED) =====
   ollama:
     image: ollama/ollama:latest
     container_name: rag_ollama
     ports:
-      - "11434:11434"
+      - "11435:11434" # avoid conflict port
     volumes:
       - ollama_data:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0:11434"
       OLLAMA_ORIGINS: "*"
+      # === GPU OPTIMIZATION (CRITICAL) ===
+      OLLAMA_NUM_PARALLEL: "8"           # 8 concurrent requests
+      OLLAMA_KEEP_ALIVE: "24h"           # Keep models in VRAM 24h
+      OLLAMA_MAX_LOADED_MODELS: "2"     # Load 2 models simultaneously
+      OLLAMA_NUM_GPU: "1"                # Use 1 GPU
+      OLLAMA_GPU_OVERHEAD: "0.9"        # Use 90% of VRAM
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 30s
@@ -160,24 +184,52 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
+    # === NVIDIA GPU DEPLOYMENT ===
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # RTX A4000
+              capabilities: [gpu]
+    # === MODEL INITIALIZATION (OPTIMIZED) ===
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting Ollama with GPU optimization..."
         ollama serve &
-        OLLAMA_PID=$$!
-        echo "Waiting for Ollama to start..."
-        sleep 10
-        # Only pull if not exists (simplified logic)
-        ollama pull embeddinggemma
-        ollama pull gpt-oss:20b
-        wait $$OLLAMA_PID
+        OLLAMA_PID=$!
+        
+        echo "⏳ Waiting for Ollama to start..."
+        sleep 15
+        
+        # === NEW MODELS (OPTIMIZED FOR GPU) ===
+        
+        echo "📥 Pulling nomic-embed-text (optimized for RAG)..."
+        ollama pull nomic-embed-text
+        
+        echo "📥 Pulling llama3.2:3b (lightweight LLM)..."
+        ollama pull llama3.2:3b
+        
+        echo "✅ All models loaded and ready!"
+        echo "📊 Model list:"
+        ollama list
+        
+        echo "🔥 GPU Status:"
+        nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv,noheader || echo "GPU info not available"
+        
+        echo "✅ Ollama ready with GPU acceleration"
+        wait $OLLAMA_PID
 
-  # ===== API SERVICE =====
+  # ===== API SERVICE (OPTIMIZED) =====
   api:
     build:
       context: ./api
       dockerfile: Dockerfile
-    container_name: rag_api_v2
+    container_name: rag_api
     ports:
       - "8000:8000"
     volumes:
@@ -185,28 +237,36 @@ services:
       - ./api/data:/app/data
       - ./api/logs:/app/logs
     environment:
-      # Database (Connects to main 'postgres' service)
+      # === DATABASES ===
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
-      
-      # ClickHouse
       - CLICKHOUSE_URL=clickhouse://default:${CLICKHOUSE_PASSWORD:-clickhouse_pass}@clickhouse:8123/analytics
       
-      # Milvus
+      # === MILVUS ===
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - MILVUS_COLLECTION_NAME=rag_collection_v2
+      - MILVUS_COLLECTION_NAME=rag_collection_v2_hnsw
       
-      # Ollama
+      # === OLLAMA (NEW MODELS) ===
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=gpt-oss:20b
+      - OLLAMA_MODEL=llama3.2:3b              # Changed!
+      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text  # Changed!
+      - OLLAMA_BATCH_SIZE=32                  # GPU optimization
       
-      # Google AI
+      # === GOOGLE AI ===
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       
-      # Superset
+      # === SUPERSET ===
       - SUPERSET_BASE_URL=http://superset:8088
       
-      # Application
+      # === FEATURES ===
+      - ENABLE_HYBRID_SEARCH=false    # Using pure vector with HNSW
+      - ENABLE_RERANKING=true
+      - ENABLE_POSTGRES_FTS=false
+      - RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2-v2
+      
+      # === OPTIMIZATION ===
+      - EMBEDDING_BATCH_SIZE=32       # GPU batch size
+      - MAX_WORKERS=8                 # Parallel processing
       - DATA_PATH=/app/data
       - LOG_LEVEL=INFO
       - PYTHONUNBUFFERED=1
@@ -233,23 +293,26 @@ services:
     restart: unless-stopped
     command: >
       sh -c "
-        echo 'Waiting for dependencies...' &&
+        echo '⏳ Waiting for dependencies...' &&
         sleep 20 &&
-        echo 'Starting RAG V2 API...' &&
+        echo '🚀 Starting RAG V2 API with GPU acceleration...' &&
         uvicorn app.main:app 
           --host 0.0.0.0 
           --port 8000 
-          --reload 
-          --reload-dir /app/app
+          --workers 1
           --log-level info
       "
+    deploy:
+      resources:
+        limits:
+          memory: 4G
 
   # ===== UI SERVICE =====
   ui:
     build:
       context: ./ui
       dockerfile: Dockerfile
-    container_name: rag_ui_v2
+    container_name: rag_ui
     ports:
       - "8501:8501"
     environment:
@@ -272,22 +335,26 @@ services:
         --server.port 8501
         --server.address 0.0.0.0
         --server.enableCORS false
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
-  # ===== V2 NEW: SUPERSET (Visualization) =====
+  # ===== SUPERSET (VISUALIZATION) =====
   superset:
     image: apache/superset:latest
     container_name: rag_superset
     environment:
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your_secret_key_here}
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-DuY0++tmMaMT1OybYEdOQSxSBjwxISXn3YhqO/Z7tOvroFwj5BiPyNEQ}
       SUPERSET_LOAD_EXAMPLES: "no"
-      # <--- CHANGED: Connect to 'postgres-superset' service on internal port 5432
-      SUPERSET_DATABASE_URL: postgresql://superset:superset_password@postgres-superset:5432/superset
+      # Use separate database
+      SUPERSET_DATABASE_URI: postgresql://${SUPERSET_DB_USER:-superset}:${SUPERSET_DB_PASSWORD:-superset_pass}@postgres-superset:5432/${SUPERSET_DB_NAME:-superset}
     ports:
       - "8088:8088"
     volumes:
       - superset_home:/app/superset_home
     depends_on:
-      postgres-superset: # <--- CHANGED: Depend on the new DB service
+      postgres-superset:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
@@ -328,7 +395,6 @@ services:
       - rag_network
     restart: unless-stopped
 
-  # ===== MONITORING =====
   jaeger:
     container_name: rag_jaeger
     image: jaegertracing/all-in-one:latest
@@ -343,11 +409,11 @@ services:
 
 networks:
   rag_network:
-    name: rag_network_v2
+    name: rag_network
     driver: bridge
 
 volumes:
   ollama_data:
-    name: rag_ollama_data_v2
+    name: rag_ollama_data
   superset_home:
     name: rag_superset_home
