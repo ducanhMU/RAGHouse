@@ -1,4 +1,4 @@
-# api/requirements.txt - RAG V2
+# api/requirements.txt
 
 # Web Framework
 fastapi==0.115.5
@@ -10,15 +10,14 @@ sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
 alembic==1.14.0
 
-# ClickHouse (V2 NEW)
+# ClickHouse
 clickhouse-connect==0.8.11
 clickhouse-sqlalchemy==0.3.2
 
-# LangChain Core
+# LangChain Core (Bộ 3 này phải đi cùng nhau)
 langchain==0.3.13
 langchain-core==0.3.28
 langchain-community==0.3.13
-langchain-classic
 
 # LangChain Integrations
 langchain-google-genai==2.0.8
@@ -28,7 +27,7 @@ langchain-milvus==0.1.6
 # Vector Store
 pymilvus==2.5.3
 
-# V2 NEW: Reranking & Hybrid Search
+# Reranking & AI
 sentence-transformers==3.3.1
 rank-bm25==0.2.2
 huggingface-hub==0.26.5
@@ -48,12 +47,11 @@ pydantic==2.10.3
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 requests==2.32.3
+aiofiles==24.1.0
 
-# Monitoring & Logging
+# Monitoring
 prometheus-client==0.21.0
 
-# For CPU optimization
-torch==2.5.1+cpu
+# CPU Optimization for Torch
 --extra-index-url https://download.pytorch.org/whl/cpu
-
-aiofiles
+torch==2.5.1+cpu

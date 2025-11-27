@@ -16,7 +16,7 @@ from langchain.retrievers.document_compressors.cross_encoder_rerank import Cross
 
 # SQL Integration
 from langchain_community.utilities import SQLDatabase
-from langchain_classic.chains import create_sql_query_chain
+from langchain.chains import create_sql_query_chain
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 
 # Internal Imports
