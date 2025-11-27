@@ -10,7 +10,7 @@ from sqlalchemy import desc, func, text
 # LangChain Imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
-from langchain.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_community.cross_encoders.huggingface import HuggingFaceCrossEncoder
 from langchain.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
 

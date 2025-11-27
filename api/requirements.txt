@@ -18,6 +18,7 @@ clickhouse-sqlalchemy==0.3.2
 langchain==0.3.13
 langchain-core==0.3.28
 langchain-community==0.3.13
+langchain-classic
 
 # LangChain Integrations
 langchain-google-genai==2.0.8
