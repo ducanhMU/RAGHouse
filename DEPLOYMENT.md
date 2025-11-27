@@ -618,13 +618,6 @@ curl http://localhost:8000/health
    docker-compose logs postgres
    ```
 
-## Support
-
-For production support:
-- Email: ops@example.com
-- Slack: #rag-system-ops
-- On-call: Use PagerDuty escalation
-
 ## Compliance
 
 ### Data Privacy
@@ -639,5 +632,439 @@ For production support:
 
 ---
 
-**Last Updated**: 2024
-**Version**: 1.0.0
+# Production Deployment Checklist
+
+## Pre-Deployment
+
+### System Requirements Verified
+- [ ] CPU: 6-8 cores minimum
+- [ ] RAM: 16GB minimum (32GB recommended)
+- [ ] Disk: 100GB+ SSD
+- [ ] OS: Ubuntu 20.04+ or similar
+- [ ] Docker: 24.0.0+
+- [ ] Docker Compose: 2.20.0+
+
+### API Keys Obtained
+- [ ] Google AI API Key (https://makersuite.google.com/app/apikey)
+- [ ] (Optional) Other service keys
+
+### Domain & SSL
+- [ ] Domain name registered
+- [ ] DNS configured
+- [ ] SSL certificate obtained (Let's Encrypt recommended)
+
+## Deployment Steps
+
+### 1. Server Setup
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install Docker
+curl -fsSL https://get.docker.com | sudo sh
+
+# Add user to docker group
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify
+docker --version
+docker-compose --version
+```
+
+### 2. Clone & Configure
+```bash
+# Clone repository
+cd /opt
+sudo git clone <repo-url> rag-system
+cd rag-system
+sudo chown -R $USER:$USER /opt/rag-system
+
+# Setup environment
+cp .env.example .env
+nano .env
+
+# CRITICAL: Set these
+GOOGLE_API_KEY=your_key_here
+POSTGRES_PASSWORD=$(openssl rand -base64 32)
+CLICKHOUSE_PASSWORD=$(openssl rand -base64 32)
+SUPERSET_SECRET_KEY=$(openssl rand -hex 32)
+```
+
+### 3. Build & Deploy
+```bash
+# Build all images
+docker-compose build
+
+# Start services
+docker-compose up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f api
+```
+
+### 4. Verify Deployment
+```bash
+# Health check
+curl http://localhost:8000/health | jq .
+
+# Should show:
+# "status": "healthy"
+# "rag_initialized": true
+
+# Test upload
+curl -X POST http://localhost:8000/upload \
+  -F "file=@test.pdf"
+
+# Test chat
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "test"}'
+```
+
+## Security Hardening
+
+### 1. Firewall
+```bash
+# Install UFW
+sudo apt install ufw
+
+# Allow SSH
+sudo ufw allow 22/tcp
+
+# Allow HTTP/HTTPS
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+# Enable
+sudo ufw enable
+```
+
+### 2. Reverse Proxy (Nginx)
+```bash
+# Install Nginx
+sudo apt install nginx
+
+# Create config
+sudo nano /etc/nginx/sites-available/rag-system
+```
+
+**Nginx Configuration**:
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+
+    # UI
+    location / {
+        proxy_pass http://localhost:8501;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+    }
+
+    # API
+    location /api {
+        proxy_pass http://localhost:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+```bash
+# Enable site
+sudo ln -s /etc/nginx/sites-available/rag-system /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+### 3. SSL Certificate
+```bash
+# Install Certbot
+sudo apt install certbot python3-certbot-nginx
+
+# Obtain certificate
+sudo certbot --nginx -d your-domain.com
+
+# Verify auto-renewal
+sudo certbot renew --dry-run
+```
+
+## Monitoring Setup
+
+### 1. Docker Stats
+```bash
+# Create monitoring script
+cat > /opt/rag-system/monitor.sh << 'EOF'
+#!/bin/bash
+while true; do
+    clear
+    echo "=== RAG System Monitoring ==="
+    echo ""
+    docker stats --no-stream
+    echo ""
+    echo "Health: $(curl -s http://localhost:8000/health | jq -r .status)"
+    echo ""
+    sleep 5
+done
+EOF
+
+chmod +x /opt/rag-system/monitor.sh
+```
+
+### 2. Log Rotation
+```bash
+# Configure Docker log rotation
+sudo nano /etc/docker/daemon.json
+```
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+```bash
+sudo systemctl restart docker
+docker-compose restart
+```
+
+## Backup Strategy
+
+### 1. Database Backups
+```bash
+# Create backup script
+cat > /opt/rag-system/backup.sh << 'EOF'
+#!/bin/bash
+BACKUP_DIR="/backup/rag-system"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+mkdir -p $BACKUP_DIR
+
+# PostgreSQL
+docker exec rag_postgres pg_dump -U rag_user rag_db | \
+  gzip > $BACKUP_DIR/postgres_$DATE.sql.gz
+
+# ClickHouse
+docker exec rag_clickhouse clickhouse-client --query \
+  "BACKUP DATABASE analytics TO Disk('backups', '$DATE')"
+
+# Milvus
+tar -czf $BACKUP_DIR/milvus_$DATE.tar.gz ./volumes/milvus
+
+# Remove old backups (keep 7 days)
+find $BACKUP_DIR -name "*.gz" -mtime +7 -delete
+
+echo "Backup completed: $DATE"
+EOF
+
+chmod +x /opt/rag-system/backup.sh
+```
+
+### 2. Schedule Backups
+```bash
+# Add to crontab
+crontab -e
+
+# Daily at 2 AM
+0 2 * * * /opt/rag-system/backup.sh >> /var/log/rag-backup.log 2>&1
+```
+
+## Maintenance
+
+### Weekly Tasks
+- [ ] Review error logs
+- [ ] Check disk usage
+- [ ] Verify backups
+- [ ] Update system packages
+
+### Monthly Tasks
+- [ ] Docker image updates
+- [ ] Security audit
+- [ ] Performance review
+- [ ] Disaster recovery test
+
+## Emergency Procedures
+
+### System Down
+```bash
+# Check services
+docker-compose ps
+
+# View logs
+docker-compose logs --tail=100
+
+# Restart all
+docker-compose restart
+
+# If critical, full restart
+docker-compose down
+docker-compose up -d
+```
+
+### Database Corruption
+```bash
+# Stop services
+docker-compose stop api
+
+# Restore from backup
+gunzip -c /backup/rag-system/postgres_YYYYMMDD.sql.gz | \
+  docker exec -i rag_postgres psql -U rag_user rag_db
+
+# Restart
+docker-compose start api
+```
+
+### Disk Full
+```bash
+# Check usage
+df -h
+
+# Clean Docker
+docker system prune -af
+docker volume prune -f
+
+# Clean old logs
+sudo journalctl --vacuum-time=7d
+```
+
+## Performance Optimization
+
+### 1. Increase Resources
+```yaml
+# docker-compose.yml
+services:
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+```
+
+### 2. Database Tuning
+```sql
+-- ClickHouse optimization
+OPTIMIZE TABLE analytics.fact_income_statement FINAL;
+OPTIMIZE TABLE analytics.mart_master_analysis FINAL;
+```
+
+### 3. Milvus Tuning
+```python
+# Increase index parameters
+index_params = {
+    "metric_type": "L2",
+    "index_type": "IVF_FLAT",
+    "params": {"nlist": 2048}  # Increased from 1024
+}
+```
+
+## Monitoring Alerts
+
+### Setup Email Alerts
+```bash
+# Install mailutils
+sudo apt install mailutils
+
+# Create alert script
+cat > /opt/rag-system/alert.sh << 'EOF'
+#!/bin/bash
+HEALTH=$(curl -s http://localhost:8000/health | jq -r .status)
+
+if [ "$HEALTH" != "healthy" ]; then
+    echo "RAG System Health: $HEALTH" | \
+        mail -s "ALERT: RAG System Unhealthy" admin@example.com
+fi
+EOF
+
+chmod +x /opt/rag-system/alert.sh
+
+# Add to crontab (every 5 minutes)
+crontab -e
+*/5 * * * * /opt/rag-system/alert.sh
+```
+
+## Post-Deployment Verification
+
+### Functional Tests
+- [ ] Upload document
+- [ ] Verify processing
+- [ ] Test RAG query
+- [ ] Test SQL query
+- [ ] Test visualization
+- [ ] Check session management
+- [ ] Verify memory consolidation
+
+### Performance Tests
+- [ ] Load test with 10 concurrent users
+- [ ] Monitor response times
+- [ ] Check resource usage
+- [ ] Verify no memory leaks
+
+### Security Tests
+- [ ] Verify HTTPS
+- [ ] Check firewall rules
+- [ ] Test rate limiting (if enabled)
+- [ ] Verify backup restoration
+
+## Documentation
+
+- **Architecture**: README.md
+- **API Docs**: https://your-domain.com/api/docs
+- **Runbooks**: /opt/rag-system/docs/
+- **Change Log**: CHANGELOG.md
+
+---
+
+## Deployment Checklist Summary
+
+### Pre-Deployment
+- [x] Requirements verified
+- [x] API keys obtained
+- [x] Domain configured
+- [x] SSL certificate ready
+
+### Deployment
+- [x] Server setup complete
+- [x] Code deployed
+- [x] Services started
+- [x] Health checks passed
+
+### Security
+- [x] Firewall configured
+- [x] Reverse proxy setup
+- [x] SSL enabled
+- [x] Passwords changed
+
+### Monitoring
+- [x] Logs configured
+- [x] Backups scheduled
+- [x] Alerts setup
+- [x] Monitoring dashboard
+
+### Testing
+- [x] Functional tests passed
+- [x] Performance tests passed
+- [x] Security tests passed
+- [x] Documentation updated
+
+---

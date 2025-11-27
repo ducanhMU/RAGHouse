@@ -3,9 +3,11 @@
 import os
 import shutil
 import logging
+import asyncio
 from datetime import datetime
 from typing import Optional
 import uuid
+import aiofiles
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, BackgroundTasks, status
 from fastapi.responses import StreamingResponse
@@ -13,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc
+from sqlalchemy.exc import IntegrityError
 
 # Internal Modules
 from app.database import init_db, get_db, SessionLocal, FileRegistry, ChatSession, ChatEvent
@@ -22,19 +25,19 @@ from app.rag_core import EnhancedRAGv2
 # --- SETUP ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="RAG System V2",
-    version="2.0.0",
-    description="Enhanced RAG with Hybrid Search, Reranking & Analytics"
+    title="RAG System V2 - Final",
+    version="2.0.0-final",
+    description="Production RAG with Hybrid Search, Analytics & Graceful Degradation"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Restrict in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -42,55 +45,82 @@ app.add_middleware(
 
 DATA_PATH = os.getenv("DATA_PATH", "./data")
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".doc", ".docx"}
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "52428800"))  # 50MB
 
-# Initialize RAG engine
+# Global RAG engine (initialized in background)
 rag_engine: Optional[EnhancedRAGv2] = None
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database, directories, and RAG engine."""
+    """
+    NON-BLOCKING STARTUP
+    Critical services start immediately, others in background
+    """
     global rag_engine
     
+    logger.info("=" * 80)
+    logger.info("🚀 RAG SYSTEM V2 STARTUP")
+    logger.info("=" * 80)
+    
     try:
+        # === CRITICAL: Database ===
+        logger.info("📦 Initializing database...")
         init_db()
+        logger.info("✅ Database ready")
+        
+        # === CRITICAL: Data directory ===
         os.makedirs(DATA_PATH, exist_ok=True)
+        logger.info(f"✅ Data path: {DATA_PATH}")
         
-        # Resume stuck files
-        ingest.resume_stuck_files()
-        
-        # Initialize Milvus collection with dynamic schema
-        ingest.create_collection_with_dynamic_schema()
-        
-        # Initialize RAG V2 engine
+        # === NON-BLOCKING: RAG Engine ===
+        logger.info("🤖 Initializing RAG engine (background)...")
         rag_engine = EnhancedRAGv2()
+        # Note: RAG engine initializes asynchronously
         
-        logger.info("=== RAG System V2 Started Successfully ===")
-        logger.info("Features: Hybrid Search | Reranking | Text-to-SQL | Visualization")
+        # === NON-BLOCKING: Ingest system ===
+        logger.info("📁 Initializing ingest system (background)...")
+        asyncio.create_task(_background_ingest_init())
+        
+        logger.info("=" * 80)
+        logger.info("✅ STARTUP COMPLETE - System running in graceful mode")
+        logger.info("⏳ Background initialization in progress...")
+        logger.info("=" * 80)
+        
     except Exception as e:
-        logger.critical(f"Startup failed: {e}")
+        logger.critical(f"❌ CRITICAL STARTUP FAILURE: {e}")
         raise
+
+
+async def _background_ingest_init():
+    """Background task for non-critical ingest initialization."""
+    try:
+        await asyncio.sleep(2)  # Let server start first
+        
+        logger.info("🔄 Running background ingest tasks...")
+        
+        # Initialize Milvus (with retry)
+        success = await asyncio.to_thread(ingest.initialize_ingest_system)
+        
+        if success:
+            logger.info("✅ Background ingest initialization complete")
+        else:
+            logger.warning("⚠️ Ingest initialization partial failure - system degraded")
+            
+    except Exception as e:
+        logger.error(f"❌ Background ingest failed: {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup on shutdown."""
-    logger.info("RAG System V2 Shutting Down")
+    logger.info("👋 RAG System V2 shutting down...")
 
 
 # --- MODELS ---
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = Field(None, description="Existing session ID")
+    session_id: Optional[str] = Field(None, description="Session ID or None for new")
     message: str = Field(..., min_length=1, max_length=10000)
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "session_id": None,
-                "message": "What was the revenue in Q4?"
-            }
-        }
 
 
 class UploadResponse(BaseModel):
@@ -100,39 +130,42 @@ class UploadResponse(BaseModel):
     message: Optional[str] = None
 
 
-class SessionResponse(BaseModel):
-    id: str
-    title: str
-    created_at: datetime
-    updated_at: datetime
-    message_count: Optional[int] = None
-
-
 class HealthResponse(BaseModel):
     status: str
     version: str
-    features: list
+    features: dict
     services: dict
+    initialization: dict
 
 
-# --- HELPER FUNCTIONS ---
+# --- HELPERS ---
 def validate_file_extension(filename: str) -> bool:
-    """Check if file extension is allowed."""
+    """Check file extension."""
     return any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
 
-
 async def save_upload_file(upload_file: UploadFile, destination: str) -> int:
-    """Save uploaded file and return size."""
+    """
+    Save file asynchronously with size limit enforcement.
+    Uses non-blocking I/O to prevent freezing the event loop.
+    """
     size = 0
-    with open(destination, "wb") as buffer:
-        while chunk := await upload_file.read(8192):
+    
+    # 1. Use async context manager (Non-blocking open)
+    async with aiofiles.open(destination, "wb") as buffer:
+        while chunk := await upload_file.read(8192): # 2. Async read from stream
             size += len(chunk)
+            
+            # 3. Security Check
             if size > MAX_FILE_SIZE:
+                # Stop writing immediately to prevent disk filling
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File exceeds {MAX_FILE_SIZE / (1024*1024)}MB limit"
+                    detail=f"File exceeds {MAX_FILE_SIZE / (1024*1024):.2f}MB limit"
                 )
-            buffer.write(chunk)
+            
+            # 4. Async write to disk (Non-blocking write)
+            await buffer.write(chunk)
+            
     return size
 
 
@@ -140,32 +173,57 @@ async def save_upload_file(upload_file: UploadFile, destination: str) -> int:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(db: Session = Depends(get_db)):
-    """Health check with V2 features."""
+    """
+    COMPREHENSIVE HEALTH CHECK
+    Shows initialization status and graceful degradation
+    """
+    # Check database
     try:
         db.execute("SELECT 1")
         db_status = "healthy"
     except:
         db_status = "unhealthy"
     
-    # Get Milvus stats
+    # Check RAG engine
+    rag_status = "not_initialized"
+    if rag_engine:
+        if rag_engine.initialized:
+            rag_status = "healthy"
+        elif rag_engine.initialization_error:
+            rag_status = "failed"
+        else:
+            rag_status = "initializing"
+    
+    # Check Milvus
     milvus_stats = ingest.get_collection_stats()
     milvus_status = "healthy" if "error" not in milvus_stats else "unhealthy"
     
+    # Overall status
+    if db_status == "healthy" and rag_status == "healthy":
+        overall = "healthy"
+    elif db_status == "healthy":
+        overall = "degraded"
+    else:
+        overall = "unhealthy"
+    
     return {
-        "status": "healthy" if db_status == "healthy" and rag_engine else "degraded",
-        "version": "2.0.0",
-        "features": [
-            "Hybrid Search (Vector + BM25)",
-            "Cross-Encoder Reranking",
-            "Text-to-SQL Analytics",
-            "Visualization Integration",
-            "Dynamic Schema Support"
-        ],
+        "status": overall,
+        "version": "2.0.0-final",
+        "features": {
+            "hybrid_search": os.getenv("ENABLE_HYBRID_SEARCH", "true") == "true",
+            "reranking": os.getenv("ENABLE_RERANKING", "true") == "true",
+            "text_to_sql": bool(os.getenv("CLICKHOUSE_URL")),
+            "visualization": bool(os.getenv("SUPERSET_BASE_URL"))
+        },
         "services": {
             "database": db_status,
-            "rag_engine": "healthy" if rag_engine else "unhealthy",
+            "rag_engine": rag_status,
             "vector_store": milvus_status,
             "milvus_entities": milvus_stats.get("num_entities", 0)
+        },
+        "initialization": {
+            "rag_initialized": rag_engine.initialized if rag_engine else False,
+            "error": rag_engine.initialization_error if rag_engine else None
         }
     }
 
@@ -176,11 +234,14 @@ async def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """Upload document with dynamic schema support."""
+    """
+    IDEMPOTENT FILE UPLOAD
+    Checks hash before processing
+    """
     if not validate_file_extension(file.filename):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File type not supported. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            detail=f"Unsupported file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
         )
     
     unique_filename = f"{uuid.uuid4()}_{file.filename}"
@@ -188,42 +249,68 @@ async def upload_document(
     
     try:
         file_size = await save_upload_file(file, temp_path)
-        logger.info(f"Saved {file.filename} ({file_size} bytes)")
+        logger.info(f"📥 Saved: {file.filename} ({file_size} bytes)")
         
         file_hash = ingest.calculate_md5(temp_path)
         
-        # Check for duplicates
-        existing = db.query(FileRegistry).filter(
-            FileRegistry.file_hash == file_hash
-        ).first()
-        
-        if existing:
-            os.remove(temp_path)
-            return UploadResponse(
-                status="exists",
-                file_id=str(existing.id),
-                processing_status=existing.status,
-                message="File already exists"
-            )
+        # Check for duplicate
+        try:
+            existing = db.query(FileRegistry).filter(
+                FileRegistry.file_hash == file_hash
+            ).first()
+            
+            if existing:
+                os.remove(temp_path)
+                logger.info(f"⏭️ Duplicate: {file.filename} (ID: {existing.id})")
+                return UploadResponse(
+                    status="exists",
+                    file_id=str(existing.id),
+                    processing_status=existing.status,
+                    message="File already exists in system"
+                )
+        except Exception as e:
+            logger.error(f"❌ Duplicate check failed: {e}")
         
         # Register new file
         new_file = FileRegistry(
             file_hash=file_hash,
             filename=file.filename,
-            file_path=temp_path
+            file_path=temp_path,
+            status="PENDING"
         )
-        db.add(new_file)
-        db.commit()
-        db.refresh(new_file)
         
-        # Trigger async processing
+        try:
+            db.add(new_file)
+            db.commit()
+            db.refresh(new_file)
+            logger.info(f"✅ Registered: {file.filename} (ID: {new_file.id})")
+            
+        except IntegrityError as e:
+            # Race condition: file was registered by another request
+            db.rollback()
+            existing = db.query(FileRegistry).filter(
+                FileRegistry.file_hash == file_hash
+            ).first()
+            
+            if existing:
+                os.remove(temp_path)
+                return UploadResponse(
+                    status="exists",
+                    file_id=str(existing.id),
+                    processing_status=existing.status,
+                    message="File registered by concurrent request"
+                )
+            else:
+                raise
+        
+        # Trigger background processing
         background_tasks.add_task(ingest.process_file_task, str(new_file.id))
         
         return UploadResponse(
             status="uploaded",
             file_id=str(new_file.id),
             processing_status="PENDING",
-            message="File queued for processing with dynamic schema support"
+            message="File queued for processing"
         )
         
     except HTTPException:
@@ -233,7 +320,7 @@ async def upload_document(
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        logger.error(f"Upload failed: {e}")
+        logger.error(f"❌ Upload failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Upload failed"
@@ -247,13 +334,8 @@ async def chat_stream(
     db: Session = Depends(get_db)
 ):
     """
-    V2 ENHANCED CHAT: Supports RAG, SQL, and Visualization queries
-    
-    Features:
-    - Intent detection (rag/sql/visualization)
-    - Hybrid search with reranking
-    - Text-to-SQL execution
-    - Dashboard link generation
+    STREAMING CHAT WITH INTENT ROUTING
+    Supports: RAG | SQL | Visualization
     """
     if not rag_engine:
         raise HTTPException(
@@ -261,7 +343,7 @@ async def chat_stream(
             detail="RAG engine not initialized"
         )
     
-    # Session management
+    # Session management with auto-increment
     session_id = req.session_id
     if not session_id:
         new_sess = ChatSession(title=req.message[:50])
@@ -269,7 +351,7 @@ async def chat_stream(
         db.commit()
         db.refresh(new_sess)
         session_id = str(new_sess.id)
-        logger.info(f"Created session: {session_id}")
+        logger.info(f"📝 New session: {session_id}")
     else:
         session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
         if not session:
@@ -277,7 +359,7 @@ async def chat_stream(
         session.updated_at = datetime.utcnow()
         db.commit()
     
-    # Append user message
+    # Auto-increment sequence_num
     last_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
         ChatEvent.session_id == session_id
     ).scalar() or 0
@@ -295,30 +377,30 @@ async def chat_stream(
     # Stream generator
     async def response_generator():
         try:
-            # Send session metadata
             yield f"data: {{'type': 'session', 'session_id': '{session_id}'}}\n\n"
             
             full_response = ""
             model_used = None
-            intent = None
             metadata = {}
             
-            # V2: Process query with unified processor
+            # Process query
             async for chunk, model, meta in rag_engine.process_query(
                 db, session_id, req.message
             ):
                 full_response += chunk
                 model_used = model
-                intent = meta.get('intent')
                 metadata = meta
                 
-                # Stream text
                 yield f"data: {{'type': 'text', 'content': {repr(chunk)}}}\n\n"
             
-            # Send metadata (intent, SQL results, viz links)
+            # Send metadata
             if metadata:
                 import json
-                meta_json = json.dumps(metadata, default=str)
+                meta_json = json.dumps({
+                    'intent': metadata.get('intent'),
+                    'sql': metadata.get('sql_result', {}).get('sql'),
+                    'viz_link': metadata.get('viz_link')
+                }, default=str)
                 yield f"data: {{'type': 'metadata', 'data': {meta_json}}}\n\n"
             
             # Save assistant message
@@ -345,14 +427,15 @@ async def chat_stream(
                     session_id
                 )
                 
+            except Exception as e:
+                logger.error(f"❌ Save failed: {e}")
             finally:
                 db_gen.close()
             
-            # Send completion
-            yield f"data: {{'type': 'done', 'intent': '{intent}'}}\n\n"
+            yield f"data: {{'type': 'done'}}\n\n"
             
         except Exception as e:
-            logger.error(f"Stream error: {e}")
+            logger.error(f"❌ Stream error: {e}")
             yield f"data: {{'type': 'error', 'message': {repr(str(e))}}}\n\n"
 
     return StreamingResponse(
@@ -366,7 +449,7 @@ async def chat_stream(
     )
 
 
-@app.get("/sessions", response_model=list[SessionResponse])
+@app.get("/sessions")
 def list_sessions(
     limit: int = 50,
     offset: int = 0,
@@ -377,33 +460,27 @@ def list_sessions(
         desc(ChatSession.updated_at)
     ).limit(limit).offset(offset).all()
     
-    result = []
-    for s in sessions:
-        msg_count = db.query(func.count(ChatEvent.id)).filter(
-            ChatEvent.session_id == s.id,
-            ChatEvent.event_type == 'NORMAL'
-        ).scalar()
-        
-        result.append(SessionResponse(
-            id=str(s.id),
-            title=s.title,
-            created_at=s.created_at,
-            updated_at=s.updated_at,
-            message_count=msg_count
-        ))
-    
-    return result
+    return [
+        {
+            "id": str(s.id),
+            "title": s.title,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+            "message_count": db.query(func.count(ChatEvent.id)).filter(
+                ChatEvent.session_id == s.id,
+                ChatEvent.event_type == 'NORMAL'
+            ).scalar()
+        }
+        for s in sessions
+    ]
 
 
 @app.get("/sessions/{session_id}/history")
-def get_session_history(
-    session_id: str,
-    db: Session = Depends(get_db)
-):
+def get_session_history(session_id: str, db: Session = Depends(get_db)):
     """Get session history."""
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
     
     events = db.query(ChatEvent).filter(
         ChatEvent.session_id == session_id,
@@ -431,11 +508,10 @@ def delete_session(session_id: str, db: Session = Depends(get_db)):
     """Delete session."""
     session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if not session:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Session not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
     
     db.delete(session)
     db.commit()
-    logger.info(f"Deleted session {session_id}")
     return None
 
 
@@ -446,7 +522,7 @@ def list_files(
     offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """List files."""
+    """List files with optional filter."""
     query = db.query(FileRegistry)
     
     if status_filter:
@@ -460,70 +536,32 @@ def list_files(
             "filename": f.filename,
             "status": f.status,
             "created_at": f.created_at,
-            "updated_at": f.updated_at,
             "error": f.error_log
         }
         for f in files
     ]
 
 
-@app.get("/files/{file_id}")
-def get_file_status(file_id: str, db: Session = Depends(get_db)):
-    """Get file status."""
-    file_record = db.query(FileRegistry).filter(FileRegistry.id == file_id).first()
-    if not file_record:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="File not found")
-    
-    return {
-        "id": str(file_record.id),
-        "filename": file_record.filename,
-        "status": file_record.status,
-        "created_at": file_record.created_at,
-        "updated_at": file_record.updated_at,
-        "error": file_record.error_log
-    }
-
-
 @app.get("/stats/milvus")
 def get_milvus_stats():
-    """V2 FEATURE: Get Milvus collection statistics."""
+    """Get Milvus collection stats."""
     return ingest.get_collection_stats()
 
 
-@app.get("/features")
-def get_features():
-    """V2 FEATURE: List all V2 capabilities."""
+@app.get("/stats/system")
+def get_system_stats(db: Session = Depends(get_db)):
+    """Get overall system statistics."""
     return {
-        "version": "2.0.0",
-        "features": {
-            "hybrid_search": {
-                "enabled": True,
-                "description": "Combines vector search with BM25 keyword matching",
-                "components": ["Dense Vectors (EmbeddingGemma)", "Sparse BM25"]
-            },
-            "reranking": {
-                "enabled": True,
-                "model": "bge-reranker-v2-m3",
-                "description": "Cross-encoder reranks candidates for better relevance"
-            },
-            "text_to_sql": {
-                "enabled": bool(os.getenv("CLICKHOUSE_URL")),
-                "database": "ClickHouse",
-                "description": "Natural language to SQL query conversion"
-            },
-            "visualization": {
-                "enabled": bool(os.getenv("SUPERSET_BASE_URL")),
-                "platform": "Apache Superset",
-                "description": "Dynamic dashboard linking based on query intent"
-            },
-            "dynamic_schema": {
-                "enabled": True,
-                "description": "Milvus adaptive schema handles heterogeneous metadata"
-            },
-            "memory_management": {
-                "enabled": True,
-                "strategy": "Hierarchical 3-5 Rule",
-                "description": "Efficient long-term conversation memory"
-            }
-        }
+        "total_files": db.query(func.count(FileRegistry.id)).scalar(),
+        "files_completed": db.query(func.count(FileRegistry.id)).filter(
+            FileRegistry.status == "COMPLETED"
+        ).scalar(),
+        "files_failed": db.query(func.count(FileRegistry.id)).filter(
+            FileRegistry.status == "FAILED"
+        ).scalar(),
+        "total_sessions": db.query(func.count(ChatSession.id)).scalar(),
+        "total_messages": db.query(func.count(ChatEvent.id)).filter(
+            ChatEvent.event_type == 'NORMAL'
+        ).scalar(),
+        "vector_store": ingest.get_collection_stats()
     }

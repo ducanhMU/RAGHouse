@@ -54,3 +54,5 @@ prometheus-client==0.21.0
 # For CPU optimization
 torch==2.5.1+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
+
+aiofiles

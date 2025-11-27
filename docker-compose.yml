@@ -2,6 +2,8 @@ version: '3.8'
 
 services:
   # ===== DATABASES =====
+  
+  # 1. Main RAG Database (Business Data)
   postgres:
     image: postgres:15-alpine
     container_name: rag_postgres
@@ -12,9 +14,30 @@ services:
     volumes:
       - ./volumes/postgres:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5432:5432" # Standard port for App DB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+  # 2. Superset Database (Metadata) - NEW SEPARATE SERVICE
+  postgres-superset: # <--- NEW: Dedicated DB service for Superset
+    image: postgres:15-alpine
+    container_name: rag_postgres_superset
+    environment:
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset_password
+      POSTGRES_DB: superset
+    volumes:
+      - ./volumes/postgres-superset:/var/lib/postgresql/data # <--- NEW: Separate volume
+    ports:
+      - "5433:5432" # <--- CHANGED: Host port 5433 to avoid conflict with main postgres (5432)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -34,8 +57,8 @@ services:
       - ./volumes/clickhouse:/var/lib/clickhouse
       - ./clickhouse-init:/docker-entrypoint-initdb.d
     ports:
-      - "8123:8123"  # HTTP
-      - "9000:9000"  # Native
+      - "8123:8123"
+      - "9000:9000"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 10s
@@ -137,7 +160,6 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    # V2: Pull required models
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -145,14 +167,9 @@ services:
         OLLAMA_PID=$$!
         echo "Waiting for Ollama to start..."
         sleep 10
-        
-        echo "Pulling EmbeddingGemma for embeddings..."
+        # Only pull if not exists (simplified logic)
         ollama pull embeddinggemma
-        
-        echo "Pulling gpt-oss:20b for inference (quantized)..."
         ollama pull gpt-oss:20b
-        
-        echo "All models ready!"
         wait $$OLLAMA_PID
 
   # ===== API SERVICE =====
@@ -168,10 +185,10 @@ services:
       - ./api/data:/app/data
       - ./api/logs:/app/logs
     environment:
-      # Database
+      # Database (Connects to main 'postgres' service)
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
       
-      # ClickHouse (V2 NEW)
+      # ClickHouse
       - CLICKHOUSE_URL=clickhouse://default:${CLICKHOUSE_PASSWORD:-clickhouse_pass}@clickhouse:8123/analytics
       
       # Milvus
@@ -186,7 +203,7 @@ services:
       # Google AI
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       
-      # Superset (V2 NEW)
+      # Superset
       - SUPERSET_BASE_URL=http://superset:8088
       
       # Application
@@ -263,13 +280,14 @@ services:
     environment:
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-your_secret_key_here}
       SUPERSET_LOAD_EXAMPLES: "no"
-      SUPERSET_DATABASE_URL: postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/superset
+      # <--- CHANGED: Connect to 'postgres-superset' service on internal port 5432
+      SUPERSET_DATABASE_URL: postgresql://superset:superset_password@postgres-superset:5432/superset
     ports:
       - "8088:8088"
     volumes:
       - superset_home:/app/superset_home
     depends_on:
-      postgres:
+      postgres-superset: # <--- CHANGED: Depend on the new DB service
         condition: service_healthy
       clickhouse:
         condition: service_healthy
