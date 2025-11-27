@@ -3,7 +3,7 @@
 import os
 import uuid
 import enum
-from sqlalchemy import create_engine, Column, String, Text, Integer, DateTime, ForeignKey, Index
+from sqlalchemy import create_engine, Column, String, Text, Integer, DateTime, ForeignKey, Index, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ENUM as PG_ENUM
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.sql import func
@@ -176,8 +176,8 @@ def init_db():
     # Create indexes if not exist
     with engine.connect() as conn:
         # Ensure GIN index exists for JSONB
-        conn.execute("""
+        conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_file_meta_gin 
             ON file_registry USING gin(meta_info)
-        """)
+        """))
         conn.commit()
