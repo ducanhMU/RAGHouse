@@ -101,7 +101,7 @@ class EnhancedRAGv2:
                 
                 # Also use for intent classification
                 self.intent_classifier = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash-exp",
+                    model="gemini-2.0-flash",
                     temperature=0.1,
                     google_api_key=GOOGLE_API_KEY
                 )
