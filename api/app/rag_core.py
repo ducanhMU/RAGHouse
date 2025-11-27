@@ -91,7 +91,7 @@ class EnhancedRAGv2:
         if GOOGLE_API_KEY:
             try:
                 self.primary_llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash-exp",
+                    model="gemini-2.0-flash",
                     temperature=0.3,
                     google_api_key=GOOGLE_API_KEY,
                     convert_system_message_to_human=True,
@@ -155,11 +155,13 @@ class EnhancedRAGv2:
                 CLICKHOUSE_URL,
                 # Only expose safe tables
                 include_tables=[
-                    'dim_company',
-                    'fact_income_statement',
-                    'fact_balance_sheet',
+                    'dim_company', 
+                    'dim_period',
+                    'fact_income_statement', 
+                    'fact_balance_sheet', 
                     'fact_cash_flow',
                     'fact_daily_market',
+                    'dim_macro_indicator'
                     'fact_macro_timeseries',
                     'mart_master_analysis'
                 ],
