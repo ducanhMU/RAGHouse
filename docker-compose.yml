@@ -270,16 +270,7 @@ services:
       - rag_network
     restart: unless-stopped
     command: >
-      sh -c "
-        echo '⏳ Waiting for dependencies...' &&
-        sleep 20 &&
-        echo '🚀 Starting RAG V2 API with GPU acceleration...' &&
-        uvicorn app.main:app \
-          --host 0.0.0.0 \
-          --port 8000 \
-          --workers 1 \
-          --log-level info
-      "
+      sh -c "echo '⏳ Waiting...' && sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --log-level info"
     deploy:
       resources:
         limits:
