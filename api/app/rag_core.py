@@ -1,623 +1,353 @@
-# file: api/app/rag_core.py
+"""
+RAG V2 - Hybrid Search + Reranking + LLM Integration
+"""
 
-import os
 import logging
-import asyncio
-from typing import AsyncGenerator, Tuple, List, Dict, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import desc, func, text
+import os
+import time
+from typing import List, Dict, Optional
+import numpy as np
+from pymilvus import connections, Collection, utility
+from sentence_transformers import CrossEncoder
+import google.generativeai as genai
+import requests
 
-# LangChain Imports
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_community.cross_encoders.huggingface import HuggingFaceCrossEncoder
-from langchain.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
-
-# SQL Integration
-from langchain_community.utilities import SQLDatabase
-from langchain.chains import create_sql_query_chain
-from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
-
-# Internal Imports
-from app.database import ChatEvent, SessionLocal, EventType, MessageRole, Visibility
-from app import ingest
-
-# --- CONFIGURATION ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL")
-SUPERSET_BASE_URL = os.getenv("SUPERSET_BASE_URL", "http://superset:8088")
-
-# Feature Flags
-ENABLE_RERANKING = os.getenv("ENABLE_RERANKING", "true").lower() == "true"
-ENABLE_POSTGRES_FTS = os.getenv("ENABLE_POSTGRES_FTS", "false").lower() == "true"
-
-# Logging
 logger = logging.getLogger(__name__)
 
-class EnhancedRAGv2:
-    """
-    ULTIMATE RAG ENGINE
+# =========================================
+# CONFIGURATION
+# =========================================
+
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "rag_collection_v2_hnsw")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-TinyBERT-L-2-v2")
+
+# =========================================
+# MILVUS VECTOR STORE
+# =========================================
+
+class MilvusStore:
+    """Milvus vector database manager"""
     
-    Fixes:
-    - Removed BM25 in-memory (use Postgres FTS instead)
-    - Semantic intent detection
-    - Lighter reranker (TinyBERT)
-    - SQL injection protection
-    - Async memory consolidation
-    """
+    def __init__(self, max_retries=10):
+        self.collection_name = COLLECTION_NAME
+        self.max_retries = max_retries
+        self.collection: Optional[Collection] = None
+        self._connect_with_retry()
+    
+    def _connect_with_retry(self):
+        """Connect to Milvus with retry logic"""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                logger.info(f"🔌 Connecting to Milvus (Attempt {attempt}/{self.max_retries})...")
+                connections.connect(
+                    alias="default",
+                    host=MILVUS_HOST,
+                    port=MILVUS_PORT
+                )
+                
+                # Create collection if not exists
+                if not utility.has_collection(self.collection_name):
+                    self._create_collection()
+                
+                self.collection = Collection(self.collection_name)
+                self.collection.load()
+                logger.info(f"✅ Milvus connected. Collection: {self.collection_name}")
+                return
+                
+            except Exception as e:
+                logger.warning(f"❌ Milvus connection failed: {e}")
+                if attempt < self.max_retries:
+                    time.sleep(3 * attempt)
+                else:
+                    raise ConnectionError("Failed to connect to Milvus")
+    
+    def _create_collection(self):
+        """Create collection with HNSW index"""
+        from pymilvus import CollectionSchema, FieldSchema, DataType
+        
+        logger.info(f"Creating collection: {self.collection_name}")
+        
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=768),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
+            FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="page_number", dtype=DataType.INT64)
+        ]
+        
+        schema = CollectionSchema(fields=fields, description="RAG V2 HNSW Collection")
+        collection = Collection(name=self.collection_name, schema=schema)
+        
+        # Create HNSW index for fast ANN search
+        index_params = {
+            "index_type": "HNSW",
+            "metric_type": "L2",
+            "params": {"M": 16, "efConstruction": 200}
+        }
+        collection.create_index(field_name="vector", index_params=index_params)
+        logger.info("✅ Collection created with HNSW index")
+    
+    def insert_vectors(self, vectors: List[List[float]], texts: List[str], 
+                      file_ids: List[str], page_numbers: List[int]):
+        """Batch insert vectors"""
+        data = [
+            vectors,
+            texts,
+            file_ids,
+            page_numbers
+        ]
+        self.collection.insert(data)
+        self.collection.flush()
+    
+    def search(self, query_vector: List[float], top_k: int = 10) -> List[Dict]:
+        """Vector similarity search"""
+        search_params = {"metric_type": "L2", "params": {"ef": 100}}
+        
+        results = self.collection.search(
+            data=[query_vector],
+            anns_field="vector",
+            param=search_params,
+            limit=top_k,
+            output_fields=["text", "file_id", "page_number"]
+        )
+        
+        hits = []
+        for hit in results[0]:
+            hits.append({
+                "id": str(hit.id),
+                "text": hit.entity.get("text"),
+                "file_id": hit.entity.get("file_id"),
+                "page_number": hit.entity.get("page_number"),
+                "distance": hit.distance,
+                "score": 1 / (1 + hit.distance)  # Convert distance to similarity
+            })
+        return hits
+    
+    def delete_by_file(self, file_id: str):
+        """Delete all vectors for a file"""
+        expr = f'file_id == "{file_id}"'
+        self.collection.delete(expr)
+        self.collection.flush()
+
+
+# =========================================
+# EMBEDDING SERVICE (OLLAMA)
+# =========================================
+
+class EmbeddingService:
+    """GPU-accelerated embedding via Ollama"""
     
     def __init__(self):
-        """Initialize with non-blocking pattern."""
-        self.initialized = False
-        self.initialization_error = None
+        self.base_url = OLLAMA_BASE_URL
+        self.model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+    
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Batch embedding for maximum GPU utilization"""
+        all_embeddings = []
         
-        # Core components
-        self.primary_llm = None
-        self.fallback_llm = None
-        self.intent_classifier = None  # NEW: Semantic router
-        self.cross_encoder = None
-        self.reranker = None
-        self.sql_db = None
-        self.sql_chain = None
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            response = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": batch}
+            )
+            response.raise_for_status()
+            
+            embeddings = response.json().get("embedding") or response.json().get("embeddings")
+            all_embeddings.extend(embeddings if isinstance(embeddings[0], list) else [embeddings])
         
-        # Start background initialization
-        logger.info("🚀 RAG V2 Engine initialization...")
-        asyncio.create_task(self._initialize_async())
+        return all_embeddings
     
-    async def _initialize_async(self):
-        """Background initialization."""
-        try:
-            await self._init_llms()
-            
-            if ENABLE_RERANKING:
-                await self._init_reranker()
-            
-            if CLICKHOUSE_URL:
-                await self._init_sql_db()
-            
-            self.initialized = True
-            logger.info("✅ RAG V2 Engine ready")
-            
-        except Exception as e:
-            self.initialization_error = str(e)
-            logger.error(f"❌ Init failed: {e}")
-    
-    async def _init_llms(self):
-        """Initialize LLMs."""
-        # Primary: Gemini
-        if GOOGLE_API_KEY:
-            try:
-                self.primary_llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash",
-                    temperature=0.3,
-                    google_api_key=GOOGLE_API_KEY,
-                    convert_system_message_to_human=True,
-                    streaming=True,
-                    max_output_tokens=4096
-                )
-                
-                # Also use for intent classification
-                self.intent_classifier = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-flash",
-                    temperature=0.1,
-                    google_api_key=GOOGLE_API_KEY
-                )
-                
-                await asyncio.to_thread(
-                    self.primary_llm.invoke,
-                    [HumanMessage(content="test")]
-                )
-                logger.info("✅ Gemini loaded")
-            except Exception as e:
-                logger.warning(f"⚠️ Gemini failed: {e}")
-                self.primary_llm = None
-        
-        # Fallback: Ollama
-        try:
-            self.fallback_llm = ChatOllama(
-                model=OLLAMA_MODEL,
-                base_url=OLLAMA_BASE_URL,
-                temperature=0.3,
-                num_predict=4096
-            )
-            await asyncio.to_thread(
-                self.fallback_llm.invoke,
-                [HumanMessage(content="test")]
-            )
-            logger.info(f"✅ Ollama loaded")
-        except Exception as e:
-            logger.error(f"❌ Ollama failed: {e}")
-            raise RuntimeError("At least one LLM required")
-    
-    async def _init_reranker(self):
-        """Initialize lighter reranker."""
-        try:
-            # Using TinyBERT instead of bge-reranker (10x faster on CPU)
-            self.cross_encoder = HuggingFaceCrossEncoder(
-                model_name="cross-encoder/ms-marco-TinyBERT-L-2-v2"
-            )
-            self.reranker = CrossEncoderReranker(
-                model=self.cross_encoder,
-                top_n=5
-            )
-            logger.info("✅ TinyBERT reranker loaded (fast)")
-        except Exception as e:
-            logger.warning(f"⚠️ Reranker failed: {e}")
-            self.reranker = None
-    
-    async def _init_sql_db(self):
-        """Initialize SQL with READ-ONLY user."""
-        try:
-            self.sql_db = SQLDatabase.from_uri(
-                CLICKHOUSE_URL,
-                # Only expose safe tables
-                include_tables=[
-                    'dim_company', 
-                    'dim_period',
-                    'fact_income_statement', 
-                    'fact_balance_sheet', 
-                    'fact_cash_flow',
-                    'fact_daily_market',
-                    'dim_macro_indicator'
-                    'fact_macro_timeseries',
-                    'mart_master_analysis'
-                ],
-                view_support=True
-            )
-            logger.info("✅ ClickHouse connected (READ-ONLY)")
-        except Exception as e:
-            logger.warning(f"⚠️ ClickHouse failed: {e}")
-            self.sql_db = None
+    def embed_single(self, text: str) -> List[float]:
+        """Single text embedding"""
+        return self.embed_batch([text])[0]
 
-    def _get_hybrid_retriever_postgres(self, query: str, k: int = 20) -> List:
-        """
-        FIXED HYBRID SEARCH: Uses Postgres FTS instead of BM25
-        No more in-memory index building!
-        """
-        try:
-            vector_db = ingest.get_vector_store()
-            
-            # Pure vector search
-            vector_results = vector_db.similarity_search(query, k=k)
-            
-            # If Postgres FTS enabled
-            if ENABLE_POSTGRES_FTS:
-                # TODO: Implement Postgres full-text search
-                # This would query a separate FTS table
-                # For now, use vector only
-                pass
-            
-            logger.info(f"📊 Retrieved {len(vector_results)} documents")
-            return vector_results
-                
-        except Exception as e:
-            logger.error(f"❌ Retrieval failed: {e}")
+
+# =========================================
+# RERANKER (CROSS-ENCODER)
+# =========================================
+
+class Reranker:
+    """GPU-accelerated reranking"""
+    
+    def __init__(self):
+        self.model = CrossEncoder(RERANKER_MODEL, max_length=512, device='cuda')
+    
+    def rerank(self, query: str, documents: List[Dict], top_k: int = 5) -> List[Dict]:
+        """Rerank documents using cross-encoder"""
+        if not documents:
             return []
-
-    def _rerank_documents(self, query: str, documents: List, top_k: int = 5) -> List:
-        """Reranking with TinyBERT."""
-        if not self.reranker or not documents or not ENABLE_RERANKING:
-            return documents[:top_k]
         
-        try:
-            reranked = self.reranker.compress_documents(documents, query)
-            logger.info(f"🎯 Reranked: {len(reranked)}")
-            return reranked[:top_k]
-        except Exception as e:
-            logger.warning(f"⚠️ Reranking failed: {e}")
-            return documents[:top_k]
-
-    def get_retrieval_context(self, query: str, k: int = 5) -> str:
-        """Enhanced retrieval pipeline."""
-        try:
-            # Hybrid search (fixed)
-            candidates = self._get_hybrid_retriever_postgres(query, k=20)
-            
-            if not candidates:
-                return "No relevant documents found."
-            
-            # Rerank
-            final_docs = self._rerank_documents(query, candidates, top_k=k)
-            
-            # Format
-            context_parts = []
-            for idx, doc in enumerate(final_docs, 1):
-                source = doc.metadata.get('filename', 'Unknown')
-                page = doc.metadata.get('page', 'N/A')
-                context_parts.append(
-                    f"[Doc {idx}: {source}, Page {page}]\n{doc.page_content}\n"
-                )
-            
-            return "\n".join(context_parts)
-            
-        except Exception as e:
-            logger.error(f"❌ Retrieval failed: {e}")
-            return "Error retrieving documents."
-
-    async def _detect_intent_semantic(self, query: str) -> str:
-        """
-        SEMANTIC INTENT DETECTION
-        Uses LLM for classification (more accurate than keywords)
-        """
-        if not self.intent_classifier:
-            # Fallback to keyword-based
-            return self._detect_intent_keyword(query)
+        pairs = [[query, doc["text"]] for doc in documents]
+        scores = self.model.predict(pairs)
         
-        try:
-            prompt = f"""Classify this user query into ONE category:
-- "rag": Question about documents, general knowledge
-- "sql": Question about numbers, statistics, financial data (revenue, profit, etc.)
-- "visualization": Request for charts, graphs, dashboards
+        for doc, score in zip(documents, scores):
+            doc["rerank_score"] = float(score)
+        
+        reranked = sorted(documents, key=lambda x: x["rerank_score"], reverse=True)
+        return reranked[:top_k]
 
-User query: "{query}"
 
-Answer with ONLY ONE WORD: rag, sql, or visualization"""
-            
-            response = await asyncio.to_thread(
-                self.intent_classifier.invoke,
-                [HumanMessage(content=prompt)]
-            )
-            
-            intent = response.content.strip().lower()
-            if intent in ['rag', 'sql', 'visualization']:
-                logger.info(f"🎯 Intent (semantic): {intent}")
-                return intent
-            else:
-                return 'rag'
-                
-        except Exception as e:
-            logger.warning(f"⚠️ Semantic intent failed: {e}, using keywords")
-            return self._detect_intent_keyword(query)
+# =========================================
+# HYBRID SEARCH (RRF FUSION)
+# =========================================
+
+def reciprocal_rank_fusion(results_list: List[List[Dict]], k: int = 60) -> List[Dict]:
+    """Combine multiple ranking lists using RRF"""
+    doc_scores = {}
     
-    def _detect_intent_keyword(self, query: str) -> str:
-        """Fallback keyword-based detection."""
-        query_lower = query.lower()
+    for results in results_list:
+        for rank, doc in enumerate(results, start=1):
+            doc_id = doc.get("id") or doc.get("text")[:50]
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = {"doc": doc, "score": 0}
+            doc_scores[doc_id]["score"] += 1 / (rank + k)
+    
+    sorted_docs = sorted(doc_scores.values(), key=lambda x: x["score"], reverse=True)
+    return [item["doc"] for item in sorted_docs]
+
+
+# =========================================
+# LLM SERVICE (GEMINI + OLLAMA FALLBACK)
+# =========================================
+
+class LLMService:
+    """Dual LLM with fallback"""
+    
+    def __init__(self):
+        self.ollama_url = OLLAMA_BASE_URL
+        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
         
-        sql_keywords = ['doanh thu', 'revenue', 'lợi nhuận', 'profit', 'sales']
-        viz_keywords = ['biểu đồ', 'chart', 'graph', 'dashboard']
-        
-        if any(kw in query_lower for kw in viz_keywords):
-            return 'visualization'
-        elif any(kw in query_lower for kw in sql_keywords):
-            return 'sql'
-        else:
-            return 'rag'
-
-    async def _execute_sql_query(self, query: str) -> Dict:
-        """
-        TEXT-TO-SQL with READ-ONLY protection
-        """
-        if not self.sql_db:
-            return {"error": "ClickHouse not configured"}
-        
-        try:
-            if not self.sql_chain:
-                llm = self.primary_llm if self.primary_llm else self.fallback_llm
-                self.sql_chain = create_sql_query_chain(llm, self.sql_db)
-            
-            # Generate SQL
-            logger.info(f"🔍 Generating SQL...")
-            sql_query = await self.sql_chain.ainvoke({"question": query})
-            
-            # Validate (basic protection)
-            sql_lower = sql_query.lower()
-            dangerous_keywords = ['drop', 'delete', 'truncate', 'update', 'insert', 'alter']
-            
-            if any(kw in sql_lower for kw in dangerous_keywords):
-                return {
-                    "error": "SQL query contains dangerous operations",
-                    "type": "sql_error"
-                }
-            
-            # Execute
-            executor = QuerySQLDataBaseTool(db=self.sql_db)
-            result = await asyncio.to_thread(executor.invoke, sql_query)
-            
-            logger.info(f"✅ SQL executed")
-            
-            return {
-                "sql": sql_query,
-                "result": result,
-                "type": "sql_query"
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ SQL failed: {e}")
-            return {"error": str(e), "type": "sql_error"}
-
-    def _get_visualization_link(self, query: str) -> Optional[str]:
-        """Map query to dashboard."""
-        query_lower = query.lower()
-        
-        dashboard_map = {
-            'revenue': '/superset/dashboard/revenue/',
-            'doanh thu': '/superset/dashboard/revenue/',
-            'profit': '/superset/dashboard/profitability/',
-            'lợi nhuận': '/superset/dashboard/profitability/',
-            'financial': '/superset/dashboard/financial/',
-            'tài chính': '/superset/dashboard/financial/',
-        }
-        
-        for keyword, path in dashboard_map.items():
-            if keyword in query_lower:
-                return f"{SUPERSET_BASE_URL}{path}"
-        
-        return None
-
-    def build_hierarchical_context(self, db: Session, session_id: str) -> str:
-        """
-        MEMORY: 3-3 Rule
-        """
-        try:
-            # Get latest Checkpoint
-            checkpoint = db.query(ChatEvent).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.CHECKPOINT
-            ).order_by(desc(ChatEvent.sequence_num)).first()
-            
-            checkpoint_txt = checkpoint.content if checkpoint else "No history."
-            last_seq = checkpoint.sequence_num if checkpoint else 0
-
-            # Get Summaries
-            summaries = db.query(ChatEvent).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.SUMMARY,
-                ChatEvent.sequence_num > last_seq
-            ).order_by(ChatEvent.sequence_num).all()
-            
-            summary_txt = "\n".join([f"- {s.content}" for s in summaries]) if summaries else "No summaries."
-            
-            if summaries:
-                last_seq = summaries[-1].sequence_num
-
-            # Get Recent
-            raw_msgs = db.query(ChatEvent).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.NORMAL,
-                ChatEvent.sequence_num > last_seq
-            ).order_by(ChatEvent.sequence_num).limit(10).all()
-            
-            recent_txt = "\n".join([
-                f"{msg.role.value.upper()}: {msg.content}" 
-                for msg in raw_msgs
-            ]) if raw_msgs else "No recent messages."
-
-            return f"""[CHECKPOINT]:
-{checkpoint_txt}
-
-[SUMMARIES]:
-{summary_txt}
-
-[RECENT]:
-{recent_txt}"""
-            
-        except Exception as e:
-            logger.error(f"❌ Context failed: {e}")
-            return "Error loading history."
-
-    async def generate_stream(
-        self, 
-        memory_ctx: str, 
-        rag_ctx: str, 
-        user_query: str,
-        intent: str = 'rag',
-        sql_result: Optional[Dict] = None,
-        viz_link: Optional[str] = None
-    ) -> AsyncGenerator[Tuple[str, str], None]:
-        """Generation with failover."""
-        # Build prompt
-        if intent == 'sql' and sql_result:
-            system_instruction = f"""You are a financial analyst. Use SQL results.
-
-SQL: {sql_result.get('sql', 'N/A')}
-Results: {sql_result.get('result', 'N/A')}
-
-Provide clear interpretation.
-
-HISTORY:
-{memory_ctx}"""
-
-        elif intent == 'visualization' and viz_link:
-            system_instruction = f"""You are a visualization assistant.
-
-Dashboard: {viz_link}
-
-Explain what insights are available.
-
-HISTORY:
-{memory_ctx}"""
-
-        else:  # RAG
-            system_instruction = f"""You are an AI financial analyst.
-
-GUIDELINES:
-1. Use [KNOWLEDGE BASE] for facts
-2. Cite sources
-3. Be accurate
-4. Use [HISTORY] for context
-
-[KNOWLEDGE BASE]:
-{rag_ctx}
-
-[HISTORY]:
-{memory_ctx}"""
-
-        messages = [
-            SystemMessage(content=system_instruction),
-            HumanMessage(content=user_query)
-        ]
-
-        # Failover
-        model_used = None
-        
-        if self.primary_llm:
+        # Configure Gemini if API key exists
+        self.use_gemini = bool(GOOGLE_API_KEY)
+        if self.use_gemini:
+            genai.configure(api_key=GOOGLE_API_KEY)
+            self.gemini = genai.GenerativeModel('gemini-2.0-flash-exp')
+    
+    def generate(self, prompt: str, temperature: float = 0.7) -> Dict:
+        """Generate with Gemini, fallback to Ollama"""
+        # Try Gemini first
+        if self.use_gemini:
             try:
-                logger.info("🚀 Using Gemini")
-                async for chunk in self.primary_llm.astream(messages):
-                    if chunk.content:
-                        model_used = "gemini-2.0-flash"
-                        yield chunk.content, model_used
-                return
-            except Exception as e:
-                logger.warning(f"⚠️ Gemini failed: {e}")
-        
-        if self.fallback_llm:
-            try:
-                logger.info(f"🔄 Using Ollama")
-                async for chunk in self.fallback_llm.astream(messages):
-                    if chunk.content:
-                        model_used = f"ollama-{OLLAMA_MODEL}"
-                        yield chunk.content, model_used
-            except Exception as e:
-                logger.critical(f"❌ Both LLMs failed: {e}")
-                yield "Unable to process request.", "error"
-        else:
-            yield "No LLM available.", "error"
-
-    async def process_query(
-        self,
-        db: Session,
-        session_id: str,
-        user_query: str
-    ) -> AsyncGenerator[Tuple[str, str, Dict], None]:
-        """Unified processor."""
-        # Wait for init
-        max_wait = 30
-        waited = 0
-        while not self.initialized and waited < max_wait:
-            await asyncio.sleep(0.5)
-            waited += 0.5
-        
-        # Semantic intent detection
-        intent = await self._detect_intent_semantic(user_query)
-        logger.info(f"🎯 Intent: {intent}")
-        
-        # Build memory
-        memory_ctx = self.build_hierarchical_context(db, session_id)
-        
-        # Execute
-        sql_result = None
-        viz_link = None
-        rag_ctx = ""
-        
-        if intent == 'sql':
-            sql_result = await self._execute_sql_query(user_query)
-        elif intent == 'visualization':
-            viz_link = self._get_visualization_link(user_query)
-        else:
-            rag_ctx = self.get_retrieval_context(user_query, k=5)
-        
-        metadata = {
-            'intent': intent,
-            'sql_result': sql_result,
-            'viz_link': viz_link
-        }
-        
-        async for chunk, model in self.generate_stream(
-            memory_ctx, rag_ctx, user_query, intent, sql_result, viz_link
-        ):
-            yield chunk, model, metadata
-
-    async def trigger_memory_consolidation(self, session_id: str):
-        """
-        ASYNC MEMORY CONSOLIDATION
-        Runs in background, doesn't block user response
-        """
-        db = SessionLocal()
-        try:
-            logger.info(f"🧠 Memory consolidation: {session_id}")
-            
-            # Check for Summary (3 turns = 6 messages)
-            last_summary_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type.in_([EventType.SUMMARY, EventType.CHECKPOINT])
-            ).scalar() or 0
-
-            new_msgs = db.query(ChatEvent).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.NORMAL,
-                ChatEvent.sequence_num > last_summary_seq
-            ).order_by(ChatEvent.sequence_num).all()
-
-            if len(new_msgs) >= 6:
-                logger.info(f"📝 Creating SUMMARY")
-                await self._create_summary_async(db, session_id, new_msgs[:6], EventType.SUMMARY)
-
-            # Check for Checkpoint (3 summaries)
-            last_checkpoint_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.CHECKPOINT
-            ).scalar() or 0
-
-            summaries = db.query(ChatEvent).filter(
-                ChatEvent.session_id == session_id,
-                ChatEvent.event_type == EventType.SUMMARY,
-                ChatEvent.sequence_num > last_checkpoint_seq
-            ).order_by(ChatEvent.sequence_num).all()
-
-            if len(summaries) >= 3:
-                logger.info(f"🔖 Creating CHECKPOINT")
-                await self._create_summary_async(db, session_id, summaries, EventType.CHECKPOINT)
-                
-        except Exception as e:
-            logger.error(f"❌ Memory consolidation failed: {e}")
-        finally:
-            db.close()
-
-    async def _create_summary_async(
-        self, 
-        db: Session, 
-        session_id: str, 
-        events: list, 
-        target_type: EventType
-    ):
-        """Async summarization."""
-        try:
-            if target_type == EventType.SUMMARY:
-                text = "\n".join([f"{e.role.value}: {e.content}" for e in events])
-                prompt = f"Summarize concisely (< 100 words):\n\n{text}\n\nSUMMARY:"
-            else:
-                text = "\n".join([f"Part {i+1}: {e.content}" for i, e in enumerate(events)])
-                prompt = f"Comprehensive summary (< 200 words):\n\n{text}\n\nSUMMARY:"
-
-            summary = None
-            llm = self.primary_llm if self.primary_llm else self.fallback_llm
-            
-            if llm:
-                try:
-                    response = await asyncio.to_thread(
-                        llm.invoke,
-                        [HumanMessage(content=prompt)]
+                response = self.gemini.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=2048
                     )
-                    summary = response.content
-                except Exception as e:
-                    logger.error(f"❌ Summarization failed: {e}")
-                    return
-
-            if not summary:
-                return
-
-            # Store
-            next_seq = db.query(func.max(ChatEvent.sequence_num)).filter(
-                ChatEvent.session_id == session_id
-            ).scalar() + 1
-            
-            new_event = ChatEvent(
-                session_id=session_id,
-                sequence_num=next_seq,
-                role=MessageRole.SYSTEM,
-                content=summary,
-                event_type=target_type,
-                visibility=Visibility.HIDDEN
+                )
+                return {
+                    "text": response.text,
+                    "model": "gemini-2.0-flash",
+                    "source": "cloud"
+                }
+            except Exception as e:
+                logger.warning(f"Gemini failed: {e}. Falling back to Ollama...")
+        
+        # Fallback to Ollama
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": temperature}
+                }
             )
-            db.add(new_event)
-            db.commit()
-            
-            logger.info(f"✅ {target_type.value} created")
-            
+            response.raise_for_status()
+            return {
+                "text": response.json()["response"],
+                "model": self.ollama_model,
+                "source": "local"
+            }
         except Exception as e:
-            logger.error(f"❌ Summary failed: {e}")
-            db.rollback()
+            logger.error(f"Ollama failed: {e}")
+            raise
+
+
+# =========================================
+# MAIN RAG ENGINE
+# =========================================
+
+class RAGEngine:
+    """Complete RAG pipeline"""
+    
+    def __init__(self, db_manager, keyword_search_fn):
+        self.vector_store = MilvusStore()
+        self.embedder = EmbeddingService()
+        self.reranker = Reranker()
+        self.llm = LLMService()
+        self.keyword_search_fn = keyword_search_fn
+    
+    def hybrid_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Hybrid search with RRF fusion"""
+        # 1. Semantic search
+        query_vector = self.embedder.embed_single(query)
+        semantic_results = self.vector_store.search(query_vector, top_k=10)
+        
+        # 2. Keyword search
+        keyword_results = self.keyword_search_fn(query, limit=10)
+        keyword_results = [
+            {**r, "id": str(r["id"]), "text": r["content"]}
+            for r in keyword_results
+        ]
+        
+        # 3. RRF Fusion
+        fused_results = reciprocal_rank_fusion([semantic_results, keyword_results])
+        
+        # 4. Reranking
+        final_results = self.reranker.rerank(query, fused_results[:10], top_k=top_k)
+        
+        return final_results
+    
+    def generate_answer(self, query: str, context_docs: List[Dict], 
+                       chat_history: List[Dict] = None) -> Dict:
+        """Generate answer with RAG"""
+        # Build context
+        context_text = "\n\n".join([
+            f"[Document {i+1}] (Page {d.get('page_number', 'N/A')})\n{d['text']}"
+            for i, d in enumerate(context_docs)
+        ])
+        
+        # Build chat history
+        history_text = ""
+        if chat_history:
+            history_text = "\n".join([
+                f"{msg['role'].upper()}: {msg['content']}"
+                for msg in chat_history[-5:]  # Last 5 messages
+            ])
+        
+        # Build prompt
+        prompt = f"""You are a helpful AI assistant with access to a knowledge base.
+
+CHAT HISTORY:
+{history_text if history_text else "No previous messages"}
+
+RELEVANT DOCUMENTS:
+{context_text}
+
+USER QUESTION: {query}
+
+INSTRUCTIONS:
+- Answer based on the documents provided
+- Cite sources using [Document X] notation
+- If information is not in the documents, say so clearly
+- Be concise and precise
+
+ANSWER:"""
+        
+        # Generate
+        response = self.llm.generate(prompt)
+        
+        return {
+            "answer": response["text"],
+            "model_used": response["model"],
+            "source_type": "knowledge_base" if context_docs else "llm_only",
+            "sources": context_docs
+        }

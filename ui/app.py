@@ -1,244 +1,252 @@
-# file: ui/app.py
+"""
+RAG V2 - Streamlit UI with System Health Check
+"""
 
 import streamlit as st
 import requests
-import os
-import json
 import time
-from typing import Optional, List, Dict
+import os
 from datetime import datetime
 
-# ===== PAGE CONFIGURATION =====
+# =========================================
+# CONFIGURATION
+# =========================================
+
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+
 st.set_page_config(
-    page_title="RAG Financial Assistant",
+    page_title="RAG V2 Ultimate",
+    page_icon="🤖",
     layout="wide",
-    page_icon="💼",
     initial_sidebar_state="expanded"
 )
 
-# ===== API CONFIGURATION =====
-# Nếu chạy Docker -> Docker, dùng tên service "http://api:8000"
-# Nếu chạy Local -> Local, dùng "http://localhost:8000"
-API_BASE_URL = os.getenv("API_BASE_URL", "http://api:8000")
+# =========================================
+# HELPER FUNCTIONS
+# =========================================
 
-ENDPOINTS = {
-    "health": f"{API_BASE_URL}/health",
-    "chat": f"{API_BASE_URL}/chat",
-    "upload": f"{API_BASE_URL}/upload",
-    "sessions": f"{API_BASE_URL}/sessions",
-    "files": f"{API_BASE_URL}/files",
-}
-
-# ===== SESSION STATE =====
-if "current_session_id" not in st.session_state:
-    st.session_state.current_session_id = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "uploaded_files_status" not in st.session_state:
-    st.session_state.uploaded_files_status = []
-if "backend_status" not in st.session_state:
-    st.session_state.backend_status = "unknown"
-
-# ===== HELPERS =====
-def check_backend_health() -> Dict:
+def check_system_health():
+    """Check if backend is ready"""
     try:
-        response = requests.get(ENDPOINTS["health"], timeout=3)
-        if response.status_code == 200:
-            data = response.json()
-            st.session_state.backend_status = data.get("status", "unknown")
-            return data
-        st.session_state.backend_status = "unhealthy"
-        return {"status": "unhealthy"}
+        response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+        return response.status_code == 200, response.json()
     except:
-        st.session_state.backend_status = "offline"
-        return {"status": "offline"}
+        return False, None
 
-def load_session_history(session_id: str):
+def api_request(method, endpoint, **kwargs):
+    """Make API request with error handling"""
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions/{session_id}/history", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            # Map history format to UI format
-            return [{
-                "role": m["role"],
-                "content": m["content"],
-                "timestamp": m.get("timestamp"),
-                # Backend currently doesn't store metadata in DB history endpoint fully
-                # Ideally backend should return it, but for now we render text
-                "metadata": {} 
-            } for m in data.get("messages", [])]
-        return []
-    except Exception as e:
-        st.error(f"Error loading history: {e}")
-        return []
+        url = f"{API_BASE_URL}{endpoint}"
+        response = requests.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"API Error: {str(e)}")
+        return None
 
-def format_timestamp(ts: str) -> str:
-    try:
-        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-        return dt.strftime("%H:%M %d/%m")
-    except:
-        return ""
+# =========================================
+# LOADING SCREEN
+# =========================================
 
-def render_metadata(metadata: Dict):
-    """Display Intent, SQL, and Viz links."""
-    if not metadata:
-        return
-
-    # 1. Intent Badge
-    intent = metadata.get('intent')
-    if intent:
-        if intent == 'sql':
-            st.caption("🤖 Mode: **SQL Analyst**")
-        elif intent == 'visualization':
-            st.caption("🤖 Mode: **Visualization**")
-        else:
-            st.caption("🤖 Mode: **Knowledge Base (RAG)**")
-
-    # 2. SQL Code Block
-    sql_query = metadata.get('sql')
-    if sql_query:
-        with st.expander("🔍 View Generated SQL", expanded=False):
-            st.code(sql_query, language="sql")
-
-    # 3. Visualization Link
-    viz_link = metadata.get('viz_link')
-    if viz_link:
-        st.success("📊 Dashboard Available")
-        st.link_button("Open Dashboard ↗️", viz_link)
-
-# ===== SIDEBAR =====
-with st.sidebar:
-    st.header("💼 RAG Assistant")
+def show_loading_screen():
+    """Show loading screen while system initializes"""
+    placeholder = st.empty()
     
-    # Status
-    health = check_backend_health()
-    status_icon = {"healthy": "🟢", "degraded": "🟡", "unhealthy": "🔴", "offline": "⚫"}
-    st.caption(f"{status_icon.get(st.session_state.backend_status, '⚫')} System: {st.session_state.backend_status.upper()}")
-    
-    st.divider()
-    
-    # Upload
-    with st.expander("📤 Upload Documents", expanded=False):
-        uploaded_files = st.file_uploader("PDF/TXT/MD", accept_multiple_files=True)
-        if st.button("Process Files", type="primary", use_container_width=True):
-            if uploaded_files:
-                for uf in uploaded_files:
-                    try:
-                        files = {"file": (uf.name, uf, uf.type)}
-                        res = requests.post(ENDPOINTS["upload"], files=files, timeout=60)
-                        if res.status_code in [200, 201]:
-                            st.success(f"✅ {uf.name} uploaded")
-                        elif res.status_code == 409:
-                            st.warning(f"⚠️ {uf.name} already exists")
-                        else:
-                            st.error(f"❌ {uf.name} failed")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-                time.sleep(1)
-                st.rerun()
-
-    # Session List
-    st.subheader("💬 History")
-    if st.button("➕ New Chat", use_container_width=True):
-        st.session_state.current_session_id = None
-        st.session_state.messages = []
-        st.rerun()
+    with placeholder.container():
+        st.title("🚀 RAG V2 Ultimate")
+        st.markdown("### System Initialization")
         
-    try:
-        res = requests.get(f"{ENDPOINTS['sessions']}?limit=10", timeout=5)
-        if res.status_code == 200:
-            for s in res.json():
-                active = s['id'] == st.session_state.current_session_id
-                label = f"{'📍' if active else ''} {s['title'][:25]}..."
-                
-                col1, col2 = st.columns([0.8, 0.2])
-                if col1.button(label, key=s['id'], use_container_width=True):
-                    st.session_state.current_session_id = s['id']
-                    st.session_state.messages = load_session_history(s['id'])
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            is_ready, health_data = check_system_health()
+            
+            if is_ready:
+                progress_bar.progress(100)
+                status_text.success("✅ All systems ready!")
+                time.sleep(1)
+                placeholder.empty()
+                return True
+            
+            progress = int((attempt + 1) / max_attempts * 100)
+            progress_bar.progress(progress)
+            status_text.info(f"🔄 Waiting for backend... ({attempt + 1}/{max_attempts})")
+            time.sleep(2)
+        
+        status_text.error("❌ Failed to connect to backend. Please check if services are running.")
+        st.stop()
+        return False
+
+# =========================================
+# INITIALIZE SESSION STATE
+# =========================================
+
+if "initialized" not in st.session_state:
+    if show_loading_screen():
+        st.session_state.initialized = True
+        st.session_state.current_session = None
+        st.session_state.messages = []
+
+# =========================================
+# SIDEBAR
+# =========================================
+
+with st.sidebar:
+    st.title("🤖 RAG V2 Ultimate")
+    st.markdown("---")
+    
+    # System Status
+    with st.expander("📊 System Status", expanded=False):
+        if st.button("Refresh Status"):
+            st.rerun()
+        
+        is_ready, health = check_system_health()
+        if health:
+            st.metric("PostgreSQL", "🟢 Online" if health['postgres'] == 'ok' else "🔴 Offline")
+            st.metric("Milvus", "🟢 Online" if health['milvus'] == 'ok' else "🔴 Offline")
+            st.metric("AI Models", "🟢 Ready" if health['models'] == 'ok' else "🔴 Not Ready")
+            st.metric("Internet", "🟢 Connected" if health['internet'] == 'ok' else "🟡 Limited")
+    
+    # Chat Sessions
+    st.markdown("### 💬 Chat Sessions")
+    
+    if st.button("➕ New Chat", use_container_width=True):
+        result = api_request("POST", "/sessions", json={"title": "New Chat"})
+        if result:
+            st.session_state.current_session = result["session_id"]
+            st.session_state.messages = []
+            st.rerun()
+    
+    # List sessions
+    sessions = api_request("GET", "/sessions")
+    if sessions:
+        for session in sessions[:10]:
+            session_id = str(session['id'])
+            title = session['title']
+            is_active = session_id == st.session_state.current_session
+            
+            if st.button(
+                f"{'🟢' if is_active else '⚪'} {title[:25]}",
+                key=session_id,
+                use_container_width=True
+            ):
+                st.session_state.current_session = session_id
+                # Load messages
+                messages = api_request("GET", f"/sessions/{session_id}/events")
+                st.session_state.messages = messages or []
+                st.rerun()
+    
+    st.markdown("---")
+    
+    # File Manager
+    tab1, tab2 = st.tabs(["📁 Files", "⚙️ Services"])
+    
+    with tab1:
+        uploaded_file = st.file_uploader("Upload PDF", type=['pdf'])
+        if uploaded_file:
+            with st.spinner("Processing..."):
+                files = {'file': uploaded_file}
+                result = api_request("POST", "/files/upload", files=files)
+                if result:
+                    st.success(f"✅ {uploaded_file.name} queued for processing")
+                    time.sleep(2)
                     st.rerun()
-                if col2.button("✕", key=f"del_{s['id']}"):
-                    requests.delete(f"{API_BASE_URL}/sessions/{s['id']}")
-                    if active:
-                        st.session_state.current_session_id = None
-                        st.session_state.messages = []
-                    st.rerun()
-    except:
-        st.warning("Cannot load sessions")
+        
+        # File list
+        files = api_request("GET", "/files")
+        if files:
+            for file in files[:5]:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    status_emoji = {
+                        'completed': '✅',
+                        'processing': '⏳',
+                        'pending': '⏸️',
+                        'failed': '❌'
+                    }.get(file.get('status', 'unknown'), '❓')
+                    st.text(f"{status_emoji} {file['filename'][:20]}")
+                with col2:
+                    if st.button("🗑️", key=f"del_{file['id']}"):
+                        api_request("DELETE", f"/files/{file['id']}")
+                        st.rerun()
+    
+    with tab2:
+        services = api_request("GET", "/system/services")
+        if services:
+            for svc in services:
+                st.text(f"🟢 {svc['name']}")
+                st.caption(svc['url'])
 
-# ===== MAIN CHAT =====
-st.title("Financial Intelligence AI")
+# =========================================
+# MAIN CHAT INTERFACE
+# =========================================
 
-if not st.session_state.current_session_id:
-    st.info("👋 Welcome! Upload documents or start asking questions about financial data.")
+st.title("💬 RAG AI Assistant")
 
-# Render Messages
+# Create session if none exists
+if not st.session_state.current_session:
+    result = api_request("POST", "/sessions", json={"title": "Welcome Chat"})
+    if result:
+        st.session_state.current_session = result["session_id"]
+
+# Display messages
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
+    with st.chat_message(msg["role"].lower()):
         st.markdown(msg["content"])
-        # Render metadata if exists (for older messages in current session state)
-        if msg.get("metadata"):
-            render_metadata(msg["metadata"])
 
-# Input
-if prompt := st.chat_input("Ask about revenue, profit, or upload files..."):
-    # User message
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# Chat input
+if prompt := st.chat_input("Ask me anything about your documents..."):
+    # Add user message
+    st.session_state.messages.append({"role": "USER", "content": prompt})
+    
     with st.chat_message("user"):
         st.markdown(prompt)
-
-    # Assistant message
+    
+    # Get AI response
     with st.chat_message("assistant"):
-        text_placeholder = st.empty()
-        full_text = ""
-        current_metadata = {}
-        
-        try:
-            payload = {"session_id": st.session_state.current_session_id, "message": prompt}
+        with st.spinner("Thinking..."):
+            response = api_request(
+                "POST",
+                f"/sessions/{st.session_state.current_session}/message",
+                json={"content": prompt, "use_rag": True}
+            )
             
-            with requests.post(ENDPOINTS["chat"], json=payload, stream=True, timeout=60) as r:
-                if r.status_code == 200:
-                    for line in r.iter_lines():
-                        if line:
-                            decoded = line.decode('utf-8')
-                            if decoded.startswith("data: "):
-                                try:
-                                    data = json.loads(decoded[6:])
-                                    type_ = data.get("type")
-                                    
-                                    if type_ == "session":
-                                        st.session_state.current_session_id = data.get("session_id")
-                                    
-                                    elif type_ == "text":
-                                        chunk = data.get("content", "")
-                                        full_text += chunk
-                                        text_placeholder.markdown(full_text + "▌")
-                                    
-                                    elif type_ == "metadata":
-                                        # [QUAN TRỌNG] Bắt lấy metadata từ backend
-                                        current_metadata = data.get("data", {})
-                                    
-                                    elif type_ == "error":
-                                        st.error(data.get("message"))
-                                        
-                                except Exception:
-                                    continue
-                    
-                    # Final Render
-                    text_placeholder.markdown(full_text)
-                    if current_metadata:
-                        render_metadata(current_metadata)
-                    
-                    # Save to history
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": full_text,
-                        "metadata": current_metadata
-                    })
-                    
-                elif r.status_code == 503:
-                    st.warning("🚀 Engine is warming up... Please try again in 5 seconds.")
-                else:
-                    st.error(f"Error {r.status_code}: {r.text}")
-                    
-        except Exception as e:
-            st.error(f"Connection Error: {e}")
+            if response:
+                st.markdown(response["reply"])
+                
+                # Show metadata
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    source_emoji = {
+                        'knowledge_base': '📘',
+                        'sql': '📊',
+                        'llm_only': '🧠'
+                    }.get(response['source_type'], '❓')
+                    st.caption(f"{source_emoji} {response['source_type'].replace('_', ' ').title()}")
+                with col2:
+                    st.caption(f"⚡ {response['latency']}s")
+                with col3:
+                    st.caption(f"🤖 {response['model_used']}")
+                
+                # Show sources
+                if response['sources']:
+                    with st.expander(f"📚 View Sources ({len(response['sources'])})"):
+                        for i, source in enumerate(response['sources'], 1):
+                            st.markdown(f"**[Source {i}]** (Page {source['page']}, Score: {source['score']:.2f})")
+                            st.text(source['text'])
+                            st.markdown("---")
+                
+                # Add to session state
+                st.session_state.messages.append({
+                    "role": "ASSISTANT",
+                    "content": response["reply"]
+                })
+
+# =========================================
+# FOOTER
+# =========================================
+
+st.markdown("---")
+st.caption("🚀 RAG V2 Ultimate | Hybrid Search + Infinite Context + GPU-Accelerated")

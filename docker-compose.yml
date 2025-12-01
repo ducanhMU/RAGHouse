@@ -1,5 +1,3 @@
-# file docker-compose.yml
-
 version: '3.8'
 
 services:
@@ -14,8 +12,9 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
       - ./volumes/postgres:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql # check var ?
     ports:
-      - "5433:5432"  # Changed from 5432 to avoid conflicts
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user}"]
       interval: 10s
@@ -28,61 +27,6 @@ services:
       resources:
         limits:
           memory: 2G
-
-  # ===== SUPERSET DATABASE (Separate) =====
-  postgres-superset:
-    image: postgres:15-alpine
-    container_name: rag_postgres_superset
-    environment:
-      POSTGRES_USER: ${SUPERSET_DB_USER:-superset}
-      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset_pass}
-      POSTGRES_DB: ${SUPERSET_DB_NAME:-superset}
-      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
-    volumes:
-      - ./volumes/postgres-superset:/var/lib/postgresql/data
-    ports:
-      - "5434:5432" # avoid conflict port
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U superset"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - rag_network
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-
-  # ===== CLICKHOUSE (Analytics) =====
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: rag_clickhouse
-    environment:
-      CLICKHOUSE_DB: analytics
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_pass}
-      # READ-ONLY user for safety
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-    volumes:
-      - ./volumes/clickhouse:/var/lib/clickhouse
-      - ./clickhouse:/docker-entrypoint-initdb.d
-    ports:
-      - "8123:8123"
-      - "9002:9000" # avoid conflict port
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - rag_network
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
 
   # ===== MILVUS COMPONENTS =====
   etcd:
@@ -113,7 +57,7 @@ services:
       MINIO_SECRET_KEY: minioadmin
     ports:
       - "9001:9001"
-      - "9003:9000" # avoid conflict port
+      - "9003:9000"
     volumes:
       - ./volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
@@ -141,17 +85,15 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
-      start_period: 90s
       timeout: 20s
       retries: 3
+      start_period: 30s
     ports:
       - "19530:19530"
       - "9091:9091"
     depends_on:
-      etcd:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      - etcd
+      - minio
     networks:
       - rag_network
     restart: unless-stopped
@@ -165,44 +107,36 @@ services:
     image: ollama/ollama:latest
     container_name: rag_ollama
     ports:
-      - "11435:11434" # avoid conflict port
+      - "11435:11434"
     volumes:
       - ollama_data:/root/.ollama
     environment:
       OLLAMA_HOST: "0.0.0.0:11434"
       OLLAMA_ORIGINS: "*"
-      # === GPU OPTIMIZATION (CRITICAL) ===
-      OLLAMA_NUM_PARALLEL: "8"           # 8 concurrent requests
-      OLLAMA_KEEP_ALIVE: "24h"           # Keep models in VRAM 24h
-      OLLAMA_MAX_LOADED_MODELS: "2"     # Load 2 models simultaneously
-      OLLAMA_NUM_GPU: "1"                # Use 1 GPU
-      OLLAMA_GPU_OVERHEAD: "0.9"        # Use 90% of VRAM
+      OLLAMA_NUM_PARALLEL: "8"
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_NUM_GPU: "1"
+      OLLAMA_GPU_OVERHEAD: "0.9"
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 20s
     networks:
       - rag_network
     restart: unless-stopped
-    # === NVIDIA GPU DEPLOYMENT ===
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1  # RTX A4000
+              count: 1
               capabilities: [gpu]
-    # === MODEL INITIALIZATION (OPTIMIZED) ===
-    entrypoint: ["/bin/bash", "-c", "\
-      ollama serve & \
-      sleep 5 && \
-      ollama pull nomic-embed-text && \
-      ollama pull llama3.2:3b && \
-      wait"]
+    entrypoint: ["/bin/bash", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text && ollama pull llama3.2:3b && wait"]
 
-  # ===== API SERVICE (OPTIMIZED) =====
+  # ===== API SERVICE =====
   api:
     build:
       context: ./api
@@ -213,68 +147,52 @@ services:
     volumes:
       - ./api/app:/app/app
       - ./api/data:/app/data
-      - ./api/logs:/app/logs
+      - ./api/logs:/app/logs # check var ?
     environment:
-      # === DATABASES ===
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
-      - CLICKHOUSE_URL=clickhouse://default:${CLICKHOUSE_PASSWORD:-clickhouse_pass}@clickhouse:8123/analytics
-      
-      # === MILVUS ===
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
       - MILVUS_COLLECTION_NAME=rag_collection_v2_hnsw
-      
-      # === OLLAMA (NEW MODELS) ===
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=llama3.2:3b              # Changed!
-      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text  # Changed!
-      - OLLAMA_BATCH_SIZE=32                  # GPU optimization
-      
-      # === GOOGLE AI ===
+      - OLLAMA_MODEL=llama3.2:3b
+      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+      - OLLAMA_BATCH_SIZE=32
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      
-      # === SUPERSET ===
-      - SUPERSET_BASE_URL=http://superset:8088
-      
-      # === FEATURES ===
-      - ENABLE_HYBRID_SEARCH=false    # Using pure vector with HNSW
+      - ENABLE_HYBRID_SEARCH=true
       - ENABLE_RERANKING=true
-      - ENABLE_POSTGRES_FTS=false
       - RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2-v2
-      
-      # === OPTIMIZATION ===
-      - EMBEDDING_BATCH_SIZE=32       # GPU batch size
-      - MAX_WORKERS=8                 # Parallel processing
+      - EMBEDDING_BATCH_SIZE=64
+      - MAX_WORKERS=4
       - DATA_PATH=/app/data
       - LOG_LEVEL=INFO
       - PYTHONUNBUFFERED=1
-      
     env_file:
       - .env
     depends_on:
-      postgres:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      milvus:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
+      - postgres
+      - milvus
+      - ollama
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
     networks:
       - rag_network
     restart: unless-stopped
-    command: >
-      sh -c "echo '⏳ Waiting...' && sleep 10 && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --log-level info"
+    command: 
+      - /bin/bash
+      - -c
+      - |
+        echo '🚀 Starting API with retry logic...'
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --log-level info
     deploy:
       resources:
-        limits:
-          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   # ===== UI SERVICE =====
   ui:
@@ -289,8 +207,7 @@ services:
     env_file:
       - .env
     depends_on:
-      api:
-        condition: service_healthy
+      - api
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
@@ -299,57 +216,13 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    command: >
-      streamlit run app.py
-        --server.port 8501
-        --server.address 0.0.0.0
-        --server.enableCORS false
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.enableCORS false
     deploy:
       resources:
         limits:
           memory: 1G
 
-  # ===== SUPERSET (VISUALIZATION) =====
-  superset:
-    image: apache/superset:latest
-    container_name: rag_superset
-    environment:
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-DuY0++tmMaMT1OybYEdOQSxSBjwxISXn3YhqO/Z7tOvroFwj5BiPyNEQ}
-      SUPERSET_LOAD_EXAMPLES: "no"
-      # Use separate database
-      SUPERSET_DATABASE_URI: postgresql://${SUPERSET_DB_USER:-superset}:${SUPERSET_DB_PASSWORD:-superset_pass}@postgres-superset:5432/${SUPERSET_DB_NAME:-superset}
-    ports:
-      - "8088:8088"
-    volumes:
-      - superset_home:/app/superset_home
-    depends_on:
-      postgres-superset:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    networks:
-      - rag_network
-    restart: unless-stopped
-    command: >
-      sh -c "
-        superset db upgrade &&
-        superset fab create-admin \
-          --username admin \
-          --firstname Admin \
-          --lastname User \
-          --email admin@superset.com \
-          --password admin &&
-        superset init &&
-        gunicorn \
-          --bind 0.0.0.0:8088 \
-          --workers 4 \
-          --timeout 120 \
-          --limit-request-line 0 \
-          --limit-request-field_size 0 \
-          'superset.app:create_app()'
-      "
-
-  # ===== MANAGEMENT UIS =====
+  # ===== MILVUS UI =====
   attu:
     container_name: rag_milvus_attu
     image: zilliz/attu:v2.4
@@ -358,31 +231,14 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      milvus:
-        condition: service_healthy
-    networks:
-      - rag_network
-    restart: unless-stopped
-
-  jaeger:
-    container_name: rag_jaeger
-    image: jaegertracing/all-in-one:latest
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports:
-      - "16686:16686"
-      - "14268:14268"
+      - milvus
     networks:
       - rag_network
     restart: unless-stopped
 
 networks:
   rag_network:
-    name: rag_network
     driver: bridge
 
 volumes:
   ollama_data:
-    name: rag_ollama_data
-  superset_home:
-    name: rag_superset_home

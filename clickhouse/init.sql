@@ -1,4 +1,4 @@
--- clickhouse/init.sql
+-- file clickhouse/init.sql
 -- COMPLETE FINANCIAL ANALYSIS SYSTEM
 -- Supports: Financial Statements + Macro + Stock + Screener + AI RAG
 

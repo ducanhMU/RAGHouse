@@ -34,7 +34,7 @@ rag-system-v2-ultimate/
 │   ├── app.py                   ✅ Metadata display, SSE handling
 │   ├── Dockerfile
 │   └── requirements.txt
-├── clickhouse-init/
+├── clickhouse/
 │   └── init.sql                 ✅ 9 tables, 100+ metrics
 ├── docker-compose.yml           ✅ GPU, separate DBs, optimized
 ├── .env.example                 ✅ All new configs
