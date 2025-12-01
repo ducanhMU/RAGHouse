@@ -61,30 +61,42 @@ sudo systemctl restart docker
 
 ## 🚀 Quick Start
 
-### 1. Clone & Configure
+### Option 1: Automated Setup (Recommended)
 
 ```bash
-git clone <your-repo>
-cd rag-v2-ultimate
+# Make setup script executable
+chmod +x setup.sh
 
-# Copy environment file
-cp .env.example .env
-
-# Edit .env and add your Gemini API key
-nano .env
-# Set: GOOGLE_API_KEY=your_actual_key_here
+# Run automated setup
+./setup.sh
 ```
 
-### 2. Launch System
+The script will:
+- ✅ Check prerequisites (Docker, GPU, nvidia-toolkit)
+- ✅ Create directory structure
+- ✅ Generate `.env` file with secure passwords
+- ✅ Verify all required files are present
+- ✅ Build and start all services
+- ✅ Wait for services to be healthy
+- ✅ Display access information
+
+### Option 2: Manual Setup
 
 ```bash
-# Start all services
+# 1. Create environment file
+cp .env.example .env
+
+# 2. Edit .env and add your Gemini API key
+nano .env
+# Set: GOOGLE_API_KEY=your_actual_key_here
+
+# 3. Start all services
 docker-compose up -d
 
-# View logs
+# 4. View logs
 docker-compose logs -f api
 
-# Stop system
+# 5. Stop system
 docker-compose down
 ```
 
@@ -94,8 +106,31 @@ docker-compose down
 |---------|-----|---------|
 | **Streamlit UI** | http://localhost:8501 | Main application |
 | **FastAPI Docs** | http://localhost:8000/docs | API documentation |
+| **FastAPI Health** | http://localhost:8000/health | System status JSON |
 | **Milvus Attu** | http://localhost:3000 | Vector DB admin |
 | **MinIO Console** | http://localhost:9001 | Object storage (admin/admin) |
+
+### 4. Initial Setup Verification
+
+```bash
+# Wait ~2 minutes for all services to initialize, then:
+
+# Check system health
+curl http://localhost:8000/health
+
+# Expected output:
+# {
+#   "postgres": "ok",
+#   "milvus": "ok",
+#   "models": "ok",
+#   "internet": "ok"
+# }
+
+# Check service status
+docker-compose ps
+
+# All services should show "Up" or "Up (healthy)"
+```
 
 ## 📊 Database Schema
 
@@ -209,15 +244,58 @@ RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2-v2
 
 ## 🐛 Troubleshooting
 
+### `init-db.sql` Not Found Error
+
+```bash
+# Verify file location (must be in project root)
+ls -la init-db.sql
+
+# Should be alongside docker-compose.yml, not in api/ or ui/
+
+# Correct structure:
+# rag-v2-ultimate/
+# ├── docker-compose.yml
+# ├── init-db.sql          ← HERE
+# ├── api/
+# └── ui/
+```
+
 ### Services Won't Start
 
 ```bash
 # Check Docker GPU access
 docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi
 
-# Recreate volumes
+# Check service logs
+docker-compose logs postgres
+docker-compose logs milvus
+docker-compose logs api
+
+# Recreate volumes (⚠️ deletes data)
 docker-compose down -v
 docker-compose up -d
+```
+
+### Database Connection Errors
+
+The API has built-in retry logic (10 attempts, 3s intervals). If you see:
+
+```
+🔌 Connecting to PostgreSQL (Attempt 1/10)...
+```
+
+This is **normal** during startup. Wait ~30 seconds for PostgreSQL to initialize.
+
+If connection fails after 10 attempts:
+
+```bash
+# Check PostgreSQL
+docker exec -it rag_postgres psql -U rag_user -d rag_db -c "SELECT 1"
+
+# Check if init-db.sql was loaded
+docker exec -it rag_postgres psql -U rag_user -d rag_db -c "\dt"
+
+# Should show: chat_sessions, chat_events, file_registry, document_chunks
 ```
 
 ### Milvus Connection Errors
@@ -226,39 +304,98 @@ docker-compose up -d
 # Check Milvus health
 curl http://localhost:9091/healthz
 
+# Check etcd (Milvus dependency)
+docker-compose logs etcd
+
 # Restart Milvus cluster
 docker-compose restart etcd minio milvus
+sleep 30
+docker-compose restart api
 ```
 
-### PostgreSQL Connection Issues
+### Volume Permission Issues
 
 ```bash
-# Check PostgreSQL
-docker exec -it rag_postgres psql -U rag_user -d rag_db -c "SELECT 1"
+# Linux: Fix ownership
+sudo chown -R $USER:$USER .
 
-# View logs
-docker-compose logs postgres
+# Check volume mounts
+docker volume ls | grep rag
+
+# Remove and recreate (⚠️ deletes data)
+docker-compose down -v
+docker volume prune
+docker-compose up -d
+```
+
+### GPU Not Detected
+
+```bash
+# Verify nvidia-container-toolkit
+docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi
+
+# If fails, reinstall toolkit
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+```
+
+### "Module Not Found" Errors in API
+
+```bash
+# Rebuild API container
+docker-compose build --no-cache api
+docker-compose up -d api
+
+# Check if requirements installed
+docker exec -it rag_api pip list
 ```
 
 ## 📁 Project Structure
 
 ```
 rag-v2-ultimate/
-├── docker-compose.yml       # Service orchestration
-├── init-db.sql             # Database schema
-├── .env.example            # Configuration template
+├── docker-compose.yml       # ⭐ Service orchestration
+├── init-db.sql             # ⭐ PostgreSQL schema (auto-loaded)
+├── .env                    # ⭐ Create from .env.example
+├── .env.example            # Environment template
+├── setup.sh                # 🚀 Automated setup script
+├── README.md               # This file
+├── PROJECT_STRUCTURE.md    # Detailed file descriptions
+│
 ├── api/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── app/
+│       ├── __init__.py
 │       ├── main.py         # FastAPI gateway
 │       ├── database.py     # PostgreSQL operations
 │       ├── rag_core.py     # RAG engine
 │       └── ingest.py       # Document processing
+│
 └── ui/
     ├── Dockerfile
     ├── requirements.txt
     └── app.py              # Streamlit interface
+```
+
+**Important Notes:**
+
+1. **`init-db.sql` location**: Must be in **project root** (same level as `docker-compose.yml`)
+2. **Volumes**: Automatically created by Docker (see `docker-compose.yml`)
+3. **`.env` file**: Must be created from `.env.example` before first run
+
+**Verify files exist:**
+
+```bash
+# Check critical files
+ls -la init-db.sql docker-compose.yml .env
+
+# Should show all three files
 ```
 
 ## 🔐 Security Notes

@@ -11,8 +11,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-rag_db}
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
-      - ./volumes/postgres:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql # check var ?
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
     healthcheck:
@@ -38,7 +38,7 @@ services:
       ETCD_QUOTA_BACKEND_BYTES: "4294967296"
       ETCD_SNAPSHOT_COUNT: "50000"
     volumes:
-      - ./volumes/etcd:/etcd
+      - etcd_data:/etcd
     command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -59,7 +59,7 @@ services:
       - "9001:9001"
       - "9003:9000"
     volumes:
-      - ./volumes/minio:/minio_data
+      - minio_data:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -81,7 +81,7 @@ services:
       MINIO_ADDRESS: minio:9000
       MQ_TYPE: woodpecker
     volumes:
-      - ./volumes/milvus:/var/lib/milvus
+      - milvus_data:/var/lib/milvus
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -146,8 +146,8 @@ services:
       - "8000:8000"
     volumes:
       - ./api/app:/app/app
-      - ./api/data:/app/data
-      - ./api/logs:/app/logs # check var ?
+      - api_data:/app/data
+      - api_logs:/app/logs
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
       - MILVUS_HOST=milvus
@@ -241,4 +241,10 @@ networks:
     driver: bridge
 
 volumes:
+  postgres_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
   ollama_data:
+  api_data:
+  api_logs:
