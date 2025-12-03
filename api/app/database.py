@@ -5,7 +5,7 @@ PostgreSQL connection, ORM models, and database schemas.
 
 import os
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -132,7 +132,7 @@ class FileRegistry(Base):
     
     created_at = Column(
         DateTime,
-        default=datetime.now(datetime.timezone.utc),
+        default=datetime.now(timezone.utc),
         nullable=False,
         index=True,
         comment="File registration timestamp"
@@ -172,7 +172,7 @@ class ChatSession(Base):
     
     created_at = Column(
         DateTime,
-        default=datetime.now(datetime.timezone.utc),
+        default=datetime.now(timezone.utc),
         nullable=False,
         index=True,
         comment="Session creation timestamp"
@@ -180,8 +180,8 @@ class ChatSession(Base):
     
     updated_at = Column(
         DateTime,
-        default=datetime.now(datetime.timezone.utc),
-        onupdate=datetime.now(datetime.timezone.utc),
+        default=datetime.now(timezone.utc),
+        onupdate=datetime.now(timezone.utc),
         nullable=False,
         index=True,
         comment="Last message timestamp (for sidebar sorting)"
@@ -270,7 +270,7 @@ class ChatEvent(Base):
     
     created_at = Column(
         DateTime,
-        default=datetime.now(datetime.timezone.utc),
+        default=datetime.now(timezone.utc),
         nullable=False,
         comment="Event creation timestamp"
     )
