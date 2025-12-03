@@ -12,7 +12,7 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./api/app/init-db.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
     healthcheck:
@@ -152,19 +152,20 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
-      - MILVUS_COLLECTION_NAME=rag_collection_v2_hnsw
+      - MILVUS_COLLECTION_NAME=rag_hybrid_collection
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=llama3.2:3b
-      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
-      - OLLAMA_BATCH_SIZE=32
+      - EMBEDDING_MODEL_NAME=BAAI/bge-m3
+      - EMBEDDING_DEVICE=cpu
+      - EMBEDDING_BATCH_SIZE=16
+      - RERANKER_MODEL=BAAI/bge-reranker-large
+      - RERANKER_DEVICE=cpu
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - ENABLE_HYBRID_SEARCH=true
       - ENABLE_RERANKING=true
-      - RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2-v2
-      - EMBEDDING_BATCH_SIZE=64
-      - MAX_WORKERS=4
       - DATA_PATH=/app/data
       - LOG_LEVEL=INFO
+      - BASE_HOST=localhost
+      - LLM_TEMPERATURE=0.2
       - PYTHONUNBUFFERED=1
     env_file:
       - .env

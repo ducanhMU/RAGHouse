@@ -1,38 +1,42 @@
 """
-RAG V2 - FastAPI Gateway
+FastAPI gateway implementing the RAG design spec (hybrid search + streaming chat).
 """
 
-import os
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
+import os
+import time
 from pathlib import Path
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from typing import AsyncGenerator, Dict, List, Optional
+from uuid import UUID
+
+from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+import requests
 
-from .database import DatabaseManager, FileRegistry, DocumentChunks, ChatSessions, ChatEvents
-from .rag_core import RAGEngine, EmbeddingService, MilvusStore
-from .ingest import IngestionPipeline
-
-# =========================================
-# LOGGING
-# =========================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from .database import (
+    ChatEventDAO,
+    ChatSessionDAO,
+    DatabaseManager,
+    DocumentChunkDAO,
+    FileRegistryDAO,
+    SystemStatsDAO,
 )
-logger = logging.getLogger(__name__)
+from .ingest import IngestionJob, IngestionWorker
+from .rag import RAGEngine
 
-# =========================================
-# FASTAPI APP
-# =========================================
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 app = FastAPI(
-    title="RAG V2 Ultimate API",
-    description="Hybrid Search + Infinite Context + GPU-Accelerated",
-    version="2.0.0"
+    title="RAG Microservice API",
+    version="3.0.0",
+    description="Hybrid dense+sparse retrieval with 3-3 memory and GPU acceleration.",
 )
 
 app.add_middleware(
@@ -43,310 +47,385 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================================
-# GLOBAL SERVICES
-# =========================================
+# ---------------------------------------------------------------------------
+# Globals initialised during startup
+# ---------------------------------------------------------------------------
 
-db_manager: Optional[DatabaseManager] = None
-file_registry: Optional[FileRegistry] = None
-doc_chunks: Optional[DocumentChunks] = None
-chat_sessions: Optional[ChatSessions] = None
-chat_events: Optional[ChatEvents] = None
-rag_engine: Optional[RAGEngine] = None
-ingest_pipeline: Optional[IngestionPipeline] = None
+DB: Optional[DatabaseManager] = None
+FILES: Optional[FileRegistryDAO] = None
+CHUNKS: Optional[DocumentChunkDAO] = None
+SESSIONS: Optional[ChatSessionDAO] = None
+EVENTS: Optional[ChatEventDAO] = None
+STATS: Optional[SystemStatsDAO] = None
+RAG: Optional[RAGEngine] = None
+INGESTION: Optional[IngestionWorker] = None
+DATA_DIR: Optional[Path] = None
 
-# =========================================
-# STARTUP & SHUTDOWN
-# =========================================
 
-@app.on_event("startup")
-async def startup_event():
-    global db_manager, file_registry, doc_chunks, chat_sessions, chat_events
-    global rag_engine, ingest_pipeline
-    
-    logger.info("🚀 Starting RAG V2 Ultimate API...")
-    
-    # Initialize database
-    db_manager = DatabaseManager()
-    file_registry = FileRegistry(db_manager)
-    doc_chunks = DocumentChunks(db_manager)
-    chat_sessions = ChatSessions(db_manager)
-    chat_events = ChatEvents(db_manager)
-    
-    # Initialize RAG components
-    embedder = EmbeddingService()
-    vector_store = MilvusStore()
-    rag_engine = RAGEngine(db_manager, doc_chunks.keyword_search)
-    
-    # Initialize ingestion pipeline
-    ingest_pipeline = IngestionPipeline(
-        file_registry, doc_chunks, embedder, vector_store
-    )
-    
-    # Auto-process pending files
-    data_path = os.getenv("DATA_PATH", "/app/data")
-    ingest_pipeline.process_pending_files(data_path)
-    
-    logger.info("✅ All systems ready")
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if db_manager:
-        db_manager.close()
-    logger.info("👋 API shutdown complete")
 
-# =========================================
-# PYDANTIC MODELS
-# =========================================
-
-class HealthResponse(BaseModel):
+class HealthEnvelope(BaseModel):
     postgres: str
     milvus: str
     models: str
     internet: str
 
+
 class SessionCreate(BaseModel):
-    title: Optional[str] = "New Chat"
+    title: str = Field(default="New Chat", max_length=255)
 
-class MessageRequest(BaseModel):
-    content: str
+
+class ChatRequest(BaseModel):
+    session_id: UUID
+    message: str = Field(..., min_length=1, max_length=8000)
     use_rag: bool = True
+    filter_expr: Optional[str] = None
 
-class MessageResponse(BaseModel):
+
+class ChatResponse(BaseModel):
+    session_id: UUID
     reply: str
-    source_type: str
-    sources: list
+    citations: List[Dict]
     model_used: str
-    latency: float
+    latency_ms: int
 
-# =========================================
-# HEALTH CHECK ENDPOINTS
-# =========================================
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """System health status"""
-    status = {
-        "postgres": "ok",
-        "milvus": "ok",
-        "models": "ok",
-        "internet": "ok"
-    }
-    
-    # Check Postgres
+# ---------------------------------------------------------------------------
+# Startup / shutdown
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    global DB, FILES, CHUNKS, SESSIONS, EVENTS, STATS, RAG, INGESTION, DATA_DIR
+
+    DATA_DIR = Path(os.getenv("DATA_PATH", "/app/data"))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    DB = DatabaseManager()
+    FILES = FileRegistryDAO(DB)
+    CHUNKS = DocumentChunkDAO(DB)
+    SESSIONS = ChatSessionDAO(DB)
+    EVENTS = ChatEventDAO(DB)
+    STATS = SystemStatsDAO(DB)
+
+    RAG = RAGEngine()
+    INGESTION = IngestionWorker(
+        files=FILES,
+        chunks=CHUNKS,
+        encoder=RAG.encoder,
+        vector_store=RAG.vector_store,
+        data_dir=DATA_DIR,
+    )
+    await INGESTION.start()
+    await INGESTION.bootstrap_from_directory()
+    logger.info("Startup complete")
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    if DB:
+        DB.close()
+
+
+# ---------------------------------------------------------------------------
+# Dependency helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_services():
+    if not all([DB, FILES, CHUNKS, SESSIONS, EVENTS, RAG, INGESTION]):
+        raise HTTPException(status_code=503, detail="Services not initialised")
+
+
+# ---------------------------------------------------------------------------
+# Health & monitoring
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health", response_model=HealthEnvelope)
+async def health() -> HealthEnvelope:
+    _ensure_services()
+    statuses = {"postgres": "ok", "milvus": "ok", "models": "ok", "internet": "ok"}
     try:
-        with db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-    except:
-        status["postgres"] = "down"
-    
-    # Check Milvus
+        with DB.get_connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:  # pragma: no cover - infrastructure guard
+        statuses["postgres"] = "down"
+
     try:
-        rag_engine.vector_store.collection.num_entities
-    except:
-        status["milvus"] = "down"
-    
-    # Check Gemini
+        RAG.vector_store.collection.num_entities
+    except Exception:
+        statuses["milvus"] = "down"
+
     try:
-        import requests
-        requests.get("https://www.google.com", timeout=3)
-    except:
-        status["internet"] = "limited"
-    
-    return status
+        requests.get("https://www.google.com", timeout=2)
+    except Exception:
+        statuses["internet"] = "limited"
+
+    return HealthEnvelope(**statuses)
+
 
 @app.get("/health/db")
 async def health_db():
-    """PostgreSQL health"""
-    try:
-        with db_manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT version()")
-                version = cur.fetchone()[0]
-        return {"status": "ok", "version": version}
-    except Exception as e:
-        raise HTTPException(500, f"DB error: {str(e)}")
+    _ensure_services()
+    with DB.get_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version()")
+        version = cur.fetchone()[0]
+    return {"status": "ok", "version": version}
+
 
 @app.get("/health/vector-db")
 async def health_vector_db():
-    """Milvus health"""
-    try:
-        entities = rag_engine.vector_store.collection.num_entities
-        return {"status": "ok", "total_vectors": entities}
-    except Exception as e:
-        raise HTTPException(500, f"Milvus error: {str(e)}")
+    _ensure_services()
+    stats = RAG.vector_store.stats()
+    return {"status": "ok", **stats}
 
-# =========================================
-# SESSION ENDPOINTS
-# =========================================
 
-@app.get("/sessions")
-async def list_sessions():
-    """List all chat sessions"""
-    return chat_sessions.list_sessions()
+@app.get("/stats/system")
+async def system_stats():
+    _ensure_services()
+    return STATS.totals()
 
-@app.post("/sessions")
-async def create_session(data: SessionCreate):
-    """Create new chat session"""
-    session_id = chat_sessions.create_session(data.title)
-    return {"session_id": session_id, "title": data.title}
 
-@app.get("/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get session metadata"""
-    sessions = chat_sessions.list_sessions()
-    session = next((s for s in sessions if str(s['id']) == session_id), None)
-    if not session:
-        raise HTTPException(404, "Session not found")
-    return session
+@app.get("/stats/milvus")
+async def milvus_stats():
+    _ensure_services()
+    return RAG.vector_store.stats()
 
-@app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """Delete session"""
-    chat_sessions.delete_session(session_id)
-    return {"status": "deleted"}
 
-# =========================================
-# CHAT ENDPOINTS
-# =========================================
-
-@app.get("/sessions/{session_id}/events")
-async def get_events(session_id: str):
-    """Get chat history"""
-    return chat_events.get_visible_history(session_id)
-
-@app.post("/sessions/{session_id}/message", response_model=MessageResponse)
-async def send_message(session_id: str, msg: MessageRequest):
-    """Send message and get AI response"""
-    import time
-    start_time = time.time()
-    
-    # Add user message
-    chat_events.add_event(session_id, "USER", msg.content)
-    
-    # Get context for LLM
-    context = chat_events.get_context_for_llm(session_id)
-    
-    # Perform RAG if enabled
-    sources = []
-    source_type = "llm_only"
-    
-    if msg.use_rag:
-        sources = rag_engine.hybrid_search(msg.content, top_k=5)
-        if sources:
-            source_type = "knowledge_base"
-    
-    # Generate answer
-    result = rag_engine.generate_answer(
-        query=msg.content,
-        context_docs=sources,
-        chat_history=context
-    )
-    
-    # Add assistant message
-    chat_events.add_event(
-        session_id, "ASSISTANT", result["answer"],
-        model_used=result["model_used"]
-    )
-    
-    # Check if summary needed
-    if chat_events.should_create_summary(session_id):
-        logger.info("Creating summary...")
-        summary_prompt = f"Summarize the last 3 conversation turns concisely:\n{context}"
-        summary = rag_engine.llm.generate(summary_prompt, temperature=0.3)
-        chat_events.add_event(
-            session_id, "SYSTEM", summary["text"],
-            event_type="SUMMARY", visibility="HIDDEN"
-        )
-    
-    latency = time.time() - start_time
-    
-    return MessageResponse(
-        reply=result["answer"],
-        source_type=source_type,
-        sources=[{
-            "text": s["text"][:200] + "...",
-            "page": s.get("page_number", 0),
-            "score": s.get("rerank_score", 0)
-        } for s in sources],
-        model_used=result["model_used"],
-        latency=round(latency, 2)
-    )
-
-# =========================================
-# FILE ENDPOINTS
-# =========================================
-
-@app.get("/files")
-async def list_files():
-    """List uploaded files"""
-    return file_registry.list_files()
-
-@app.post("/files/upload")
-async def upload_file(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
-    """Upload and process file"""
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(400, "Only PDF files supported")
-    
-    # Save file
-    data_path = Path(os.getenv("DATA_PATH", "/app/data"))
-    data_path.mkdir(exist_ok=True)
-    file_path = data_path / file.filename
-    
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-    
-    # Process in background
-    background_tasks.add_task(
-        ingest_pipeline.ingest_file,
-        str(file_path),
-        file.filename
-    )
-    
-    return {"status": "processing", "filename": file.filename}
-
-@app.delete("/files/{file_id}")
-async def delete_file(file_id: str):
-    """Delete file and associated data"""
-    # Delete from Milvus
-    rag_engine.vector_store.delete_by_file(file_id)
-    
-    # Delete from Postgres (cascades to chunks)
-    file_registry.delete_file(file_id)
-    
-    return {"status": "deleted"}
-
-@app.get("/files/status")
-async def files_status():
-    """Get processing status"""
-    files = file_registry.list_files()
+@app.get("/features")
+async def feature_flags():
     return {
-        "total": len(files),
-        "completed": len([f for f in files if f['status'] == 'completed']),
-        "pending": len([f for f in files if f['status'] in ('pending', 'processing')]),
-        "failed": len([f for f in files if f['status'] == 'failed'])
+        "hybrid_search": True,
+        "reranking": bool(RAG.reranker),
+        "importance_boost": True,
+        "streaming": True,
+        "infinite_memory": True,
     }
 
-# =========================================
-# SYSTEM ENDPOINTS
-# =========================================
 
 @app.get("/system/services")
 async def system_services():
-    """List running services"""
+    base = os.getenv("BASE_HOST", "localhost")
     return [
-        {"name": "FastAPI", "url": "http://localhost:8000", "status": "running"},
-        {"name": "Streamlit UI", "url": "http://localhost:8501", "status": "running"},
-        {"name": "PostgreSQL", "url": "localhost:5433", "status": "running"},
-        {"name": "Milvus", "url": "localhost:19530", "status": "running"},
-        {"name": "Milvus Attu", "url": "http://localhost:3000", "status": "running"},
-        {"name": "MinIO", "url": "http://localhost:9001", "status": "running"},
+        {"name": "API", "url": f"http://{base}:8000", "status": "running"},
+        {"name": "Streamlit UI", "url": f"http://{base}:8501", "status": "running"},
+        {"name": "Milvus", "url": f"http://{base}:9091/healthz", "status": "running"},
+        {"name": "PostgreSQL", "url": f"{base}:5433", "status": "running"},
+        {"name": "Ollama", "url": f"http://{base}:11435", "status": "running"},
     ]
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ---------------------------------------------------------------------------
+# Session & event APIs
+# ---------------------------------------------------------------------------
+
+
+@app.get("/sessions")
+async def list_sessions():
+    _ensure_services()
+    return SESSIONS.list()
+
+
+@app.post("/sessions")
+async def create_session(payload: SessionCreate):
+    _ensure_services()
+    session_id = SESSIONS.create(title=payload.title)
+    return {"session_id": session_id, "title": payload.title}
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: UUID):
+    _ensure_services()
+    SESSIONS.delete(str(session_id))
+    return {"status": "deleted"}
+
+
+@app.get("/sessions/{session_id}/history")
+async def session_history(session_id: UUID, limit: int = 50):
+    _ensure_services()
+    return EVENTS.visible_history(str(session_id), limit=limit)
+
+
+@app.get("/sessions/{session_id}/events")
+async def session_events(session_id: UUID, limit: int = 200):
+    _ensure_services()
+    return EVENTS.raw_events(str(session_id), limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoints
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_summarise(session_id: str) -> None:
+    count = EVENTS.messages_since_summary(session_id)
+    if count < 6:
+        return
+    history = EVENTS.visible_history(session_id, limit=10)
+    conversation = "\n".join(
+        f"{msg['role']}: {msg['content']}" for msg in history[-6:]
+    )
+    prompt = (
+        "Summarise the following conversation in 3 bullet points:\n"
+        f"{conversation}"
+    )
+    loop = asyncio.get_running_loop()
+
+    def _generate_summary():
+        text = ""
+        for chunk in RAG.llm.stream(prompt):
+            text += chunk["token"]
+        return text
+
+    summary = await loop.run_in_executor(None, _generate_summary)
+    EVENTS.append(
+        session_id,
+        "SYSTEM",
+        summary.strip(),
+        event_type="SUMMARY",
+        visibility="HIDDEN",
+    )
+
+
+def _format_citations(chunks: List[Dict]) -> List[Dict]:
+    cites = []
+    for chunk in chunks:
+        cites.append(
+            {
+                "file_id": chunk.get("file_id"),
+                "page_number": chunk.get("page_number"),
+                "importance": chunk.get("importance_score"),
+                "excerpt": chunk.get("text", "")[:400],
+            }
+        )
+    return cites
+
+
+@app.post("/chat", response_model=None)
+async def stream_chat(payload: ChatRequest):
+    _ensure_services()
+    session_id = str(payload.session_id)
+    EVENTS.append(session_id, "USER", payload.message)
+    context = EVENTS.llm_context(session_id)
+    retrieved = RAG.retrieve(payload.message) if payload.use_rag else []
+    citations = _format_citations(retrieved)
+
+    async def event_generator() -> AsyncGenerator[Dict, None]:
+        assistant_text = ""
+        start = time.perf_counter()
+        yield {"event": "context", "data": json.dumps({"citations": citations})}
+        try:
+            for chunk in RAG.stream(
+                query=payload.message, retrieved=retrieved, conversation=context
+            ):
+                assistant_text += chunk["token"]
+                yield {"event": "token", "data": chunk["token"]}
+                await asyncio.sleep(0)
+        finally:
+            elapsed = int((time.perf_counter() - start) * 1000)
+            EVENTS.append(
+                session_id,
+                "ASSISTANT",
+                assistant_text.strip(),
+                model_used=chunk.get("model") if "chunk" in locals() else "unknown",
+            )
+            await _maybe_summarise(session_id)
+            yield {
+                "event": "metadata",
+                "data": json.dumps(
+                    {
+                        "latency_ms": elapsed,
+                        "model_used": chunk.get("model")
+                        if "chunk" in locals()
+                        else "unknown",
+                    }
+                ),
+            }
+
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/sessions/{session_id}/message", response_model=ChatResponse)
+async def send_message(session_id: UUID, payload: ChatRequest):
+    _ensure_services()
+    if str(session_id) != str(payload.session_id):
+        raise HTTPException(status_code=400, detail="Session mismatch")
+
+    start = time.perf_counter()
+    EVENTS.append(str(session_id), "USER", payload.message)
+    context = EVENTS.llm_context(str(session_id))
+    retrieved = RAG.retrieve(payload.message) if payload.use_rag else []
+    result = RAG.generate(
+        query=payload.message, retrieved=retrieved, conversation=context
+    )
+    EVENTS.append(
+        str(session_id),
+        "ASSISTANT",
+        result["answer"],
+        model_used=result["model_used"],
+    )
+    await _maybe_summarise(str(session_id))
+    elapsed = int((time.perf_counter() - start) * 1000)
+    return ChatResponse(
+        session_id=session_id,
+        reply=result["answer"],
+        citations=_format_citations(retrieved),
+        model_used=result["model_used"],
+        latency_ms=elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# File ingestion APIs
+# ---------------------------------------------------------------------------
+
+
+@app.get("/files")
+async def list_files():
+    _ensure_services()
+    return FILES.list()
+
+
+@app.get("/files/status")
+async def file_status():
+    _ensure_services()
+    summary = FILES.status_counts()
+    summary["total"] = sum(summary.values())
+    return summary
+
+
+@app.get("/files/{file_id}")
+async def file_detail(file_id: UUID):
+    _ensure_services()
+    detail = FILES.detail(str(file_id))
+    if not detail:
+        raise HTTPException(status_code=404, detail="File not found")
+    return detail
+
+
+@app.post("/files/upload", status_code=status.HTTP_202_ACCEPTED)
+async def upload_file(file: UploadFile = File(...)):
+    _ensure_services()
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
+
+    destination = DATA_DIR / file.filename
+    destination.write_bytes(await file.read())
+
+    await INGESTION.enqueue(
+        IngestionJob(file_path=destination, display_name=file.filename)
+    )
+    return {"status": "queued", "filename": file.filename}
+
+
+@app.delete("/files/{file_id}")
+async def delete_file(file_id: UUID):
+    _ensure_services()
+    RAG.vector_store.delete_file(str(file_id))
+    FILES.remove(str(file_id))
+    return {"status": "deleted"}
