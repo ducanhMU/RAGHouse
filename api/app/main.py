@@ -1,44 +1,53 @@
 """
-FastAPI gateway implementing the RAG design spec (hybrid search + streaming chat).
+FastAPI Gateway - Main Application Entry Point
+Handles startup, health checks, file management, and chat endpoints.
 """
 
-from __future__ import annotations
-
-import asyncio
-import json
-import logging
 import os
-import time
+import logging
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional
-from uuid import UUID
+from typing import List, Optional
+from datetime import datetime
+import uuid
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
-import requests
+from pydantic import BaseModel
+from pymilvus import connections, Collection, utility
 
 from .database import (
-    ChatEventDAO,
-    ChatSessionDAO,
-    DatabaseManager,
-    DocumentChunkDAO,
-    FileRegistryDAO,
-    SystemStatsDAO,
+    engine, Base, SessionLocal, 
+    FileRegistry, FileStatus, ChatSession, ChatEvent,
+    MessageRole, EventType, Visibility
 )
-from .ingest import IngestionJob, IngestionWorker
-from .rag import RAGEngine
+from .ingest import (
+    load_embedding_model, 
+    compute_file_hash, 
+    ingest_file_task,
+    auto_ingest_directory
+)
+from .rag import (
+    load_reranker_model,
+    hybrid_search_and_generate,
+    create_or_get_collection
+)
 
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
+# FastAPI app
 app = FastAPI(
-    title="RAG Microservice API",
-    version="3.0.0",
-    description="Hybrid dense+sparse retrieval with 3-3 memory and GPU acceleration.",
+    title="RAG Financial Assistant API",
+    version="1.0.0",
+    description="Hybrid Search RAG System with BGE-M3 Embeddings"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,385 +56,826 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Globals initialised during startup
-# ---------------------------------------------------------------------------
-
-DB: Optional[DatabaseManager] = None
-FILES: Optional[FileRegistryDAO] = None
-CHUNKS: Optional[DocumentChunkDAO] = None
-SESSIONS: Optional[ChatSessionDAO] = None
-EVENTS: Optional[ChatEventDAO] = None
-STATS: Optional[SystemStatsDAO] = None
-RAG: Optional[RAGEngine] = None
-INGESTION: Optional[IngestionWorker] = None
-DATA_DIR: Optional[Path] = None
+# Global variables
+milvus_collection: Optional[Collection] = None
+UPLOAD_DIR = Path("/app/data/uploads")
+DATA_DIR = Path("/app/data")
 
 
-# ---------------------------------------------------------------------------
-# Pydantic schemas
-# ---------------------------------------------------------------------------
-
-
-class HealthEnvelope(BaseModel):
-    postgres: str
-    milvus: str
-    models: str
-    internet: str
-
-
-class SessionCreate(BaseModel):
-    title: str = Field(default="New Chat", max_length=255)
-
+# ============================================
+# Pydantic Models
+# ============================================
 
 class ChatRequest(BaseModel):
-    session_id: UUID
-    message: str = Field(..., min_length=1, max_length=8000)
+    session_id: str
+    message: str
     use_rag: bool = True
-    filter_expr: Optional[str] = None
+    top_k: int = 7
 
 
 class ChatResponse(BaseModel):
-    session_id: UUID
-    reply: str
-    citations: List[Dict]
-    model_used: str
-    latency_ms: int
+    session_id: str
+    message: str
+    sources: List[dict] = []
+    metadata: dict = {}
 
 
-# ---------------------------------------------------------------------------
-# Startup / shutdown
-# ---------------------------------------------------------------------------
+class SessionCreate(BaseModel):
+    title: Optional[str] = "New Chat"
 
+
+class FileUploadResponse(BaseModel):
+    file_id: str
+    filename: str
+    status: str
+    message: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    details: dict
+
+
+class ServiceInfo(BaseModel):
+    name: str
+    url: str
+    description: str
+    status: str
+
+
+# ============================================
+# Lifecycle Events
+# ============================================
 
 @app.on_event("startup")
-async def on_startup() -> None:
-    global DB, FILES, CHUNKS, SESSIONS, EVENTS, STATS, RAG, INGESTION, DATA_DIR
-
-    DATA_DIR = Path(os.getenv("DATA_PATH", "/app/data"))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    DB = DatabaseManager()
-    FILES = FileRegistryDAO(DB)
-    CHUNKS = DocumentChunkDAO(DB)
-    SESSIONS = ChatSessionDAO(DB)
-    EVENTS = ChatEventDAO(DB)
-    STATS = SystemStatsDAO(DB)
-
-    RAG = RAGEngine()
-    INGESTION = IngestionWorker(
-        files=FILES,
-        chunks=CHUNKS,
-        encoder=RAG.encoder,
-        vector_store=RAG.vector_store,
-        data_dir=DATA_DIR,
-    )
-    await INGESTION.start()
-    await INGESTION.bootstrap_from_directory()
-    logger.info("Startup complete")
+async def startup_event():
+    """Initialize DB, Milvus, models, and auto-ingest initial files"""
+    global milvus_collection
+    
+    logger.info("=" * 60)
+    logger.info("Starting RAG API server...")
+    logger.info("=" * 60)
+    
+    # Create database tables
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("✓ Database tables created/verified")
+    except Exception as e:
+        logger.error(f"✗ Database initialization failed: {e}")
+        raise
+    
+    # Create upload directory
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info(f"✓ Upload directory ready: {UPLOAD_DIR}")
+        logger.info(f"✓ Data directory ready: {DATA_DIR}")
+    except Exception as e:
+        logger.error(f"✗ Directory creation failed: {e}")
+        raise
+    
+    # Connect to Milvus
+    try:
+        milvus_host = os.getenv("MILVUS_HOST", "milvus")
+        milvus_port = os.getenv("MILVUS_PORT", "19530")
+        
+        connections.connect(
+            alias="default",
+            host=milvus_host,
+            port=milvus_port
+        )
+        logger.info(f"✓ Connected to Milvus at {milvus_host}:{milvus_port}")
+        
+        # Create or load collection
+        collection_name = os.getenv("MILVUS_COLLECTION", "rag_hybrid_collection")
+        milvus_collection = create_or_get_collection(collection_name)
+        milvus_collection.load()
+        
+        num_entities = milvus_collection.num_entities
+        logger.info(f"✓ Milvus collection '{collection_name}' loaded ({num_entities} entities)")
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to connect to Milvus: {e}")
+        raise
+    
+    # Load models
+    try:
+        logger.info("Loading AI models...")
+        device = os.getenv("DEVICE", "cuda")
+        
+        load_embedding_model(device=device)
+        logger.info("✓ BGE-M3 embedding model loaded")
+        
+        load_reranker_model(device=device)
+        logger.info("✓ BGE-reranker-v2-m3 loaded")
+        
+    except Exception as e:
+        logger.error(f"✗ Failed to load models: {e}")
+        raise
+    
+    # Auto-ingest files from /app/data
+    try:
+        logger.info("Starting auto-ingestion from /app/data...")
+        await auto_ingest_directory(str(DATA_DIR), milvus_collection)
+        logger.info("✓ Auto-ingestion completed")
+    except Exception as e:
+        logger.error(f"⚠ Auto-ingestion failed: {e}")
+        # Non-critical, continue startup
+    
+    logger.info("=" * 60)
+    logger.info("RAG API server is ready!")
+    logger.info("=" * 60)
 
 
 @app.on_event("shutdown")
-async def on_shutdown() -> None:
-    if DB:
-        DB.close()
-
-
-# ---------------------------------------------------------------------------
-# Dependency helpers
-# ---------------------------------------------------------------------------
-
-
-def _ensure_services():
-    if not all([DB, FILES, CHUNKS, SESSIONS, EVENTS, RAG, INGESTION]):
-        raise HTTPException(status_code=503, detail="Services not initialised")
-
-
-# ---------------------------------------------------------------------------
-# Health & monitoring
-# ---------------------------------------------------------------------------
-
-
-@app.get("/health", response_model=HealthEnvelope)
-async def health() -> HealthEnvelope:
-    _ensure_services()
-    statuses = {"postgres": "ok", "milvus": "ok", "models": "ok", "internet": "ok"}
+async def shutdown_event():
+    """Cleanup resources"""
+    logger.info("Shutting down RAG API server...")
     try:
-        with DB.get_connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT 1")
-    except Exception:  # pragma: no cover - infrastructure guard
-        statuses["postgres"] = "down"
-
-    try:
-        RAG.vector_store.collection.num_entities
-    except Exception:
-        statuses["milvus"] = "down"
-
-    try:
-        requests.get("https://www.google.com", timeout=2)
-    except Exception:
-        statuses["internet"] = "limited"
-
-    return HealthEnvelope(**statuses)
+        connections.disconnect("default")
+        logger.info("✓ Milvus connection closed")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 
-@app.get("/health/db")
-async def health_db():
-    _ensure_services()
-    with DB.get_connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT version()")
-        version = cur.fetchone()[0]
-    return {"status": "ok", "version": version}
+# ============================================
+# Health & System Endpoints
+# ============================================
 
-
-@app.get("/health/vector-db")
-async def health_vector_db():
-    _ensure_services()
-    stats = RAG.vector_store.stats()
-    return {"status": "ok", **stats}
-
-
-@app.get("/stats/system")
-async def system_stats():
-    _ensure_services()
-    return STATS.totals()
-
-
-@app.get("/stats/milvus")
-async def milvus_stats():
-    _ensure_services()
-    return RAG.vector_store.stats()
-
-
-@app.get("/features")
-async def feature_flags():
+@app.get("/", tags=["Root"])
+async def root():
+    """API root endpoint"""
     return {
-        "hybrid_search": True,
-        "reranking": bool(RAG.reranker),
-        "importance_boost": True,
-        "streaming": True,
-        "infinite_memory": True,
+        "name": "RAG Financial Assistant API",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health"
     }
 
 
-@app.get("/system/services")
-async def system_services():
-    base = os.getenv("BASE_HOST", "localhost")
-    return [
-        {"name": "API", "url": f"http://{base}:8000", "status": "running"},
-        {"name": "Streamlit UI", "url": f"http://{base}:8501", "status": "running"},
-        {"name": "Milvus", "url": f"http://{base}:9091/healthz", "status": "running"},
-        {"name": "PostgreSQL", "url": f"{base}:5433", "status": "running"},
-        {"name": "Ollama", "url": f"http://{base}:11435", "status": "running"},
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check():
+    """Overall system health check"""
+    db_status = "healthy"
+    milvus_status = "healthy"
+    model_status = "healthy"
+    
+    # Check DB
+    try:
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        db.close()
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+    
+    # Check Milvus
+    try:
+        if milvus_collection is None:
+            milvus_status = "unhealthy: collection not loaded"
+        else:
+            _ = milvus_collection.num_entities
+    except Exception as e:
+        milvus_status = f"unhealthy: {str(e)}"
+    
+    # Check models
+    from .ingest import bge_m3_model
+    from .rag import bge_reranker
+    if bge_m3_model is None or bge_reranker is None:
+        model_status = "unhealthy: models not loaded"
+    
+    overall_status = "healthy" if all(
+        s == "healthy" for s in [db_status, milvus_status, model_status]
+    ) else "degraded"
+    
+    return HealthResponse(
+        status=overall_status,
+        details={
+            "database": db_status,
+            "vector_db": milvus_status,
+            "models": model_status
+        }
+    )
+
+
+@app.get("/health/db", tags=["Health"])
+async def health_check_db():
+    """PostgreSQL health check"""
+    try:
+        db = SessionLocal()
+        result = db.execute("SELECT version()").fetchone()
+        db.close()
+        return {
+            "status": "healthy",
+            "version": result[0] if result else "unknown"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
+
+
+@app.get("/health/vector-db", tags=["Health"])
+async def health_check_milvus():
+    """Milvus health check"""
+    try:
+        if milvus_collection is None:
+            raise HTTPException(status_code=503, detail="Milvus collection not loaded")
+        
+        num_entities = milvus_collection.num_entities
+        return {
+            "status": "healthy",
+            "collection": milvus_collection.name,
+            "entities": num_entities
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Milvus unhealthy: {str(e)}")
+
+
+@app.get("/stats/milvus", tags=["Statistics"])
+async def get_milvus_stats():
+    """Detailed Milvus statistics"""
+    try:
+        if milvus_collection is None:
+            raise HTTPException(status_code=503, detail="Collection not loaded")
+        
+        stats = {
+            "collection_name": milvus_collection.name,
+            "num_entities": milvus_collection.num_entities,
+            "schema": {
+                "fields": [
+                    {
+                        "name": field.name,
+                        "type": str(field.dtype),
+                        "params": field.params
+                    }
+                    for field in milvus_collection.schema.fields
+                ]
+            },
+            "indexes": [
+                {
+                    "field": idx.field_name,
+                    "index_name": idx.index_name,
+                    "params": idx.params
+                }
+                for idx in milvus_collection.indexes
+            ]
+        }
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats/system", tags=["Statistics"])
+async def get_system_stats():
+    """Aggregated system statistics"""
+    db = SessionLocal()
+    try:
+        total_files = db.query(FileRegistry).count()
+        completed_files = db.query(FileRegistry).filter(
+            FileRegistry.status == FileStatus.COMPLETED
+        ).count()
+        processing_files = db.query(FileRegistry).filter(
+            FileRegistry.status == FileStatus.PROCESSING
+        ).count()
+        failed_files = db.query(FileRegistry).filter(
+            FileRegistry.status == FileStatus.FAILED
+        ).count()
+        
+        total_sessions = db.query(ChatSession).count()
+        total_messages = db.query(ChatEvent).count()
+        
+        return {
+            "files": {
+                "total": total_files,
+                "completed": completed_files,
+                "processing": processing_files,
+                "failed": failed_files
+            },
+            "chat": {
+                "sessions": total_sessions,
+                "messages": total_messages
+            },
+            "vector_db": {
+                "entities": milvus_collection.num_entities if milvus_collection else 0,
+                "collection": milvus_collection.name if milvus_collection else None
+            }
+        }
+    finally:
+        db.close()
+
+
+@app.get("/system/services", response_model=List[ServiceInfo], tags=["System"])
+async def get_services_info():
+    """List all connected services and their URLs"""
+    services = [
+        ServiceInfo(
+            name="Streamlit UI",
+            url="http://localhost:8501",
+            description="Frontend application",
+            status="external"
+        ),
+        ServiceInfo(
+            name="FastAPI Backend",
+            url="http://localhost:8000",
+            description="RAG engine and API gateway",
+            status="running"
+        ),
+        ServiceInfo(
+            name="Ollama",
+            url="http://localhost:11435",
+            description="Local LLM server (Llama 3.2 3B)",
+            status="external"
+        ),
+        ServiceInfo(
+            name="PostgreSQL",
+            url="postgresql://localhost:5433",
+            description="Metadata and chat history database",
+            status="external"
+        ),
+        ServiceInfo(
+            name="Milvus",
+            url="http://localhost:19530",
+            description="Vector database for embeddings",
+            status="external"
+        ),
+        ServiceInfo(
+            name="MinIO Console",
+            url="http://localhost:9001",
+            description="Object storage web UI",
+            status="external"
+        ),
+        ServiceInfo(
+            name="Attu",
+            url="http://localhost:3000",
+            description="Milvus vector database UI",
+            status="external"
+        )
     ]
+    return services
 
 
-# ---------------------------------------------------------------------------
-# Session & event APIs
-# ---------------------------------------------------------------------------
+@app.get("/features", tags=["System"])
+async def get_enabled_features():
+    """List enabled system features"""
+    return {
+        "hybrid_search": True,
+        "dense_embedding": "BGE-M3",
+        "sparse_embedding": "BGE-M3 (lexical)",
+        "reranker": "BGE-reranker-v2-m3",
+        "primary_llm": "Gemini 2.0 Flash" if os.getenv("GEMINI_API_KEY") else "None",
+        "fallback_llm": "Llama 3.2 3B (Ollama)",
+        "chunking": "Overlap-based (512 tokens)",
+        "memory_mechanism": "3-3 Memory (summaries + checkpoints)",
+        "gpu_acceleration": True,
+        "streaming_responses": True
+    }
 
 
-@app.get("/sessions")
-async def list_sessions():
-    _ensure_services()
-    return SESSIONS.list()
+# ============================================
+# File Management Endpoints
+# ============================================
 
-
-@app.post("/sessions")
-async def create_session(payload: SessionCreate):
-    _ensure_services()
-    session_id = SESSIONS.create(title=payload.title)
-    return {"session_id": session_id, "title": payload.title}
-
-
-@app.delete("/sessions/{session_id}")
-async def delete_session(session_id: UUID):
-    _ensure_services()
-    SESSIONS.delete(str(session_id))
-    return {"status": "deleted"}
-
-
-@app.get("/sessions/{session_id}/history")
-async def session_history(session_id: UUID, limit: int = 50):
-    _ensure_services()
-    return EVENTS.visible_history(str(session_id), limit=limit)
-
-
-@app.get("/sessions/{session_id}/events")
-async def session_events(session_id: UUID, limit: int = 200):
-    _ensure_services()
-    return EVENTS.raw_events(str(session_id), limit=limit)
-
-
-# ---------------------------------------------------------------------------
-# Chat endpoints
-# ---------------------------------------------------------------------------
-
-
-async def _maybe_summarise(session_id: str) -> None:
-    count = EVENTS.messages_since_summary(session_id)
-    if count < 6:
-        return
-    history = EVENTS.visible_history(session_id, limit=10)
-    conversation = "\n".join(
-        f"{msg['role']}: {msg['content']}" for msg in history[-6:]
-    )
-    prompt = (
-        "Summarise the following conversation in 3 bullet points:\n"
-        f"{conversation}"
-    )
-    loop = asyncio.get_running_loop()
-
-    def _generate_summary():
-        text = ""
-        for chunk in RAG.llm.stream(prompt):
-            text += chunk["token"]
-        return text
-
-    summary = await loop.run_in_executor(None, _generate_summary)
-    EVENTS.append(
-        session_id,
-        "SYSTEM",
-        summary.strip(),
-        event_type="SUMMARY",
-        visibility="HIDDEN",
-    )
-
-
-def _format_citations(chunks: List[Dict]) -> List[Dict]:
-    cites = []
-    for chunk in chunks:
-        cites.append(
-            {
-                "file_id": chunk.get("file_id"),
-                "page_number": chunk.get("page_number"),
-                "importance": chunk.get("importance_score"),
-                "excerpt": chunk.get("text", "")[:400],
+@app.post("/files/upload", response_model=FileUploadResponse, tags=["Files"])
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """Upload a document for ingestion"""
+    db = SessionLocal()
+    try:
+        # Validate file type
+        if not file.filename.endswith(('.pdf', '.docx', '.doc')):
+            raise HTTPException(
+                status_code=400, 
+                detail="Only PDF and DOCX files are supported"
+            )
+        
+        # Save file
+        file_path = UPLOAD_DIR / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Saved uploaded file: {file_path}")
+        
+        # Compute hash
+        file_hash = compute_file_hash(str(file_path))
+        
+        # Check if already exists
+        existing = db.query(FileRegistry).filter(
+            FileRegistry.file_hash == file_hash
+        ).first()
+        
+        if existing:
+            return FileUploadResponse(
+                file_id=str(existing.id),
+                filename=file.filename,
+                status=existing.status.value,
+                message="File already exists in the system"
+            )
+        
+        # Create new file record
+        file_record = FileRegistry(
+            file_hash=file_hash,
+            filename=file.filename,
+            status=FileStatus.PENDING,
+            meta_info={
+                "uploaded_at": datetime.utcnow().isoformat(),
+                "file_size": len(content)
             }
         )
-    return cites
+        db.add(file_record)
+        db.commit()
+        db.refresh(file_record)
+        
+        logger.info(f"Created file record: {file_record.id}")
+        
+        # Schedule background ingestion
+        background_tasks.add_task(
+            ingest_file_task,
+            str(file_record.id),
+            str(file_path),
+            milvus_collection
+        )
+        
+        return FileUploadResponse(
+            file_id=str(file_record.id),
+            filename=file.filename,
+            status="pending",
+            message="File uploaded and queued for processing"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 
-@app.post("/chat", response_model=None)
-async def stream_chat(payload: ChatRequest):
-    _ensure_services()
-    session_id = str(payload.session_id)
-    EVENTS.append(session_id, "USER", payload.message)
-    context = EVENTS.llm_context(session_id)
-    retrieved = RAG.retrieve(payload.message) if payload.use_rag else []
-    citations = _format_citations(retrieved)
-
-    async def event_generator() -> AsyncGenerator[Dict, None]:
-        assistant_text = ""
-        start = time.perf_counter()
-        yield {"event": "context", "data": json.dumps({"citations": citations})}
-        try:
-            for chunk in RAG.stream(
-                query=payload.message, retrieved=retrieved, conversation=context
-            ):
-                assistant_text += chunk["token"]
-                yield {"event": "token", "data": chunk["token"]}
-                await asyncio.sleep(0)
-        finally:
-            elapsed = int((time.perf_counter() - start) * 1000)
-            EVENTS.append(
-                session_id,
-                "ASSISTANT",
-                assistant_text.strip(),
-                model_used=chunk.get("model") if "chunk" in locals() else "unknown",
-            )
-            await _maybe_summarise(session_id)
-            yield {
-                "event": "metadata",
-                "data": json.dumps(
-                    {
-                        "latency_ms": elapsed,
-                        "model_used": chunk.get("model")
-                        if "chunk" in locals()
-                        else "unknown",
-                    }
-                ),
-            }
-
-    return EventSourceResponse(event_generator())
+@app.post("/upload", response_model=FileUploadResponse, tags=["Files"])
+async def upload_file_alias(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """Alias endpoint for file upload"""
+    return await upload_file(background_tasks, file)
 
 
-@app.post("/sessions/{session_id}/message", response_model=ChatResponse)
-async def send_message(session_id: UUID, payload: ChatRequest):
-    _ensure_services()
-    if str(session_id) != str(payload.session_id):
-        raise HTTPException(status_code=400, detail="Session mismatch")
-
-    start = time.perf_counter()
-    EVENTS.append(str(session_id), "USER", payload.message)
-    context = EVENTS.llm_context(str(session_id))
-    retrieved = RAG.retrieve(payload.message) if payload.use_rag else []
-    result = RAG.generate(
-        query=payload.message, retrieved=retrieved, conversation=context
-    )
-    EVENTS.append(
-        str(session_id),
-        "ASSISTANT",
-        result["answer"],
-        model_used=result["model_used"],
-    )
-    await _maybe_summarise(str(session_id))
-    elapsed = int((time.perf_counter() - start) * 1000)
-    return ChatResponse(
-        session_id=session_id,
-        reply=result["answer"],
-        citations=_format_citations(retrieved),
-        model_used=result["model_used"],
-        latency_ms=elapsed,
-    )
-
-
-# ---------------------------------------------------------------------------
-# File ingestion APIs
-# ---------------------------------------------------------------------------
-
-
-@app.get("/files")
+@app.get("/files", tags=["Files"])
 async def list_files():
-    _ensure_services()
-    return FILES.list()
+    """List all uploaded files with metadata"""
+    db = SessionLocal()
+    try:
+        files = db.query(FileRegistry).order_by(
+            FileRegistry.created_at.desc()
+        ).all()
+        
+        return [
+            {
+                "id": str(f.id),
+                "filename": f.filename,
+                "status": f.status.value,
+                "meta_info": f.meta_info,
+                "created_at": f.created_at.isoformat()
+            }
+            for f in files
+        ]
+    finally:
+        db.close()
 
 
-@app.get("/files/status")
-async def file_status():
-    _ensure_services()
-    summary = FILES.status_counts()
-    summary["total"] = sum(summary.values())
-    return summary
+@app.get("/files/status", tags=["Files"])
+async def get_files_status():
+    """Get aggregated file processing status"""
+    db = SessionLocal()
+    try:
+        status_counts = {}
+        for status in FileStatus:
+            count = db.query(FileRegistry).filter(
+                FileRegistry.status == status
+            ).count()
+            status_counts[status.value] = count
+        
+        return status_counts
+    finally:
+        db.close()
 
 
-@app.get("/files/{file_id}")
-async def file_detail(file_id: UUID):
-    _ensure_services()
-    detail = FILES.detail(str(file_id))
-    if not detail:
-        raise HTTPException(status_code=404, detail="File not found")
-    return detail
+@app.get("/files/{file_id}", tags=["Files"])
+async def get_file_detail(file_id: str):
+    """Get detailed file information"""
+    db = SessionLocal()
+    try:
+        file_record = db.query(FileRegistry).filter(
+            FileRegistry.id == uuid.UUID(file_id)
+        ).first()
+        
+        if not file_record:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        return {
+            "id": str(file_record.id),
+            "filename": file_record.filename,
+            "file_hash": file_record.file_hash,
+            "status": file_record.status.value,
+            "meta_info": file_record.meta_info,
+            "created_at": file_record.created_at.isoformat()
+        }
+    finally:
+        db.close()
 
 
-@app.post("/files/upload", status_code=status.HTTP_202_ACCEPTED)
-async def upload_file(file: UploadFile = File(...)):
-    _ensure_services()
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files supported")
+@app.delete("/files/{file_id}", tags=["Files"])
+async def delete_file(file_id: str):
+    """Delete a file and its vectors from Milvus"""
+    db = SessionLocal()
+    try:
+        # Get file record
+        file_record = db.query(FileRegistry).filter(
+            FileRegistry.id == uuid.UUID(file_id)
+        ).first()
+        
+        if not file_record:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Delete vectors from Milvus
+        if milvus_collection:
+            try:
+                expr = f'file_id == "{file_id}"'
+                milvus_collection.delete(expr)
+                milvus_collection.flush()
+                logger.info(f"Deleted vectors for file {file_id} from Milvus")
+            except Exception as e:
+                logger.error(f"Error deleting vectors: {e}")
+        
+        # Delete from database
+        filename = file_record.filename
+        db.delete(file_record)
+        db.commit()
+        
+        logger.info(f"Deleted file record: {file_id}")
+        
+        return {
+            "message": "File deleted successfully",
+            "file_id": file_id,
+            "filename": filename
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
-    destination = DATA_DIR / file.filename
-    destination.write_bytes(await file.read())
 
-    await INGESTION.enqueue(
-        IngestionJob(file_path=destination, display_name=file.filename)
+# ============================================
+# Chat Session Endpoints
+# ============================================
+
+@app.post("/sessions", tags=["Chat"])
+async def create_session(session_create: SessionCreate):
+    """Create a new chat session"""
+    db = SessionLocal()
+    try:
+        session = ChatSession(title=session_create.title or "New Chat")
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        logger.info(f"Created new session: {session.id}")
+        
+        return {
+            "id": str(session.id),
+            "title": session.title,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat()
+        }
+    finally:
+        db.close()
+
+
+@app.get("/sessions", tags=["Chat"])
+async def list_sessions():
+    """List all chat sessions"""
+    db = SessionLocal()
+    try:
+        sessions = db.query(ChatSession).order_by(
+            ChatSession.updated_at.desc()
+        ).all()
+        
+        return [
+            {
+                "id": str(s.id),
+                "title": s.title,
+                "created_at": s.created_at.isoformat(),
+                "updated_at": s.updated_at.isoformat()
+            }
+            for s in sessions
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/sessions/{session_id}", tags=["Chat"])
+async def get_session(session_id: str):
+    """Get session details"""
+    db = SessionLocal()
+    try:
+        session = db.query(ChatSession).filter(
+            ChatSession.id == uuid.UUID(session_id)
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get message count
+        message_count = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.visibility == Visibility.VISIBLE
+        ).count()
+        
+        return {
+            "id": str(session.id),
+            "title": session.title,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "message_count": message_count
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/sessions/{session_id}", tags=["Chat"])
+async def delete_session(session_id: str):
+    """Delete a chat session and all messages"""
+    db = SessionLocal()
+    try:
+        session = db.query(ChatSession).filter(
+            ChatSession.id == uuid.UUID(session_id)
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session_title = session.title
+        db.delete(session)
+        db.commit()
+        
+        logger.info(f"Deleted session: {session_id}")
+        
+        return {
+            "message": "Session deleted successfully",
+            "session_id": session_id,
+            "title": session_title
+        }
+    finally:
+        db.close()
+
+
+@app.get("/sessions/{session_id}/history", tags=["Chat"])
+async def get_session_history(session_id: str):
+    """Get visible chat history for a session"""
+    db = SessionLocal()
+    try:
+        events = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.visibility == Visibility.VISIBLE
+        ).order_by(ChatEvent.sequence_num).all()
+        
+        return [
+            {
+                "id": str(e.id),
+                "role": e.role.value,
+                "content": e.content,
+                "sequence_num": e.sequence_num,
+                "model_used": e.model_used
+            }
+            for e in events
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/sessions/{session_id}/events", tags=["Chat"])
+async def get_session_events(session_id: str):
+    """Get all events (including hidden summaries) for a session"""
+    db = SessionLocal()
+    try:
+        events = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id)
+        ).order_by(ChatEvent.sequence_num).all()
+        
+        return [
+            {
+                "id": str(e.id),
+                "role": e.role.value,
+                "content": e.content,
+                "sequence_num": e.sequence_num,
+                "event_type": e.event_type.value,
+                "visibility": e.visibility.value,
+                "model_used": e.model_used
+            }
+            for e in events
+        ]
+    finally:
+        db.close()
+
+
+@app.post("/sessions/{session_id}/message", tags=["Chat"])
+async def send_message(session_id: str, request: ChatRequest):
+    """Send a message and get a non-streaming response"""
+    db = SessionLocal()
+    try:
+        # Verify session exists
+        session = db.query(ChatSession).filter(
+            ChatSession.id == uuid.UUID(session_id)
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Use the streaming endpoint but collect all chunks
+        full_response = ""
+        sources = []
+        
+        async for chunk in hybrid_search_and_generate(
+            query_text=request.message,
+            session_id=session_id,
+            collection=milvus_collection,
+            top_k=request.top_k,
+            use_rag=request.use_rag
+        ):
+            import json
+            data = json.loads(chunk)
+            if data.get("type") == "content":
+                full_response += data.get("content", "")
+            elif data.get("type") == "sources":
+                sources = data.get("sources", [])
+        
+        return ChatResponse(
+            session_id=session_id,
+            message=full_response,
+            sources=sources,
+            metadata={"use_rag": request.use_rag, "top_k": request.top_k}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Message error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.post("/chat", tags=["Chat"])
+async def chat_endpoint(request: ChatRequest):
+    """Main RAG chat endpoint with streaming responses"""
+    try:
+        # Verify session exists
+        db = SessionLocal()
+        session = db.query(ChatSession).filter(
+            ChatSession.id == uuid.UUID(request.session_id)
+        ).first()
+        db.close()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        async def generate():
+            async for chunk in hybrid_search_and_generate(
+                query_text=request.message,
+                session_id=request.session_id,
+                collection=milvus_collection,
+                top_k=request.top_k,
+                use_rag=request.use_rag
+            ):
+                yield f"data: {chunk}\n\n"
+        
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
     )
-    return {"status": "queued", "filename": file.filename}
-
-
-@app.delete("/files/{file_id}")
-async def delete_file(file_id: UUID):
-    _ensure_services()
-    RAG.vector_store.delete_file(str(file_id))
-    FILES.remove(str(file_id))
-    return {"status": "deleted"}

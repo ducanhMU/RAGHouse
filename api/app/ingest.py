@@ -1,169 +1,293 @@
 """
-Document ingestion pipeline with background worker and GPU embeddings.
+File Ingestion Module
+Handles document extraction, chunking, embedding generation, and vector insertion into Milvus.
 """
 
-from __future__ import annotations
-
-import asyncio
+import os
 import hashlib
-import logging
-from dataclasses import dataclass, field
+import asyncio
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import logging
 
-import pypdf
+import fitz  # PyMuPDF
+from docx import Document
+from FlagEmbedding import BGEM3FlagModel
+from pymilvus import Collection, utility
+import numpy as np
 
-from .database import DocumentChunkDAO, FileRegistryDAO
-from .rag import BgeM3Encoder, MilvusHybridStore
+from .database import SessionLocal, FileRegistry, FileStatus
 
 logger = logging.getLogger(__name__)
 
-
-def _md5(path: Path) -> str:
-    digest = hashlib.md5()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 512), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# Global model instances (loaded at startup)
+bge_m3_model: Optional[BGEM3FlagModel] = None
 
 
-def _chunk_text(text: str, chunk_tokens: int = 512, overlap: int = 128) -> Iterable[str]:
-    tokens = text.split()
-    stride = max(chunk_tokens - overlap, 1)
-    for start in range(0, len(tokens), stride):
-        chunk = " ".join(tokens[start : start + chunk_tokens])
-        if chunk.strip():
-            yield chunk
+def load_embedding_model(model_name: str = "BAAI/bge-m3", device: str = "cuda"):
+    """Load BGE-M3 embedding model on GPU"""
+    global bge_m3_model
+    logger.info(f"Loading embedding model: {model_name} on {device}")
+    bge_m3_model = BGEM3FlagModel(model_name, use_fp16=True, device=device)
+    logger.info("Embedding model loaded successfully")
 
 
-def _extract_pdf(path: Path) -> List[Dict]:
-    pages: List[Dict] = []
-    with path.open("rb") as pdf_file:
-        reader = pypdf.PdfReader(pdf_file)
-        for idx, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            pages.append({"page": idx, "text": text})
+def compute_file_hash(file_path: str) -> str:
+    """Compute MD5 hash of file for deduplication"""
+    hasher = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def extract_text_from_pdf(file_path: str) -> List[Dict[str, Any]]:
+    """Extract text from PDF with page metadata"""
+    pages = []
+    try:
+        doc = fitz.open(file_path)
+        for page_num, page in enumerate(doc, start=1):
+            text = page.get_text()
+            if text.strip():
+                pages.append({
+                    "page_number": page_num,
+                    "content": text.strip()
+                })
+        doc.close()
+        logger.info(f"Extracted {len(pages)} pages from {file_path}")
+    except Exception as e:
+        logger.error(f"Error extracting PDF {file_path}: {e}")
+        raise
     return pages
 
 
-@dataclass
-class IngestionJob:
-    file_path: Path
-    display_name: str
-    metadata: Dict = field(default_factory=dict)
-    force: bool = False
+def extract_text_from_docx(file_path: str) -> List[Dict[str, Any]]:
+    """Extract text from DOCX (single page since Word doesn't have page concept)"""
+    try:
+        doc = Document(file_path)
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        content = "\n".join(paragraphs)
+        logger.info(f"Extracted content from {file_path}")
+        return [{"page_number": 1, "content": content}]
+    except Exception as e:
+        logger.error(f"Error extracting DOCX {file_path}: {e}")
+        raise
 
 
-class IngestionWorker:
-    """
-    Asynchronous ingestion worker that keeps the FastAPI thread non-blocking.
-    """
+def chunk_text(text: str, chunk_size: int = 512, overlap: int = 50) -> List[str]:
+    """Split text into overlapping chunks by token count (simplified word-based)"""
+    words = text.split()
+    chunks = []
+    
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk.strip():
+            chunks.append(chunk.strip())
+    
+    return chunks
 
-    def __init__(
-        self,
-        *,
-        files: FileRegistryDAO,
-        chunks: DocumentChunkDAO,
-        encoder: BgeM3Encoder,
-        vector_store: MilvusHybridStore,
-        data_dir: Path,
-    ) -> None:
-        self.files = files
-        self.chunks = chunks
-        self.encoder = encoder
-        self.vector_store = vector_store
-        self.data_dir = data_dir
-        self.queue: asyncio.Queue[IngestionJob] = asyncio.Queue(maxsize=100)
-        self._task: Optional[asyncio.Task] = None
 
-    async def start(self) -> None:
-        if not self._task:
-            self._task = asyncio.create_task(self._run(), name="ingestion-worker")
+def generate_embeddings(texts: List[str]) -> Dict[str, Any]:
+    """Generate dense + sparse embeddings using BGE-M3"""
+    if bge_m3_model is None:
+        raise RuntimeError("Embedding model not loaded")
+    
+    logger.info(f"Generating embeddings for {len(texts)} chunks")
+    embeddings = bge_m3_model.encode(
+        texts,
+        batch_size=8,
+        max_length=512,
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False
+    )
+    
+    return {
+        "dense": embeddings['dense'],
+        "sparse": embeddings['lexical_weights']
+    }
 
-    async def enqueue(self, job: IngestionJob) -> None:
-        await self.queue.put(job)
 
-    async def bootstrap_from_directory(self) -> None:
-        for file_path in sorted(self.data_dir.glob("*")):
-            if file_path.is_file():
-                await self.enqueue(
-                    IngestionJob(
-                        file_path=file_path,
-                        display_name=file_path.name,
-                        metadata={"bootstrap": True},
-                    )
-                )
+async def insert_vectors_to_milvus(
+    collection: Collection,
+    chunks: List[Dict[str, Any]],
+    file_id: str
+):
+    """Insert dense + sparse vectors into Milvus collection"""
+    if not chunks:
+        logger.warning(f"No chunks to insert for file {file_id}")
+        return
+    
+    texts = [chunk["content"] for chunk in chunks]
+    embeddings = generate_embeddings(texts)
+    
+    # Prepare data for insertion
+    data = []
+    for i, chunk in enumerate(chunks):
+        data.append({
+            "dense_vector": embeddings["dense"][i].tolist(),
+            "sparse_vector": embeddings["sparse"][i],
+            "content": chunk["content"],
+            "file_id": file_id,
+            "page_number": chunk["page_number"],
+            "importance_score": chunk.get("importance_score", 0.0)
+        })
+    
+    # Insert in batches
+    batch_size = 100
+    for i in range(0, len(data), batch_size):
+        batch = data[i:i + batch_size]
+        collection.insert(batch)
+        logger.info(f"Inserted batch {i//batch_size + 1} for file {file_id}")
+    
+    collection.flush()
+    logger.info(f"Successfully inserted {len(data)} vectors for file {file_id}")
 
-    async def _run(self) -> None:
-        logger.info("Ingestion worker started")
-        while True:
-            job = await self.queue.get()
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, self._process_job, job
-                )
-            except Exception as exc:  # pragma: no cover - resilience over strictness
-                logger.exception("Ingestion failed for %s (%s)", job.display_name, exc)
-            finally:
-                self.queue.task_done()
 
-    # ------------------------------------------------------------------ #
-    # CPU intensive processing (runs in thread pool)
-    # ------------------------------------------------------------------ #
+async def process_file(
+    file_path: str,
+    file_id: str,
+    collection: Collection
+) -> Dict[str, Any]:
+    """Main ingestion pipeline: extract → chunk → embed → insert"""
+    try:
+        logger.info(f"Processing file: {file_path}")
+        
+        # Extract text based on file type
+        file_ext = Path(file_path).suffix.lower()
+        if file_ext == '.pdf':
+            pages = extract_text_from_pdf(file_path)
+        elif file_ext in ['.docx', '.doc']:
+            pages = extract_text_from_docx(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}")
+        
+        # Chunk each page
+        all_chunks = []
+        for page_data in pages:
+            page_chunks = chunk_text(page_data["content"])
+            for chunk_text in page_chunks:
+                all_chunks.append({
+                    "content": chunk_text,
+                    "page_number": page_data["page_number"],
+                    "importance_score": 0.0  # Can be enhanced with importance scoring
+                })
+        
+        logger.info(f"Generated {len(all_chunks)} chunks from {len(pages)} pages")
+        
+        # Insert into Milvus
+        await insert_vectors_to_milvus(collection, all_chunks, file_id)
+        
+        return {
+            "success": True,
+            "pages": len(pages),
+            "chunks": len(all_chunks)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
-    def _process_job(self, job: IngestionJob) -> None:
-        file_path = job.file_path
-        if not file_path.exists():
-            logger.warning("File missing, skipping ingestion: %s", file_path)
+
+async def ingest_file_task(
+    file_id: str,
+    file_path: str,
+    collection: Collection
+):
+    """Background task for file ingestion with DB status updates"""
+    db = SessionLocal()
+    try:
+        # Update status to PROCESSING
+        file_record = db.query(FileRegistry).filter(FileRegistry.id == file_id).first()
+        if not file_record:
+            logger.error(f"File record not found: {file_id}")
             return
+        
+        file_record.status = FileStatus.PROCESSING
+        db.commit()
+        
+        # Process file
+        result = await process_file(file_path, file_id, collection)
+        
+        # Update status based on result
+        if result["success"]:
+            file_record.status = FileStatus.COMPLETED
+            file_record.meta_info = {
+                **file_record.meta_info,
+                "pages": result.get("pages", 0),
+                "chunks": result.get("chunks", 0),
+                "processed_at": datetime.utcnow().isoformat()
+            }
+        else:
+            file_record.status = FileStatus.FAILED
+            file_record.meta_info = {
+                **file_record.meta_info,
+                "error": result.get("error", "Unknown error")
+            }
+        
+        db.commit()
+        logger.info(f"File {file_id} ingestion completed with status: {file_record.status}")
+        
+    except Exception as e:
+        logger.error(f"Critical error in ingestion task for {file_id}: {e}", exc_info=True)
+        file_record = db.query(FileRegistry).filter(FileRegistry.id == file_id).first()
+        if file_record:
+            file_record.status = FileStatus.FAILED
+            file_record.meta_info = {**file_record.meta_info, "error": str(e)}
+            db.commit()
+    finally:
+        db.close()
 
-        logger.info("Starting ingestion for %s", job.display_name)
-        file_hash = _md5(file_path)
 
-        existing = self.files.lookup_by_hash(file_hash)
-        if existing and not job.force:
-            logger.info("File already ingested (%s), skipping", job.display_name)
+async def auto_ingest_directory(
+    directory: str,
+    collection: Collection
+):
+    """Auto-ingest all files from a directory (e.g., api/data/) on startup"""
+    db = SessionLocal()
+    try:
+        data_dir = Path(directory)
+        if not data_dir.exists():
+            logger.warning(f"Data directory does not exist: {directory}")
             return
-
-        file_id = existing["id"] if existing else self.files.register(job.display_name, file_hash)
-        self.files.update_status(file_id, "PROCESSING")
-
-        pages = _extract_pdf(file_path)
-        chunks = []
-        chunk_index = 0
-        for page in pages:
-            for chunk_text in _chunk_text(page["text"]):
-                chunks.append(
-                    {
-                        "index": chunk_index,
-                        "text": chunk_text,
-                        "page": page["page"],
-                    }
+        
+        files = list(data_dir.glob("**/*.pdf")) + list(data_dir.glob("**/*.docx"))
+        logger.info(f"Found {len(files)} files in {directory}")
+        
+        for file_path in files:
+            file_hash = compute_file_hash(str(file_path))
+            
+            # Check if already processed
+            existing = db.query(FileRegistry).filter(
+                FileRegistry.file_hash == file_hash
+            ).first()
+            
+            if existing and existing.status == FileStatus.COMPLETED:
+                logger.info(f"File already processed: {file_path.name}")
+                continue
+            
+            # Register or update file
+            if not existing:
+                file_record = FileRegistry(
+                    file_hash=file_hash,
+                    filename=file_path.name,
+                    status=FileStatus.PENDING,
+                    meta_info={"source": "auto_ingest"}
                 )
-                chunk_index += 1
-
-        if not chunks:
-            raise RuntimeError("No textual content detected")
-
-        self.chunks.insert_batch(file_id, chunks)
-
-        embeddings = self.encoder.encode_texts([c["text"] for c in chunks])
-        self.vector_store.insert_chunks(
-            file_id=file_id,
-            dense_vectors=[emb.dense for emb in embeddings],
-            sparse_vectors=[emb.sparse for emb in embeddings],
-            texts=[c["text"] for c in chunks],
-            pages=[c["page"] for c in chunks],
-            importance=[emb.importance for emb in embeddings],
-        )
-
-        self.files.upsert_metadata(
-            file_id,
-            {
-                "pages": len(pages),
-                "chunks": len(chunks),
-                "bootstrap": job.metadata.get("bootstrap", False),
-            },
-        )
-        self.files.update_status(file_id, "COMPLETED")
-        logger.info("Ingestion completed for %s (%s chunks)", job.display_name, len(chunks))
+                db.add(file_record)
+                db.commit()
+                db.refresh(file_record)
+                file_id = str(file_record.id)
+            else:
+                file_id = str(existing.id)
+            
+            # Start ingestion
+            logger.info(f"Starting ingestion for: {file_path.name}")
+            await ingest_file_task(file_id, str(file_path), collection)
+        
+    finally:
+        db.close()

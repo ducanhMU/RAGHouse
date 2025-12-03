@@ -1,425 +1,394 @@
-# 🚀 RAG V2 ULTIMATE
+# 📊 RAG Financial Assistant
 
-**Production-Ready Retrieval-Augmented Generation System**
+A production-ready Retrieval-Augmented Generation (RAG) system designed for financial document analysis with hybrid search, GPU acceleration, and infinite conversation memory.
 
-A complete AI assistant with hybrid search, infinite context memory, and GPU acceleration.
+## 🌟 Key Features
 
-## ✨ Key Features
+- **Hybrid Search**: Combines dense (BGE-M3) and sparse (lexical) embeddings for optimal retrieval
+- **Cross-Encoder Reranking**: BGE-reranker-v2-m3 for fine-grained relevance scoring
+- **Infinite Context**: 3-3 memory mechanism (summaries + checkpoints) for unlimited conversation history
+- **GPU Acceleration**: CUDA-optimized embedding and reranking
+- **Dual LLM Support**: Gemini 2.0 Flash (primary) + Llama 3.2 3B (fallback)
+- **Real-Time Streaming**: Server-Sent Events (SSE) for responsive chat
+- **Production-Ready**: Docker Compose orchestration with health checks and monitoring
 
-- **🔍 Hybrid Search**: Combines semantic (Milvus) + keyword (PostgreSQL FTS) search with RRF fusion
-- **🧠 Infinite Context**: Smart 3-3 memory architecture (Summary + Checkpoint system)
-- **⚡ GPU-Accelerated**: Batch embedding, reranking, and optional local LLM
-- **🌐 Dual LLM**: Gemini 2.0 Flash (primary) + Llama 3.2 (fallback)
-- **📚 Document Intelligence**: PDF ingestion with deduplication
-- **💾 Enterprise Database**: PostgreSQL with FTS + Milvus vector DB
-- **🎨 Modern UI**: Streamlit interface with real-time status
+---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────┐
-│ Streamlit UI│
-└──────┬──────┘
-       │
-┌──────▼───────┐     ┌──────────────┐
-│  FastAPI     │────▶│  PostgreSQL  │
-│  Gateway     │     │  (FTS + Chat)│
-└──────┬───────┘     └──────────────┘
-       │
-       ├────────────▶┌──────────────┐
-       │             │   Milvus     │
-       │             │  (Vectors)   │
-       │             └──────────────┘
-       │
-       └────────────▶┌──────────────┐
-                     │   Ollama     │
-                     │ (Embedding + │
-                     │   Fallback)  │
-                     └──────────────┘
+┌─────────────┐     ┌──────────────┐     ┌────────────────┐
+│  Streamlit  │────▶│   FastAPI    │────▶│   PostgreSQL   │
+│     UI      │     │   Gateway    │     │   (Metadata)   │
+└─────────────┘     └──────────────┘     └────────────────┘
+                           │
+                           ├────────▶ Milvus (Vectors)
+                           │
+                           ├────────▶ BGE-M3 (Embeddings)
+                           │
+                           ├────────▶ BGE-Reranker (Rerank)
+                           │
+                           └────────▶ Gemini / Ollama (LLM)
 ```
+
+---
 
 ## 📋 Prerequisites
 
-- **Docker** & **Docker Compose**
-- **NVIDIA GPU** with CUDA support (12GB+ VRAM recommended)
-- **nvidia-container-toolkit** installed
-- **Google Gemini API Key** (free tier available)
+### Required:
+- **Docker** 20.10+
+- **Docker Compose** 2.0+
+- **NVIDIA GPU** with CUDA support
+- **nvidia-container-toolkit**
 
-### Install NVIDIA Container Toolkit
+### Optional:
+- **Gemini API Key** (recommended for production)
+- 16GB+ VRAM (for full model stack)
 
-```bash
-# Ubuntu/Debian
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
-sudo systemctl restart docker
-```
+---
 
 ## 🚀 Quick Start
 
-### Option 1: Automated Setup (Recommended)
+### 1. Install NVIDIA Container Toolkit
 
 ```bash
-# Make setup script executable
-chmod +x setup.sh
+# Ubuntu/Debian
+make install-nvidia-toolkit
 
-# Run automated setup
-./setup.sh
-```
-
-The script will:
-- ✅ Check prerequisites (Docker, GPU, nvidia-toolkit)
-- ✅ Create directory structure
-- ✅ Generate `.env` file with secure passwords
-- ✅ Verify all required files are present
-- ✅ Build and start all services
-- ✅ Wait for services to be healthy
-- ✅ Display access information
-
-### Option 2: Manual Setup
-
-```bash
-# 1. Create environment file
-cp .env.example .env
-
-# 2. Edit .env and add your Gemini API key
-nano .env
-# Set: GOOGLE_API_KEY=your_actual_key_here
-
-# 3. Start all services
-docker-compose up -d
-
-# 4. View logs
-docker-compose logs -f api
-
-# 5. Stop system
-docker-compose down
-```
-
-### 3. Access Services
-
-| Service | URL | Purpose |
-|---------|-----|---------|
-| **Streamlit UI** | http://localhost:8501 | Main application |
-| **FastAPI Docs** | http://localhost:8000/docs | API documentation |
-| **FastAPI Health** | http://localhost:8000/health | System status JSON |
-| **Milvus Attu** | http://localhost:3000 | Vector DB admin |
-| **MinIO Console** | http://localhost:9001 | Object storage (admin/admin) |
-
-### 4. Initial Setup Verification
-
-```bash
-# Wait ~2 minutes for all services to initialize, then:
-
-# Check system health
-curl http://localhost:8000/health
-
-# Expected output:
-# {
-#   "postgres": "ok",
-#   "milvus": "ok",
-#   "models": "ok",
-#   "internet": "ok"
-# }
-
-# Check service status
-docker-compose ps
-
-# All services should show "Up" or "Up (healthy)"
-```
-
-## 📊 Database Schema
-
-### Chat System (Infinite Context)
-
-```sql
-chat_sessions
-├── id (UUID)
-├── title
-├── created_at
-└── updated_at
-
-chat_events (Append-Only Event Store)
-├── id (UUID)
-├── session_id (FK)
-├── sequence_num (Ordered)
-├── role (USER/ASSISTANT/SYSTEM)
-├── content
-├── event_type (NORMAL/SUMMARY/CHECKPOINT)
-├── visibility (VISIBLE/HIDDEN)
-└── model_used
-```
-
-### Knowledge Base
-
-```sql
-file_registry
-├── id (UUID)
-├── file_hash (MD5 - Unique)
-├── filename
-├── status (PENDING/PROCESSING/COMPLETED/FAILED)
-└── meta_info (JSONB)
-
-document_chunks
-├── id (UUID)
-├── file_id (FK)
-├── content (TEXT)
-├── search_vector (TSVECTOR - Auto-generated)
-├── chunk_index
-└── page_number
-```
-
-## 🎯 Usage Examples
-
-### Chat with Documents
-
-1. Open http://localhost:8501
-2. Upload PDF files in sidebar
-3. Wait for processing (green checkmark)
-4. Ask questions in chat
-
-### API Usage
-
-```python
-import requests
-
-# Health check
-response = requests.get("http://localhost:8000/health")
-print(response.json())
-
-# Create session
-session = requests.post("http://localhost:8000/sessions", 
-                       json={"title": "My Chat"}).json()
-
-# Send message
-message = requests.post(
-    f"http://localhost:8000/sessions/{session['session_id']}/message",
-    json={"content": "What is the revenue?", "use_rag": True}
-).json()
-
-print(message['reply'])
-```
-
-## 🔧 Configuration
-
-### Key Environment Variables
-
-```bash
-# LLM Selection
-GOOGLE_API_KEY=sk-...        # Gemini (primary)
-OLLAMA_MODEL=llama3.2:3b     # Fallback
-
-# Performance Tuning
-EMBEDDING_BATCH_SIZE=64      # GPU batch size
-MAX_WORKERS=4                # Concurrent workers
-
-# RAG Settings
-ENABLE_HYBRID_SEARCH=true
-ENABLE_RERANKING=true
-RERANKER_MODEL=cross-encoder/ms-marco-TinyBERT-L-2-v2
-```
-
-## 📈 Performance Tips
-
-### For 16GB VRAM GPU
-
-- `EMBEDDING_BATCH_SIZE=64` (optimal)
-- Models loaded: nomic-embed (0.5GB) + reranker (1.5GB) + llama3.2 (2.5GB) = ~4.5GB
-- Leaves 11GB for KV cache and batching
-
-### For 12GB VRAM GPU
-
-- `EMBEDDING_BATCH_SIZE=32`
-- Still highly performant
-
-### For CPU-Only
-
-- Set `EMBEDDING_BATCH_SIZE=8`
-- Expect slower ingestion (5-10x)
-- Chat speed unaffected (uses Gemini API)
-
-## 🐛 Troubleshooting
-
-### `init-db.sql` Not Found Error
-
-```bash
-# Verify file location (must be in project root)
-ls -la init-db.sql
-
-# Should be alongside docker-compose.yml, not in api/ or ui/
-
-# Correct structure:
-# rag-v2-ultimate/
-# ├── docker-compose.yml
-# ├── init-db.sql          ← HERE
-# ├── api/
-# └── ui/
-```
-
-### Services Won't Start
-
-```bash
-# Check Docker GPU access
-docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi
-
-# Check service logs
-docker-compose logs postgres
-docker-compose logs milvus
-docker-compose logs api
-
-# Recreate volumes (⚠️ deletes data)
-docker-compose down -v
-docker-compose up -d
-```
-
-### Database Connection Errors
-
-The API has built-in retry logic (10 attempts, 3s intervals). If you see:
-
-```
-🔌 Connecting to PostgreSQL (Attempt 1/10)...
-```
-
-This is **normal** during startup. Wait ~30 seconds for PostgreSQL to initialize.
-
-If connection fails after 10 attempts:
-
-```bash
-# Check PostgreSQL
-docker exec -it rag_postgres psql -U rag_user -d rag_db -c "SELECT 1"
-
-# Check if init-db.sql was loaded
-docker exec -it rag_postgres psql -U rag_user -d rag_db -c "\dt"
-
-# Should show: chat_sessions, chat_events, file_registry, document_chunks
-```
-
-### Milvus Connection Errors
-
-```bash
-# Check Milvus health
-curl http://localhost:9091/healthz
-
-# Check etcd (Milvus dependency)
-docker-compose logs etcd
-
-# Restart Milvus cluster
-docker-compose restart etcd minio milvus
-sleep 30
-docker-compose restart api
-```
-
-### Volume Permission Issues
-
-```bash
-# Linux: Fix ownership
-sudo chown -R $USER:$USER .
-
-# Check volume mounts
-docker volume ls | grep rag
-
-# Remove and recreate (⚠️ deletes data)
-docker-compose down -v
-docker volume prune
-docker-compose up -d
-```
-
-### GPU Not Detected
-
-```bash
-# Verify nvidia-container-toolkit
-docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi
-
-# If fails, reinstall toolkit
+# Or manually:
 distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | sudo apt-key add -
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
     sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 sudo apt-get update
 sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-### "Module Not Found" Errors in API
+### 2. Configure Environment
 
 ```bash
-# Rebuild API container
-docker-compose build --no-cache api
-docker-compose up -d api
+# Copy environment template
+cp .env.example .env
 
-# Check if requirements installed
-docker exec -it rag_api pip list
+# Edit .env and add your Gemini API key (optional but recommended)
+nano .env
+
+# Example:
+# GEMINI_API_KEY=your_actual_api_key_here
 ```
+
+### 3. Launch System
+
+```bash
+# Build and start all services
+make quickstart
+
+# Or step by step:
+make build
+make up
+make pull-models  # Download Llama 3.2 3B
+```
+
+### 4. Access UI
+
+Open browser to: **http://localhost:8501**
+
+---
 
 ## 📁 Project Structure
 
 ```
-rag-v2-ultimate/
-├── docker-compose.yml       # ⭐ Service orchestration
-├── init-db.sql             # ⭐ PostgreSQL schema (auto-loaded)
-├── .env                    # ⭐ Create from .env.example
-├── .env.example            # Environment template
-├── setup.sh                # 🚀 Automated setup script
-├── README.md               # This file
-├── PROJECT_STRUCTURE.md    # Detailed file descriptions
-│
-├── api/
+rag/
+├── api/                      # FastAPI Backend
+│   ├── app/
+│   │   ├── database.py       # PostgreSQL ORM models
+│   │   ├── ingest.py         # Document ingestion & embedding
+│   │   ├── rag.py            # Hybrid search & generation
+│   │   ├── main.py           # FastAPI app entry point
+│   │   └── __init__.py
+│   ├── data/                 # Preloaded documents (auto-ingest)
 │   ├── Dockerfile
-│   ├── requirements.txt
-│   └── app/
-│       ├── __init__.py
-│       ├── main.py         # FastAPI gateway
-│       ├── database.py     # PostgreSQL operations
-│       ├── rag_core.py     # RAG engine
-│       └── ingest.py       # Document processing
-│
-└── ui/
-    ├── Dockerfile
-    ├── requirements.txt
-    └── app.py              # Streamlit interface
+│   └── requirements.txt
+├── ui/                       # Streamlit Frontend
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── docker-compose.yml        # Service orchestration
+├── Makefile                  # Utility commands
+├── .env.example              # Environment template
+├── .gitignore
+└── README.md
 ```
-
-**Important Notes:**
-
-1. **`init-db.sql` location**: Must be in **project root** (same level as `docker-compose.yml`)
-2. **Volumes**: Automatically created by Docker (see `docker-compose.yml`)
-3. **`.env` file**: Must be created from `.env.example` before first run
-
-**Verify files exist:**
-
-```bash
-# Check critical files
-ls -la init-db.sql docker-compose.yml .env
-
-# Should show all three files
-```
-
-## 🔐 Security Notes
-
-- PostgreSQL exposed on 5433 (change in production)
-- Use strong passwords in `.env`
-- Restrict API access with firewall rules
-- Enable SSL/TLS for production deployment
-
-## 📝 License
-
-MIT License - See LICENSE file
-
-## 🤝 Contributing
-
-Contributions welcome! Please open issues for bugs/features.
-
-## 🙏 Acknowledgments
-
-- Milvus for vector search
-- Ollama for local LLM inference
-- Google Gemini for fast cloud inference
-- PostgreSQL for FTS capabilities
 
 ---
 
-**Built with ❤️ for production RAG systems**
+## 🔌 Service URLs
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| **UI** | http://localhost:8501 | Streamlit chat interface |
+| **API** | http://localhost:8000 | FastAPI backend |
+| **API Docs** | http://localhost:8000/docs | Interactive API documentation |
+| **Attu** | http://localhost:3000 | Milvus vector DB UI |
+| **MinIO Console** | http://localhost:9001 | Object storage UI |
+| **PostgreSQL** | localhost:5433 | Database (user: rag_user, pass: rag_password) |
+| **Ollama** | localhost:11435 | Local LLM API |
+
+---
+
+## 🛠️ Makefile Commands
+
+```bash
+make help           # Show all available commands
+make build          # Build Docker images
+make up             # Start all services
+make down           # Stop all services
+make restart        # Restart services
+make logs           # View all logs
+make logs-api       # View API logs only
+make logs-ui        # View UI logs only
+make clean          # Remove containers and volumes (⚠️ deletes data)
+make pull-models    # Download Ollama models
+make health         # Check system health
+make test-db        # Test database connection
+make shell-api      # Open bash in API container
+make backup-db      # Backup PostgreSQL database
+make restore-db     # Restore database (FILE=path/to/backup.sql)
+```
+
+---
+
+## 📊 System Requirements
+
+### Minimum (CPU Mode):
+- 16GB RAM
+- 50GB disk space
+- No GPU required (set `DEVICE=cpu` in `.env`)
+
+### Recommended (GPU Mode):
+- 32GB RAM
+- 16GB VRAM (NVIDIA GPU)
+- 100GB disk space
+- CUDA 12.1+
+
+### VRAM Allocation (GPU Mode):
+| Component | Model | VRAM |
+|-----------|-------|------|
+| Embedding | BGE-M3 | ~1.5 GB |
+| Reranker | BGE-reranker-v2-m3 | ~1.5 GB |
+| LLM (Fallback) | Llama 3.2 3B | ~2.5 GB |
+| **Total** | | **~5.5 GB** |
+
+---
+
+## 📚 API Endpoints
+
+### Health & System
+- `GET /health` - Overall health check
+- `GET /health/db` - PostgreSQL status
+- `GET /health/vector-db` - Milvus status
+- `GET /stats/system` - System statistics
+- `GET /stats/milvus` - Vector DB stats
+- `GET /system/services` - Service URLs
+- `GET /features` - Enabled features
+
+### File Management
+- `POST /files/upload` - Upload document
+- `GET /files` - List all files
+- `GET /files/status` - Processing status
+- `GET /files/{id}` - File details
+- `DELETE /files/{id}` - Delete file
+
+### Chat
+- `POST /sessions` - Create session
+- `GET /sessions` - List sessions
+- `DELETE /sessions/{id}` - Delete session
+- `GET /sessions/{id}/history` - Chat history
+- `POST /chat` - Send message (streaming)
+
+---
+
+## 🧪 Testing
+
+### Check System Health
+```bash
+# Via Makefile
+make health
+
+# Or via curl
+curl http://localhost:8000/health | jq
+```
+
+### Test Database
+```bash
+make test-db
+```
+
+### Upload Test Document
+```bash
+curl -X POST "http://localhost:8000/files/upload" \
+  -F "file=@test_document.pdf"
+```
+
+### Send Chat Query
+```bash
+curl -X POST "http://localhost:8000/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "YOUR_SESSION_ID",
+    "message": "What is the revenue for Q3?",
+    "use_rag": true,
+    "top_k": 7
+  }'
+```
+
+---
+
+## 🔧 Configuration
+
+### Environment Variables (`.env`)
+
+```bash
+# Database
+DATABASE_URL=postgresql://rag_user:rag_password@postgres:5432/rag_db
+
+# Milvus
+MILVUS_HOST=milvus
+MILVUS_PORT=19530
+MILVUS_COLLECTION=rag_hybrid_collection
+
+# GPU
+DEVICE=cuda  # or 'cpu'
+CUDA_VISIBLE_DEVICES=0
+
+# LLM
+GEMINI_API_KEY=your_key_here  # Get from: https://ai.google.dev/
+OLLAMA_URL=http://ollama:11434
+```
+
+### Hybrid Search Parameters
+Edit `api/app/rag.py`:
+```python
+# Adjust weights
+alpha = 0.2  # Importance score weight
+beta = 0.8   # Reranker weight
+gamma = 0.2  # Importance in final ranking
+
+# Fusion weights
+WeightedRanker(0.7, 0.3)  # 0.7 dense + 0.3 sparse
+```
+
+---
+
+## 🔍 Monitoring
+
+### View Logs
+```bash
+# All services
+make logs
+
+# Specific service
+docker-compose logs -f api
+docker-compose logs -f ui
+docker-compose logs -f milvus
+```
+
+### Check Container Status
+```bash
+docker-compose ps
+```
+
+### Monitor GPU Usage
+```bash
+watch -n 1 nvidia-smi
+```
+
+---
+
+## 🛡️ Troubleshooting
+
+### Issue: API not starting
+```bash
+# Check logs
+make logs-api
+
+# Common fixes:
+# 1. Ensure GPU is available
+nvidia-smi
+
+# 2. Check if Milvus is healthy
+curl http://localhost:9091/healthz
+
+# 3. Verify database connection
+make test-db
+```
+
+### Issue: Models not loading
+```bash
+# Check HuggingFace cache
+docker exec -it rag_api ls -la /app/.cache/huggingface
+
+# Re-download models
+docker exec -it rag_api python3 -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3')"
+```
+
+### Issue: Out of memory
+```bash
+# Reduce batch size in api/app/rag.py:
+batch_size=4  # Default: 16
+
+# Or use CPU mode:
+# Edit .env: DEVICE=cpu
+```
+
+### Issue: Milvus connection failed
+```bash
+# Restart Milvus stack
+docker-compose restart etcd minio milvus
+
+# Wait for health check
+docker-compose ps
+```
+
+---
+
+## 📦 Backup & Restore
+
+### Backup Database
+```bash
+make backup-db
+# Creates: backups/rag_db_YYYYMMDD_HHMMSS.sql
+```
+
+### Restore Database
+```bash
+make restore-db FILE=backups/rag_db_20240101_120000.sql
+```
+
+### Backup Volumes
+```bash
+# Backup all volumes
+docker run --rm \
+  -v rag_postgres_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/postgres_data.tar.gz -C /data .
+```
+
+---
+
+## 🚧 Roadmap
+
+- [ ] Multi-GPU support
+- [ ] Advanced chunk importance scoring
+- [ ] Automatic summary generation with LLM
+- [ ] Export chat history to PDF
+- [ ] REST API authentication
+- [ ] Kubernetes deployment manifests
+- [ ] Multi-language support
+- [ ] Advanced analytics dashboard
+
+---
+

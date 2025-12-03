@@ -1,11 +1,530 @@
-.env
-.venv
-volumes/
+# ============================================
+# .gitignore for RAG Financial Assistant
+# ============================================
 
-# Bỏ qua các file rác của Python
+# ============================================
+# Python
+# ============================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
 .pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# ============================================
+# Virtual Environments
+# ============================================
 venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.virtualenv/
+
+# ============================================
+# IDE & Editors
+# ============================================
+
+# VS Code
 .vscode/
+.history/
+*.code-workspace
+
+# PyCharm
 .idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*.swn
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Atom
+.atom/
+
+# ============================================
+# Operating System Files
+# ============================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================
+# Environment & Configuration
+# ============================================
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+*.env
+
+# Configuration files with secrets
+config.local.*
+secrets.yml
+secrets.yaml
+secrets.json
+
+# ============================================
+# Data & Uploads
+# ============================================
+
+# Upload directories
+api/data/uploads/
+api/data/temp/
+uploads/
+temp/
+
+# Backup files
+backups/
+*.backup
+*.bak
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+*.json
+*.xml
+*.parquet
+
+# Document files (exclude from git)
+*.pdf
+*.doc
+*.docx
+*.txt
+*.rtf
+*.odt
+
+# ============================================
+# Logs
+# ============================================
+
+# Application logs
+logs/
+*.log
+log.txt
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System logs
+syslog
+*.out
+
+# ============================================
+# Database
+# ============================================
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# PostgreSQL
+*.sql
+*.dump
+pg_dump/
+
+# ============================================
+# Docker
+# ============================================
+
+# Docker override files
+docker-compose.override.yml
+docker-compose.local.yml
+docker-compose.dev.yml
+docker-compose.resolved.yml
+
+# Docker volumes (if locally bound)
+volumes/
+data/postgres/
+data/milvus/
+data/etcd/
+data/minio/
+
+# ============================================
+# AI/ML Models & Caches
+# ============================================
+
+# Model files
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.pb
+*.onnx
+
+# Model caches
+.cache/
+models/
+checkpoints/
+pretrained/
+
+# HuggingFace cache
+.huggingface/
+transformers_cache/
+sentence_transformers/
+
+# Torch hub
+.torch/
+
+# ============================================
+# Testing
+# ============================================
+
+# Test outputs
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+.hypothesis/
+*.cover
+coverage.xml
+*.log
+
+# Test data
+test_data/
+fixtures/
+*.test
+
+# ============================================
+# Build & Distribution
+# ============================================
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Compiled files
+*.pyc
+*.pyo
+*.so
+*.dll
+*.exe
+*.dylib
+
+# ============================================
+# Temporary Files
+# ============================================
+
+# General temp files
+tmp/
+temp/
+*.tmp
+*.temp
+*~
+
+# OS temp files
+.DS_Store
+Thumbs.db
+
+# Application temp
+*.pid
+*.seed
+*.pid.lock
+
+# ============================================
+# Streamlit
+# ============================================
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# ============================================
+# FastAPI
+# ============================================
+.pytest_cache/
+__debug_toolbar__/
+
+# ============================================
+# Milvus
+# ============================================
+milvus_data/
+wal/
+rdb_data/
+
+# ============================================
+# Monitoring & Profiling
+# ============================================
+
+# Profiling data
+*.prof
+*.lprof
+*.pstats
+
+# Memory profiling
+*.mprofile
+
+# Performance logs
+perf.data
+perf.data.old
+
+# ============================================
+# Documentation
+# ============================================
+
+# Build docs
+docs/_build/
+site/
+.docusaurus/
+
+# ============================================
+# Package Managers
+# ============================================
+
+# npm
+node_modules/
+package-lock.json
+npm-debug.log
+yarn-error.log
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================
+# CI/CD
+# ============================================
+
+# GitHub Actions
+.github/workflows/*.log
+
+# GitLab CI
+.gitlab-ci-local/
+
+# CircleCI
+.circleci/local/
+
+# ============================================
+# Security & Credentials
+# ============================================
+
+# API keys and secrets
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Credentials
+credentials.json
+client_secret*.json
+*_credentials.yml
+
+# SSH keys
+id_rsa*
+id_dsa*
+id_ed25519*
+known_hosts
+
+# ============================================
+# Miscellaneous
+# ============================================
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Images (if not needed in repo)
+# *.jpg
+# *.jpeg
+# *.png
+# *.gif
+# *.bmp
+# *.ico
+# *.svg
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.wmv
+
+# Audio
+*.mp3
+*.wav
+*.flac
+
+# Compressed files
+*.gz
+*.bz2
+*.xz
+
+# Lock files
+*.lock
+
+# Hidden files (optional - uncomment if needed)
+# .*
+# !.gitignore
+# !.gitattributes
+# !.github/
+
+# ============================================
+# Project Specific
+# ============================================
+
+# RAG system specific
+api/data/uploads/*
+!api/data/uploads/.gitkeep
+api/data/temp/*
+!api/data/temp/.gitkeep
+
+# Exclude preloaded data (if large)
+# api/data/*.pdf
+# api/data/*.docx
+
+# Milvus segments
+segments/
+snapshots/
+
+# Vector store backups
+vector_backup/
+
+# Experiment results
+experiments/
+results/
+outputs/
+
+# ============================================
+# Keep these fil

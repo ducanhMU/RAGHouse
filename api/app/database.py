@@ -1,363 +1,463 @@
 """
-Database layer for the RAG microservice stack.
+Database Models and Configuration
+PostgreSQL connection, ORM models, and database schemas.
 """
 
-from __future__ import annotations
-
-import json
-import logging
 import os
-import time
-from contextlib import contextmanager
-from typing import Dict, Generator, List, Optional
+import enum
+from datetime import datetime
+from typing import Optional
 
-from psycopg2 import pool
-from psycopg2.extensions import connection as PGConnection
-from psycopg2.extras import RealDictCursor, execute_batch
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Integer,
+    Text,
+    DateTime,
+    Enum as SQLEnum,
+    ForeignKey,
+    UniqueConstraint,
+    Index
+)
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+import uuid as uuid_lib
 
-logger = logging.getLogger(__name__)
+# ============================================
+# Database Configuration
+# ============================================
+
+# Get database URL from environment
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://rag_user:rag_password@postgres:5432/rag_db"
+)
+
+# Create SQLAlchemy engine
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,  # Verify connections before using
+    echo=False  # Set to True for SQL query logging
+)
+
+# Create session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Create declarative base
+Base = declarative_base()
 
 
-class DatabaseManager:
-    """Thread-safe PostgreSQL connection pool with retry logic."""
+# ============================================
+# Enums
+# ============================================
 
-    def __init__(self, max_retries: int = 10, retry_delay: int = 3) -> None:
-        self.dsn = os.getenv(
-            "DATABASE_URL",
-            "postgresql://rag_user:rag_password@postgres:5432/rag_db",
+class FileStatus(enum.Enum):
+    """File processing status"""
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class MessageRole(enum.Enum):
+    """Message role in conversation"""
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+    SYSTEM = "SYSTEM"
+
+
+class EventType(enum.Enum):
+    """Event type for 3-3 memory mechanism"""
+    NORMAL = "NORMAL"           # Regular chat message
+    SUMMARY = "SUMMARY"         # Short summary after 3 message pairs
+    CHECKPOINT = "CHECKPOINT"   # Master summary after 3 summaries
+
+
+class Visibility(enum.Enum):
+    """Message visibility in UI"""
+    VISIBLE = "VISIBLE"     # Shown in chat UI
+    HIDDEN = "HIDDEN"       # Hidden from UI (used for summaries/internal state)
+
+
+# ============================================
+# ORM Models
+# ============================================
+
+class FileRegistry(Base):
+    """
+    File Registry Table
+    Tracks uploaded documents and their processing status.
+    """
+    __tablename__ = "file_registry"
+    
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid_lib.uuid4,
+        nullable=False
+    )
+    
+    file_hash = Column(
+        String(32),
+        unique=True,
+        nullable=False,
+        index=True,
+        comment="MD5 hash for deduplication"
+    )
+    
+    filename = Column(
+        String(255),
+        nullable=False,
+        comment="Original filename"
+    )
+    
+    status = Column(
+        SQLEnum(FileStatus),
+        default=FileStatus.PENDING,
+        nullable=False,
+        index=True,
+        comment="Processing status"
+    )
+    
+    meta_info = Column(
+        JSONB,
+        default=dict,
+        nullable=False,
+        comment="Flexible metadata (pages, chunks, author, etc.)"
+    )
+    
+    created_at = Column(
+        DateTime,
+        default=datetime.now(datetime.timezone.utc),
+        nullable=False,
+        index=True,
+        comment="File registration timestamp"
+    )
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_file_status', 'status'),
+        Index('idx_file_created', 'created_at'),
+        Index('idx_file_meta_gin', 'meta_info', postgresql_using='gin'),
+    )
+    
+    def __repr__(self):
+        return f"<FileRegistry(id={self.id}, filename={self.filename}, status={self.status.value})>"
+
+
+class ChatSession(Base):
+    """
+    Chat Sessions Table
+    Stores overarching conversation session metadata.
+    """
+    __tablename__ = "chat_sessions"
+    
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid_lib.uuid4,
+        nullable=False
+    )
+    
+    title = Column(
+        String(255),
+        default="New Chat",
+        nullable=True,
+        comment="Session title (auto-updated from summaries)"
+    )
+    
+    created_at = Column(
+        DateTime,
+        default=datetime.now(datetime.timezone.utc),
+        nullable=False,
+        index=True,
+        comment="Session creation timestamp"
+    )
+    
+    updated_at = Column(
+        DateTime,
+        default=datetime.now(datetime.timezone.utc),
+        onupdate=datetime.now(datetime.timezone.utc),
+        nullable=False,
+        index=True,
+        comment="Last message timestamp (for sidebar sorting)"
+    )
+    
+    # Relationship to events (one-to-many)
+    events = relationship(
+        "ChatEvent",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        lazy="dynamic"
+    )
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_session_updated', 'updated_at'),
+        Index('idx_session_created', 'created_at'),
+    )
+    
+    def __repr__(self):
+        return f"<ChatSession(id={self.id}, title={self.title})>"
+
+
+class ChatEvent(Base):
+    """
+    Chat Events Table
+    Core memory table for AI context (messages, summaries, checkpoints).
+    Implements 3-3 memory mechanism.
+    """
+    __tablename__ = "chat_events"
+    
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid_lib.uuid4,
+        nullable=False
+    )
+    
+    session_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Foreign key to chat_sessions"
+    )
+    
+    sequence_num = Column(
+        Integer,
+        nullable=False,
+        comment="Absolute message order (independent of timestamp)"
+    )
+    
+    role = Column(
+        SQLEnum(MessageRole),
+        nullable=False,
+        comment="Message originator (USER, ASSISTANT, SYSTEM)"
+    )
+    
+    content = Column(
+        Text,
+        nullable=False,
+        comment="Message or summary content"
+    )
+    
+    event_type = Column(
+        SQLEnum(EventType),
+        default=EventType.NORMAL,
+        nullable=False,
+        index=True,
+        comment="Event type for 3-3 memory mechanism"
+    )
+    
+    visibility = Column(
+        SQLEnum(Visibility),
+        default=Visibility.VISIBLE,
+        nullable=False,
+        index=True,
+        comment="Controls UI display vs AI-only context"
+    )
+    
+    model_used = Column(
+        String(50),
+        nullable=True,
+        comment="Model used for response (e.g., gemini-2.0-flash)"
+    )
+    
+    created_at = Column(
+        DateTime,
+        default=datetime.now(datetime.timezone.utc),
+        nullable=False,
+        comment="Event creation timestamp"
+    )
+    
+    # Relationship to session (many-to-one)
+    session = relationship("ChatSession", back_populates="events")
+    
+    # Constraints and Indexes
+    __table_args__ = (
+        UniqueConstraint('session_id', 'sequence_num', name='uq_session_sequence'),
+        Index('idx_session_sequence', 'session_id', 'sequence_num'),
+        Index('idx_event_type', 'event_type'),
+        Index('idx_visibility', 'visibility'),
+    )
+    
+    def __repr__(self):
+        return (
+            f"<ChatEvent(id={self.id}, session_id={self.session_id}, "
+            f"seq={self.sequence_num}, role={self.role.value}, "
+            f"type={self.event_type.value})>"
         )
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.pool: Optional[pool.ThreadedConnectionPool] = None
-        self._connect_with_retry()
-
-    def _connect_with_retry(self) -> None:
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                self.pool = pool.ThreadedConnectionPool(
-                    minconn=2,
-                    maxconn=int(os.getenv("DB_MAX_CONNECTIONS", "20")),
-                    dsn=self.dsn,
-                )
-                with self.get_connection() as conn, conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                logger.info("PostgreSQL connection pool ready")
-                return
-            except Exception as exc:  # pragma: no cover - infra safety net
-                logger.warning("PostgreSQL connection failed (%s)", exc)
-                if attempt == self.max_retries:
-                    raise ConnectionError("Unable to reach PostgreSQL") from exc
-                time.sleep(self.retry_delay * attempt)
-
-    @contextmanager
-    def get_connection(self) -> Generator[PGConnection, None, None]:
-        if not self.pool:
-            raise RuntimeError("Database pool not initialized")
-
-        conn = self.pool.getconn()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
-
-    def close(self) -> None:
-        if self.pool:
-            self.pool.closeall()
-            logger.info("Closed PostgreSQL connections")
 
 
-class FileRegistryDAO:
-    """CRUD helpers for the file_registry table."""
+# ============================================
+# Database Utilities
+# ============================================
 
-    def __init__(self, db: DatabaseManager) -> None:
-        self.db = db
-
-    def lookup_by_hash(self, file_hash: str) -> Optional[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                "SELECT id, filename, status FROM file_registry WHERE file_hash = %s",
-                (file_hash,),
-            )
-            return cur.fetchone()
-
-    def register(self, filename: str, file_hash: str, meta: Optional[Dict] = None) -> str:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO file_registry (filename, file_hash, status, meta_info)
-                VALUES (%s, %s, 'PENDING', %s)
-                RETURNING id
-                """,
-                (filename, file_hash, json.dumps(meta or {})),
-            )
-            return str(cur.fetchone()[0])
-
-    def update_status(self, file_id: str, status: str) -> None:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE file_registry SET status = %s WHERE id = %s",
-                (status.upper(), file_id),
-            )
-
-    def upsert_metadata(self, file_id: str, meta: Dict) -> None:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE file_registry
-                SET meta_info = COALESCE(meta_info, '{}'::jsonb) || %s::jsonb
-                WHERE id = %s
-                """,
-                (json.dumps(meta), file_id),
-            )
-
-    def remove(self, file_id: str) -> None:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM file_registry WHERE id = %s", (file_id,))
-
-    def list(self) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute("SELECT * FROM v_file_stats ORDER BY created_at DESC")
-            return cur.fetchall()
-
-    def detail(self, file_id: str) -> Optional[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT fr.*, COUNT(dc.id) AS chunk_count
-                FROM file_registry fr
-                LEFT JOIN document_chunks dc ON fr.id = dc.file_id
-                WHERE fr.id = %s
-                GROUP BY fr.id
-                """,
-                (file_id,),
-            )
-            return cur.fetchone()
-
-    def status_counts(self) -> Dict[str, int]:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT status, COUNT(*) FROM file_registry GROUP BY status"
-            )
-            rows = cur.fetchall()
-            resolved = {row[0].lower(): row[1] for row in rows}
-            return {
-                "pending": resolved.get("pending", 0),
-                "processing": resolved.get("processing", 0),
-                "completed": resolved.get("completed", 0),
-                "failed": resolved.get("failed", 0),
-            }
+def get_db():
+    """
+    Dependency for FastAPI endpoints.
+    Provides a database session and ensures cleanup.
+    
+    Usage:
+        @app.get("/endpoint")
+        def endpoint(db: Session = Depends(get_db)):
+            # Use db here
+            pass
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-class DocumentChunkDAO:
-    """Chunk persistence helpers."""
-
-    def __init__(self, db: DatabaseManager) -> None:
-        self.db = db
-
-    def insert_batch(self, file_id: str, chunks: List[Dict]) -> None:
-        payload = [
-            (file_id, chunk["index"], chunk["text"], chunk.get("page", 0))
-            for chunk in chunks
-        ]
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            execute_batch(
-                cur,
-                """
-                INSERT INTO document_chunks (file_id, chunk_index, content, page_number)
-                VALUES (%s, %s, %s, %s)
-                """,
-                payload,
-            )
-
-    def keyword_search(self, query: str, limit: int) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT
-                    dc.id,
-                    dc.content,
-                    dc.page_number,
-                    fr.filename,
-                    ts_rank(dc.search_vector, websearch_to_tsquery('english', %s)) AS rank
-                FROM document_chunks dc
-                JOIN file_registry fr ON fr.id = dc.file_id
-                WHERE dc.search_vector @@ websearch_to_tsquery('english', %s)
-                ORDER BY rank DESC
-                LIMIT %s
-                """,
-                (query, query, limit),
-            )
-            return cur.fetchall()
+def init_db():
+    """
+    Initialize database by creating all tables.
+    Safe to call multiple times (won't recreate existing tables).
+    """
+    Base.metadata.create_all(bind=engine)
 
 
-class ChatSessionDAO:
-    """Chat session CRUD helpers."""
-
-    def __init__(self, db: DatabaseManager) -> None:
-        self.db = db
-
-    def create(self, title: str = "New Chat") -> str:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO chat_sessions (title) VALUES (%s) RETURNING id",
-                (title,),
-            )
-            return str(cur.fetchone()[0])
-
-    def list(self, limit: int = 50) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT * FROM v_session_stats
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            return cur.fetchall()
-
-    def delete(self, session_id: str) -> None:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM chat_sessions WHERE id = %s", (session_id,))
+def drop_all_tables():
+    """
+    Drop all tables from the database.
+    WARNING: This deletes all data!
+    Use only for testing or complete reset.
+    """
+    Base.metadata.drop_all(bind=engine)
 
 
-class ChatEventDAO:
-    """Event sourcing storage for the 3-3 memory system."""
-
-    def __init__(self, db: DatabaseManager) -> None:
-        self.db = db
-
-    def _next_sequence(self, session_id: str) -> int:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(MAX(sequence_num), 0) + 1 FROM chat_events WHERE session_id = %s",
-                (session_id,),
-            )
-            return cur.fetchone()[0]
-
-    def append(
-        self,
-        session_id: str,
-        role: str,
-        content: str,
-        *,
-        event_type: str = "NORMAL",
-        visibility: str = "VISIBLE",
-        model_used: Optional[str] = None,
-    ) -> str:
-        sequence_num = self._next_sequence(session_id)
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO chat_events
-                    (session_id, sequence_num, role, content, event_type, visibility, model_used)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    session_id,
-                    sequence_num,
-                    role,
-                    content,
-                    event_type,
-                    visibility,
-                    model_used,
-                ),
-            )
-            return str(cur.fetchone()[0])
-
-    def visible_history(self, session_id: str, limit: int = 200) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT role, content, created_at, model_used
-                FROM chat_events
-                WHERE session_id = %s AND visibility = 'VISIBLE'
-                ORDER BY sequence_num DESC
-                LIMIT %s
-                """,
-                (session_id, limit),
-            )
-            return list(reversed(cur.fetchall()))
-
-    def raw_events(self, session_id: str, limit: int = 500) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT role, content, event_type, visibility, sequence_num, created_at
-                FROM chat_events
-                WHERE session_id = %s
-                ORDER BY sequence_num DESC
-                LIMIT %s
-                """,
-                (session_id, limit),
-            )
-            return list(reversed(cur.fetchall()))
-
-    def llm_context(self, session_id: str) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute("SELECT * FROM get_session_context(%s)", (session_id,))
-            return cur.fetchall()
-
-    def messages_since_summary(self, session_id: str) -> int:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT count_messages_since_last_summary(%s)",
-                (session_id,),
-            )
-            return cur.fetchone()[0]
+def reset_db():
+    """
+    Drop and recreate all tables.
+    WARNING: This deletes all data!
+    """
+    drop_all_tables()
+    init_db()
 
 
-class SystemStatsDAO:
-    """Aggregated statistics for dashboards."""
+# ============================================
+# SQL Script Generation (for reference)
+# ============================================
 
-    def __init__(self, db: DatabaseManager) -> None:
-        self.db = db
+def generate_sql_script():
+    """
+    Generate SQL DDL script for manual database setup.
+    Returns the SQL as a string.
+    """
+    from sqlalchemy.schema import CreateTable
+    
+    sql_script = []
+    
+    # Add UUID extension
+    sql_script.append("-- Enable UUID extension")
+    sql_script.append("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
+    sql_script.append("")
+    
+    # Add enum definitions
+    sql_script.append("-- Define Enums")
+    sql_script.append("CREATE TYPE filestatus AS ENUM ('PENDING','PROCESSING','COMPLETED','FAILED');")
+    sql_script.append("CREATE TYPE messagerole AS ENUM ('USER','ASSISTANT','SYSTEM');")
+    sql_script.append("CREATE TYPE eventtype AS ENUM ('NORMAL','SUMMARY','CHECKPOINT');")
+    sql_script.append("CREATE TYPE visibility AS ENUM ('VISIBLE','HIDDEN');")
+    sql_script.append("")
+    
+    # Generate CREATE TABLE statements
+    for table in Base.metadata.sorted_tables:
+        sql_script.append(f"-- Table: {table.name}")
+        sql_script.append(str(CreateTable(table).compile(engine)).strip() + ";")
+        sql_script.append("")
+    
+    return "\n".join(sql_script)
 
-    def totals(self) -> Dict[str, int]:
-        with self.db.get_connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM file_registry")
-            total_files = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM document_chunks")
-            total_chunks = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM chat_events")
-            total_events = cur.fetchone()[0]
-            return {
-                "files": total_files,
-                "chunks": total_chunks,
-                "messages": total_events,
-            }
 
-    def recent_activity(self, limit: int = 25) -> List[Dict]:
-        with self.db.get_connection() as conn, conn.cursor(
-            cursor_factory=RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT * FROM v_recent_activity
-                ORDER BY timestamp DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            return cur.fetchall()
+# ============================================
+# Example Usage & Testing
+# ============================================
+
+if __name__ == "__main__":
+    """
+    Example usage and testing of database models.
+    Run this script directly to test database connection and models.
+    """
+    import logging
+    
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Test database connection
+    try:
+        logger.info("Testing database connection...")
+        init_db()
+        logger.info("✓ Database initialized successfully")
+        
+        # Test session creation
+        db = SessionLocal()
+        result = db.execute("SELECT version()").fetchone()
+        logger.info(f"✓ PostgreSQL version: {result[0]}")
+        
+        # Create a test file record
+        test_file = FileRegistry(
+            file_hash="test_hash_123",
+            filename="test_document.pdf",
+            status=FileStatus.PENDING,
+            meta_info={"test": True, "pages": 10}
+        )
+        db.add(test_file)
+        db.commit()
+        logger.info(f"✓ Created test file record: {test_file.id}")
+        
+        # Create a test chat session
+        test_session = ChatSession(title="Test Session")
+        db.add(test_session)
+        db.commit()
+        logger.info(f"✓ Created test session: {test_session.id}")
+        
+        # Create a test message
+        test_message = ChatEvent(
+            session_id=test_session.id,
+            sequence_num=1,
+            role=MessageRole.USER,
+            content="Test message",
+            event_type=EventType.NORMAL,
+            visibility=Visibility.VISIBLE
+        )
+        db.add(test_message)
+        db.commit()
+        logger.info(f"✓ Created test message: {test_message.id}")
+        
+        # Query test
+        file_count = db.query(FileRegistry).count()
+        session_count = db.query(ChatSession).count()
+        event_count = db.query(ChatEvent).count()
+        
+        logger.info(f"✓ Database contains:")
+        logger.info(f"  - {file_count} files")
+        logger.info(f"  - {session_count} sessions")
+        logger.info(f"  - {event_count} events")
+        
+        # Cleanup test data
+        db.delete(test_message)
+        db.delete(test_session)
+        db.delete(test_file)
+        db.commit()
+        logger.info("✓ Cleaned up test data")
+        
+        db.close()
+        logger.info("✓ All database tests passed!")
+        
+    except Exception as e:
+        logger.error(f"✗ Database test failed: {e}", exc_info=True)
+        raise
+    
+    # Print SQL script for reference
+    print("\n" + "=" * 60)
+    print("Generated SQL DDL Script:")
+    print("=" * 60)
+    print(generate_sql_script())

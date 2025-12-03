@@ -1,45 +1,44 @@
 version: '3.8'
 
 services:
-  # ===== PRIMARY DATABASE (RAG System) =====
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
   postgres:
     image: postgres:15-alpine
     container_name: rag_postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-rag_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
-      POSTGRES_DB: ${POSTGRES_DB:-rag_db}
-      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.utf8"
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: rag_password
+      POSTGRES_DB: rag_db
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./api/app/init-db.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user}"]
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d rag_db"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - rag_network
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 2G
 
-  # ===== MILVUS COMPONENTS =====
+  # ============================================
+  # etcd (Milvus Metadata Store)
+  # ============================================
   etcd:
-    container_name: rag_milvus_etcd
     image: quay.io/coreos/etcd:v3.5.18
+    container_name: rag_etcd
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
-      ETCD_AUTO_COMPACTION_RETENTION: "1000"
-      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
-      ETCD_SNAPSHOT_COUNT: "50000"
+      ETCD_AUTO_COMPACTION_RETENTION: '1000'
+      ETCD_QUOTA_BACKEND_BYTES: '4294967296'
+      ETCD_SNAPSHOT_COUNT: '50000'
     volumes:
       - etcd_data:/etcd
-    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
@@ -49,18 +48,21 @@ services:
       - rag_network
     restart: unless-stopped
 
+  # ============================================
+  # MinIO (Milvus Object Storage)
+  # ============================================
   minio:
-    container_name: rag_milvus_minio
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: rag_minio
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    ports:
-      - "9001:9001"
-      - "9003:9000"
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - minio_data:/minio_data
     command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9001:9001"  # MinIO Console
+      - "9003:9000"  # MinIO API
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -70,163 +72,43 @@ services:
       - rag_network
     restart: unless-stopped
 
+  # ============================================
+  # Milvus Standalone
+  # ============================================
   milvus:
-    container_name: rag_milvus
     image: milvusdb/milvus:v2.6.6
-    command: ["milvus", "run", "standalone"]
-    security_opt:
-      - seccomp:unconfined
+    container_name: rag_milvus
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
-      MQ_TYPE: woodpecker
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
     volumes:
       - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    command: ["milvus", "run", "standalone"]
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
       timeout: 20s
-      retries: 3
-      start_period: 30s
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    depends_on:
-      - etcd
-      - minio
+      retries: 5
     networks:
       - rag_network
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 6G
 
-  # ===== OLLAMA (GPU-OPTIMIZED) =====
-  ollama:
-    image: ollama/ollama:latest
-    container_name: rag_ollama
-    ports:
-      - "11435:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      OLLAMA_HOST: "0.0.0.0:11434"
-      OLLAMA_ORIGINS: "*"
-      OLLAMA_NUM_PARALLEL: "8"
-      OLLAMA_KEEP_ALIVE: "24h"
-      OLLAMA_MAX_LOADED_MODELS: "2"
-      OLLAMA_NUM_GPU: "1"
-      OLLAMA_GPU_OVERHEAD: "0.9"
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    networks:
-      - rag_network
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    entrypoint: ["/bin/bash", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text && ollama pull llama3.2:3b && wait"]
-
-  # ===== API SERVICE =====
-  api:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
-    container_name: rag_api
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./api/app:/app/app
-      - api_data:/app/data
-      - api_logs:/app/logs
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-rag_db}
-      - MILVUS_HOST=milvus
-      - MILVUS_PORT=19530
-      - MILVUS_COLLECTION_NAME=rag_hybrid_collection
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=llama3.2:3b
-      - EMBEDDING_MODEL_NAME=BAAI/bge-m3
-      - EMBEDDING_DEVICE=cpu
-      - EMBEDDING_BATCH_SIZE=16
-      - RERANKER_MODEL=BAAI/bge-reranker-large
-      - RERANKER_DEVICE=cpu
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - ENABLE_RERANKING=true
-      - DATA_PATH=/app/data
-      - LOG_LEVEL=INFO
-      - BASE_HOST=localhost
-      - LLM_TEMPERATURE=0.2
-      - PYTHONUNBUFFERED=1
-    env_file:
-      - .env
-    depends_on:
-      - postgres
-      - milvus
-      - ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - rag_network
-    restart: unless-stopped
-    command: 
-      - /bin/bash
-      - -c
-      - |
-        echo '🚀 Starting API with retry logic...'
-        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --log-level info
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-
-  # ===== UI SERVICE =====
-  ui:
-    build:
-      context: ./ui
-      dockerfile: Dockerfile
-    container_name: rag_ui
-    ports:
-      - "8501:8501"
-    environment:
-      - API_BASE_URL=http://api:8000
-    env_file:
-      - .env
-    depends_on:
-      - api
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    networks:
-      - rag_network
-    restart: unless-stopped
-    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.enableCORS false
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-
-  # ===== MILVUS UI =====
+  # ============================================
+  # Attu (Milvus Web UI)
+  # ============================================
   attu:
-    container_name: rag_milvus_attu
     image: zilliz/attu:v2.4
+    container_name: rag_attu
     environment:
       MILVUS_URL: milvus:19530
     ports:
@@ -237,15 +119,138 @@ services:
       - rag_network
     restart: unless-stopped
 
+  # ============================================
+  # Ollama (Local LLM Server)
+  # ============================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11435:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - rag_network
+    restart: unless-stopped
+    command: serve
+
+  # ============================================
+  # FastAPI Backend (RAG Engine)
+  # ============================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: rag_api
+    environment:
+      # Database
+      DATABASE_URL: postgresql://rag_user:rag_password@postgres:5432/rag_db
+      
+      # Milvus
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      MILVUS_COLLECTION: rag_hybrid_collection
+      
+      # Models
+      DEVICE: cuda
+      HF_HOME: /app/.cache/huggingface
+      
+      # LLM
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OLLAMA_URL: http://ollama:11434
+      
+      # Logging
+      LOG_LEVEL: INFO
+    volumes:
+      - ./api/app:/app/app
+      - ./api/data:/app/data
+      - api_uploads:/app/data/uploads
+      - hf_cache:/app/.cache/huggingface
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - rag_network
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ============================================
+  # Streamlit UI
+  # ============================================
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: rag_ui
+    environment:
+      API_URL: http://api:8000
+    volumes:
+      - ./ui/app.py:/app/app.py
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    networks:
+      - rag_network
+    restart: unless-stopped
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+
+# ============================================
+# Networks
+# ============================================
 networks:
   rag_network:
     driver: bridge
+    name: rag_network
 
+# ============================================
+# Volumes
+# ============================================
 volumes:
   postgres_data:
+    driver: local
+    name: rag_postgres_data
+  
   etcd_data:
+    driver: local
+    name: rag_etcd_data
+  
   minio_data:
+    driver: local
+    name: rag_minio_data
+  
   milvus_data:
+    driver: local
+    name: rag_milvus_data
+  
   ollama_data:
-  api_data:
-  api_logs:
+    driver: local
+    name: rag_ollama_data
+  
+  api_uploads:
+    driver: local
+    name: rag_api_uploads
+  
+  hf_cache:
+    driver: local
+    name: rag_hf_cache

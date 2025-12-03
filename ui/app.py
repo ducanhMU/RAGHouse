@@ -1,209 +1,639 @@
 """
-Streamlit UI aligned with the DESIGN.md specification. It exposes three
-sections: chat interface, knowledge-base management, and system monitoring.
+Streamlit UI for RAG Financial Assistant
+Provides chat interface, file management, and system monitoring.
 """
 
-from __future__ import annotations
-
-import os
-import time
-from typing import Dict, List, Optional
-
-import requests
 import streamlit as st
+import requests
+import json
+import time
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import os
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
+# ============================================
+# Configuration
+# ============================================
 
+API_URL = os.getenv("API_URL", "http://api:8000")
+
+# Page configuration
 st.set_page_config(
-    page_title="RAG Control Room",
-    page_icon="📘",
+    page_title="RAG Financial Assistant",
+    page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        margin-bottom: 1rem;
+    }
+    .status-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 0.5rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin: 0.25rem;
+    }
+    .status-healthy {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .status-degraded {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    .status-unhealthy {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
+    .status-pending {
+        background-color: #cce5ff;
+        color: #004085;
+    }
+    .status-processing {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    .status-completed {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .status-failed {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
+    .chat-message {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .user-message {
+        background-color: #e3f2fd;
+        border-left: 4px solid #1976d2;
+    }
+    .assistant-message {
+        background-color: #f5f5f5;
+        border-left: 4px solid #43a047;
+    }
+    .source-citation {
+        font-size: 0.85rem;
+        color: #666;
+        background-color: #f0f0f0;
+        padding: 0.5rem;
+        border-radius: 0.25rem;
+        margin-top: 0.5rem;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #dee2e6;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# HTTP helper
-# ---------------------------------------------------------------------------
 
+# ============================================
+# API Helper Functions
+# ============================================
 
-def api_call(method: str, path: str, **kwargs) -> Optional[Dict]:
-    url = f"{API_BASE}{path}"
+def check_api_health() -> Dict[str, Any]:
+    """Check API health status"""
     try:
-        resp = requests.request(method, url, timeout=30, **kwargs)
-        resp.raise_for_status()
-        if resp.headers.get("content-type", "").startswith("application/json"):
-            return resp.json()
-        return resp.text
-    except requests.RequestException as exc:
-        st.error(f"API error: {exc}")
-        return None
+        response = requests.get(f"{API_URL}/health", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        return {"status": "unhealthy", "details": {"error": f"Status code: {response.status_code}"}}
+    except Exception as e:
+        return {"status": "unhealthy", "details": {"error": str(e)}}
 
 
-# ---------------------------------------------------------------------------
-# Sidebar widgets
-# ---------------------------------------------------------------------------
+def get_system_stats() -> Optional[Dict[str, Any]]:
+    """Get system statistics"""
+    try:
+        response = requests.get(f"{API_URL}/stats/system", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching system stats: {e}")
+    return None
 
 
-def render_health_panel():
-    st.markdown("### System Health")
-    health = api_call("GET", "/health")
-    if not health:
-        st.warning("Unable to reach backend")
-        return
-    for key, label in [
-        ("postgres", "PostgreSQL"),
-        ("milvus", "Milvus"),
-        ("models", "Models"),
-        ("internet", "Internet"),
-    ]:
-        status = health.get(key, "unknown")
-        emoji = "🟢" if status in ("ok", "connected") else "🟡" if status == "limited" else "🔴"
-        st.metric(label, f"{emoji} {status.upper()}")
+def get_services_info() -> Optional[List[Dict[str, Any]]]:
+    """Get services information"""
+    try:
+        response = requests.get(f"{API_URL}/system/services", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching services info: {e}")
+    return None
 
 
-def ensure_session_state():
-    if "active_session" not in st.session_state:
-        session = api_call("POST", "/sessions", json={"title": "Primary Chat"})
-        st.session_state.active_session = session["session_id"] if session else None
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+def get_features() -> Optional[Dict[str, Any]]:
+    """Get enabled features"""
+    try:
+        response = requests.get(f"{API_URL}/features", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching features: {e}")
+    return None
 
 
-def refresh_messages(session_id: str):
-    history = api_call("GET", f"/sessions/{session_id}/history")
-    if history is not None:
-        st.session_state.messages = history
+def list_sessions() -> List[Dict[str, Any]]:
+    """List all chat sessions"""
+    try:
+        response = requests.get(f"{API_URL}/sessions", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching sessions: {e}")
+    return []
 
 
-def render_session_list():
-    st.markdown("### Sessions")
-    if st.button("➕ New Chat", use_container_width=True):
-        result = api_call("POST", "/sessions", json={"title": "New Chat"})
-        if result:
-            st.session_state.active_session = result["session_id"]
-            refresh_messages(result["session_id"])
-            st.experimental_rerun()
-
-    sessions = api_call("GET", "/sessions") or []
-    for sess in sessions:
-        sess_id = str(sess["id"])
-        title = sess["title"] or "Untitled"
-        label = "🟢" if sess_id == st.session_state.active_session else "⚪"
-        if st.button(f"{label} {title[:24]}", key=f"session_{sess_id}"):
-            st.session_state.active_session = sess_id
-            refresh_messages(sess_id)
-            st.experimental_rerun()
+def create_session(title: str = "New Chat") -> Optional[Dict[str, Any]]:
+    """Create a new chat session"""
+    try:
+        response = requests.post(
+            f"{API_URL}/sessions",
+            json={"title": title},
+            timeout=10
+        )
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error creating session: {e}")
+    return None
 
 
-def render_file_panel():
-    st.markdown("### Knowledge Base")
-    uploaded = st.file_uploader("Upload PDF", type=["pdf"])
-    if uploaded:
-        with st.spinner("Uploading..."):
-            files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
-            if api_call("POST", "/files/upload", files=files):
-                st.success(f"{uploaded.name} queued for ingestion")
-                time.sleep(1)
-                st.experimental_rerun()
+def delete_session(session_id: str) -> bool:
+    """Delete a chat session"""
+    try:
+        response = requests.delete(f"{API_URL}/sessions/{session_id}", timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        st.error(f"Error deleting session: {e}")
+        return False
 
-    stats = api_call("GET", "/files/status") or {}
-    st.caption("Ingestion status")
-    st.progress(
-        stats.get("completed", 0) / max(stats.get("total", 1), 1),
-        text=f"{stats.get('completed', 0)} / {stats.get('total', 0)} completed",
-    )
-    files = (api_call("GET", "/files") or [])[:5]
-    for file_info in files:
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            st.write(f"**{file_info['filename']}** — {file_info.get('status')}")
-        with col2:
-            if st.button("🗑", key=f"delete_{file_info['id']}"):
-                api_call("DELETE", f"/files/{file_info['id']}")
-                st.experimental_rerun()
 
+def get_session_history(session_id: str) -> List[Dict[str, Any]]:
+    """Get chat history for a session"""
+    try:
+        response = requests.get(f"{API_URL}/sessions/{session_id}/history", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching history: {e}")
+    return []
+
+
+def send_message_streaming(session_id: str, message: str, use_rag: bool = True, top_k: int = 7):
+    """Send a message and get streaming response"""
+    try:
+        response = requests.post(
+            f"{API_URL}/chat",
+            json={
+                "session_id": session_id,
+                "message": message,
+                "use_rag": use_rag,
+                "top_k": top_k
+            },
+            stream=True,
+            timeout=120
+        )
+        
+        if response.status_code == 200:
+            for line in response.iter_lines():
+                if line:
+                    line_str = line.decode('utf-8')
+                    if line_str.startswith('data: '):
+                        data = json.loads(line_str[6:])
+                        yield data
+    except Exception as e:
+        st.error(f"Error sending message: {e}")
+
+
+def list_files() -> List[Dict[str, Any]]:
+    """List all uploaded files"""
+    try:
+        response = requests.get(f"{API_URL}/files", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching files: {e}")
+    return []
+
+
+def get_files_status() -> Optional[Dict[str, int]]:
+    """Get file processing status counts"""
+    try:
+        response = requests.get(f"{API_URL}/files/status", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching file status: {e}")
+    return None
+
+
+def upload_file(file) -> Optional[Dict[str, Any]]:
+    """Upload a file"""
+    try:
+        files = {"file": (file.name, file, file.type)}
+        response = requests.post(f"{API_URL}/files/upload", files=files, timeout=300)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error uploading file: {e}")
+    return None
+
+
+def delete_file(file_id: str) -> bool:
+    """Delete a file"""
+    try:
+        response = requests.delete(f"{API_URL}/files/{file_id}", timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        st.error(f"Error deleting file: {e}")
+        return False
+
+
+# ============================================
+# UI Helper Functions
+# ============================================
+
+def render_status_badge(status: str) -> str:
+    """Render a status badge"""
+    status_lower = status.lower()
+    css_class = f"status-badge status-{status_lower}"
+    return f'<span class="{css_class}">{status.upper()}</span>'
+
+
+def render_chat_message(role: str, content: str):
+    """Render a chat message"""
+    if role == "USER":
+        st.markdown(f'<div class="chat-message user-message"><strong>You:</strong><br>{content}</div>', 
+                   unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="chat-message assistant-message"><strong>Assistant:</strong><br>{content}</div>', 
+                   unsafe_allow_html=True)
+
+
+# ============================================
+# Initialize Session State
+# ============================================
+
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = None
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "files_refresh" not in st.session_state:
+    st.session_state.files_refresh = 0
+
+
+# ============================================
+# Sidebar
+# ============================================
 
 with st.sidebar:
-    ensure_session_state()
-    render_health_panel()
-    st.markdown("---")
-    render_session_list()
-    st.markdown("---")
-    render_file_panel()
+    st.markdown('<p class="main-header">🤖 RAG Assistant</p>', unsafe_allow_html=True)
+    
+    # System Health
+    st.subheader("System Health")
+    health = check_api_health()
+    status = health.get("status", "unknown")
+    st.markdown(render_status_badge(status), unsafe_allow_html=True)
+    
+    with st.expander("Health Details", expanded=False):
+        st.json(health)
+    
+    st.divider()
+    
+    # Navigation
+    st.subheader("Navigation")
+    page = st.radio(
+        "Select Page",
+        ["💬 Chat", "📁 File Manager", "📊 Dashboard", "⚙️ System Info"],
+        label_visibility="collapsed"
+    )
+    
+    st.divider()
+    
+    # Chat Sessions (only show on chat page)
+    if page == "💬 Chat":
+        st.subheader("Chat Sessions")
+        
+        if st.button("➕ New Chat", use_container_width=True):
+            new_session = create_session()
+            if new_session:
+                st.session_state.current_session_id = new_session["id"]
+                st.session_state.chat_history = []
+                st.rerun()
+        
+        sessions = list_sessions()
+        
+        for session in sessions:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                if st.button(
+                    f"📝 {session['title'][:20]}...",
+                    key=f"session_{session['id']}",
+                    use_container_width=True
+                ):
+                    st.session_state.current_session_id = session['id']
+                    st.session_state.chat_history = get_session_history(session['id'])
+                    st.rerun()
+            with col2:
+                if st.button("🗑️", key=f"delete_{session['id']}"):
+                    if delete_session(session['id']):
+                        st.success("Session deleted")
+                        if st.session_state.current_session_id == session['id']:
+                            st.session_state.current_session_id = None
+                            st.session_state.chat_history = []
+                        st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Main layout
-# ---------------------------------------------------------------------------
+# ============================================
+# Main Content Area
+# ============================================
 
-
-st.title("📘 AI Financial Assistant")
-
-tabs = st.tabs(["Chat", "Knowledge Base", "Monitoring"])
-
-
-with tabs[0]:
-    if not st.session_state.active_session:
-        st.info("No active session. Create one from the sidebar.")
+if page == "💬 Chat":
+    st.title("💬 Chat Interface")
+    
+    # Create session if none exists
+    if st.session_state.current_session_id is None:
+        new_session = create_session()
+        if new_session:
+            st.session_state.current_session_id = new_session["id"]
+            st.session_state.chat_history = []
+    
+    if st.session_state.current_session_id:
+        # Chat settings
+        with st.expander("⚙️ Chat Settings", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                use_rag = st.checkbox("Use RAG (Document Search)", value=True)
+            with col2:
+                top_k = st.slider("Documents to retrieve", 1, 20, 7)
+        
+        # Display chat history
+        chat_container = st.container()
+        with chat_container:
+            if not st.session_state.chat_history:
+                st.info("Start a conversation by typing a message below.")
+            else:
+                for msg in st.session_state.chat_history:
+                    render_chat_message(msg["role"], msg["content"])
+        
+        # Chat input
+        st.divider()
+        user_input = st.chat_input("Ask me anything about your documents...")
+        
+        if user_input:
+            # Add user message to history
+            st.session_state.chat_history.append({
+                "role": "USER",
+                "content": user_input
+            })
+            
+            # Display user message
+            with chat_container:
+                render_chat_message("USER", user_input)
+            
+            # Stream assistant response
+            with chat_container:
+                response_placeholder = st.empty()
+                full_response = ""
+                sources = []
+                
+                for chunk in send_message_streaming(
+                    st.session_state.current_session_id,
+                    user_input,
+                    use_rag,
+                    top_k
+                ):
+                    if chunk.get("type") == "content":
+                        full_response += chunk.get("content", "")
+                        response_placeholder.markdown(
+                            f'<div class="chat-message assistant-message"><strong>Assistant:</strong><br>{full_response}</div>',
+                            unsafe_allow_html=True
+                        )
+                    elif chunk.get("type") == "sources":
+                        sources = chunk.get("sources", [])
+                
+                # Add assistant response to history
+                st.session_state.chat_history.append({
+                    "role": "ASSISTANT",
+                    "content": full_response
+                })
+                
+                # Display sources if available
+                if sources:
+                    sources_html = "<div class='source-citation'><strong>Sources:</strong><br>"
+                    for i, source in enumerate(sources, 1):
+                        sources_html += f"[{i}] File: {source['file_id']}, Page: {source['page_number']}<br>"
+                    sources_html += "</div>"
+                    st.markdown(sources_html, unsafe_allow_html=True)
+            
+            st.rerun()
     else:
-        refresh_messages(st.session_state.active_session)
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"].lower()):
-                st.markdown(message["content"])
-
-        prompt = st.chat_input("Ask about your documents...")
-        if prompt:
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            payload = {
-                "session_id": st.session_state.active_session,
-                "message": prompt,
-                "use_rag": True,
-            }
-            response = api_call(
-                "POST",
-                f"/sessions/{st.session_state.active_session}/message",
-                json=payload,
-            )
-            if response:
-                refresh_messages(st.session_state.active_session)
-                with st.chat_message("assistant"):
-                    st.markdown(response["reply"])
-                    cols = st.columns(3)
-                    cols[0].caption(f"Model: {response['model_used']}")
-                    cols[1].caption(f"Latency: {response['latency_ms']} ms")
-                    cols[2].caption(
-                        f"Citations: {len(response.get('citations', []))}"
-                    )
-                    if response.get("citations"):
-                        with st.expander("Citations"):
-                            for idx, cite in enumerate(response["citations"], start=1):
-                                st.markdown(
-                                    f"**Source {idx}** — file `{cite['file_id']}` page {cite['page_number']}"
-                                )
-                                st.caption(cite["excerpt"])
+        st.warning("No active chat session. Click 'New Chat' in the sidebar to start.")
 
 
-with tabs[1]:
-    st.subheader("Knowledge Base Snapshot")
-    files = api_call("GET", "/files") or []
+elif page == "📁 File Manager":
+    st.title("📁 File Manager")
+    
+    # File upload
+    st.subheader("Upload Documents")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF or DOCX file",
+        type=["pdf", "docx", "doc"],
+        help="Upload documents to add to the knowledge base"
+    )
+    
+    if uploaded_file is not None:
+        if st.button("Upload File"):
+            with st.spinner("Uploading file..."):
+                result = upload_file(uploaded_file)
+                if result:
+                    st.success(f"✅ {result['message']}")
+                    st.session_state.files_refresh += 1
+                    time.sleep(1)
+                    st.rerun()
+    
+    st.divider()
+    
+    # File status summary
+    st.subheader("Processing Status")
+    status_data = get_files_status()
+    if status_data:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Pending", status_data.get("PENDING", 0))
+        with col2:
+            st.metric("Processing", status_data.get("PROCESSING", 0))
+        with col3:
+            st.metric("Completed", status_data.get("COMPLETED", 0))
+        with col4:
+            st.metric("Failed", status_data.get("FAILED", 0))
+    
+    # Auto-refresh toggle
+    auto_refresh = st.checkbox("Auto-refresh (5s)", value=False)
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+    
+    st.divider()
+    
+    # File list
+    st.subheader("Uploaded Files")
+    files = list_files()
+    
     if not files:
-        st.info("No files ingested yet.")
+        st.info("No files uploaded yet.")
     else:
-        for file_info in files:
-            with st.expander(f"{file_info['filename']} — {file_info.get('status')}"):
-                st.write(file_info)
+        for file in files:
+            with st.expander(f"📄 {file['filename']}", expanded=False):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.write(f"**Status:** {render_status_badge(file['status'])}", unsafe_allow_html=True)
+                    st.write(f"**File ID:** `{file['id']}`")
+                    st.write(f"**Uploaded:** {file['created_at']}")
+                    
+                    # Metadata
+                    if file.get('meta_info'):
+                        meta = file['meta_info']
+                        if meta.get('pages'):
+                            st.write(f"**Pages:** {meta['pages']}")
+                        if meta.get('chunks'):
+                            st.write(f"**Chunks:** {meta['chunks']}")
+                        if meta.get('error'):
+                            st.error(f"Error: {meta['error']}")
+                
+                with col2:
+                    if st.button("Delete", key=f"delete_file_{file['id']}"):
+                        if delete_file(file['id']):
+                            st.success("File deleted")
+                            time.sleep(1)
+                            st.rerun()
 
 
-with tabs[2]:
-    st.subheader("Monitoring")
-    stats = api_call("GET", "/stats/system") or {}
-    milvus = api_call("GET", "/stats/milvus") or {}
-    cols = st.columns(3)
-    cols[0].metric("Files", stats.get("files", 0))
-    cols[1].metric("Chunks", stats.get("chunks", 0))
-    cols[2].metric("Chat Events", stats.get("messages", 0))
-    st.markdown("#### Milvus Collection")
-    st.json(milvus)
+elif page == "📊 Dashboard":
+    st.title("📊 System Dashboard")
+    
+    # System stats
+    stats = get_system_stats()
+    if stats:
+        st.subheader("Overview")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric("Total Files", stats['files']['total'])
+            st.metric("Completed", stats['files']['completed'])
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric("Chat Sessions", stats['chat']['sessions'])
+            st.metric("Total Messages", stats['chat']['messages'])
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+            st.metric("Vector Entities", stats['vector_db']['entities'])
+            st.write(f"**Collection:** {stats['vector_db']['collection']}")
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # Features
+    st.subheader("Enabled Features")
+    features = get_features()
+    if features:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Hybrid Search:** {features.get('hybrid_search')}")
+            st.write(f"**Dense Embedding:** {features.get('dense_embedding')}")
+            st.write(f"**Sparse Embedding:** {features.get('sparse_embedding')}")
+            st.write(f"**Reranker:** {features.get('reranker')}")
+        with col2:
+            st.write(f"**Primary LLM:** {features.get('primary_llm')}")
+            st.write(f"**Fallback LLM:** {features.get('fallback_llm')}")
+            st.write(f"**GPU Acceleration:** {features.get('gpu_acceleration')}")
+            st.write(f"**Streaming:** {features.get('streaming_responses')}")
+    
+    st.divider()
+    
+    # Health details
+    st.subheader("Health Check")
+    health = check_api_health()
+    st.json(health)
 
+
+elif page == "⚙️ System Info":
+    st.title("⚙️ System Information")
+    
+    st.subheader("Connected Services")
+    services = get_services_info()
+    if services:
+        for service in services:
+            with st.expander(f"{service['name']}", expanded=False):
+                st.write(f"**URL:** {service['url']}")
+                st.write(f"**Description:** {service['description']}")
+                st.write(f"**Status:** {render_status_badge(service['status'])}", unsafe_allow_html=True)
+    
+    st.divider()
+    
+    st.subheader("API Endpoints")
+    st.markdown("""
+    **Health & System:**
+    - `GET /health` - Overall health check
+    - `GET /health/db` - PostgreSQL health
+    - `GET /health/vector-db` - Milvus health
+    - `GET /stats/system` - System statistics
+    - `GET /stats/milvus` - Milvus statistics
+    - `GET /system/services` - Services info
+    - `GET /features` - Enabled features
+    
+    **File Management:**
+    - `POST /files/upload` - Upload document
+    - `GET /files` - List all files
+    - `GET /files/status` - File processing status
+    - `GET /files/{id}` - Get file details
+    - `DELETE /files/{id}` - Delete file
+    
+    **Chat:**
+    - `POST /sessions` - Create session
+    - `GET /sessions` - List sessions
+    - `GET /sessions/{id}` - Get session
+    - `DELETE /sessions/{id}` - Delete session
+    - `GET /sessions/{id}/history` - Get chat history
+    - `POST /chat` - Send message (streaming)
+    """)
+    
+    st.divider()
+    
+    st.subheader("Documentation")
+    st.markdown(f"**API Docs:** [{API_URL}/docs]({API_URL}/docs)")
+    st.markdown(f"**OpenAPI Schema:** [{API_URL}/openapi.json]({API_URL}/openapi.json)")
+
+
+# ============================================
+# Footer
+# ============================================
+
+st.sidebar.divider()
+st.sidebar.caption("RAG Financial Assistant v1.0.0")
+st.sidebar.caption("Powered by BGE-M3 & Gemini")

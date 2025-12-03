@@ -1,457 +1,453 @@
 """
-RAG core components: BGE-M3 encoder, Milvus hybrid retrieval, reranker, and LLM router.
+RAG Query Module
+Handles hybrid search, reranking, LLM generation, and 3-3 memory mechanism.
 """
 
-from __future__ import annotations
-
-import logging
 import os
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import json
+import logging
+from typing import List, Dict, Any, Optional, AsyncGenerator
+from datetime import datetime
+import uuid
 
-import numpy as np
-import requests
+import torch
+import google.generativeai as genai
+from FlagEmbedding import FlagReranker
 from pymilvus import (
-    AnnSearchRequest,
-    Collection,
-    CollectionSchema,
-    DataType,
-    FieldSchema,
-    WeightedRanker,
-    connections,
-    utility,
+    Collection, CollectionSchema, FieldSchema, DataType,
+    AnnSearchRequest, WeightedRanker, connections
 )
-from sentence_transformers import CrossEncoder, SentenceTransformer
+
+from .database import (
+    SessionLocal, ChatSession, ChatEvent,
+    MessageRole, EventType, Visibility
+)
+from .ingest import bge_m3_model
 
 logger = logging.getLogger(__name__)
 
+# Global reranker model
+bge_reranker: Optional[FlagReranker] = None
 
-# ---------------------------------------------------------------------------
-# Embeddings
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class HybridEmbedding:
-    dense: List[float]
-    sparse: Dict[int, float]
-    importance: float
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("Gemini API configured")
 
 
-class BgeM3Encoder:
+def load_reranker_model(model_name: str = "BAAI/bge-reranker-v2-m3", device: str = "cuda"):
+    """Load BGE reranker model"""
+    global bge_reranker
+    logger.info(f"Loading reranker model: {model_name} on {device}")
+    bge_reranker = FlagReranker(model_name, use_fp16=True, device=device)
+    logger.info("Reranker model loaded successfully")
+
+
+def create_or_get_collection(collection_name: str) -> Collection:
+    """Create or retrieve Milvus collection with hybrid search schema"""
+    from pymilvus import utility
+    
+    if utility.has_collection(collection_name):
+        logger.info(f"Collection {collection_name} already exists")
+        return Collection(collection_name)
+    
+    # Define schema
+    fields = [
+        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+        FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
+        FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
+        FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=36),
+        FieldSchema(name="page_number", dtype=DataType.INT32),
+        FieldSchema(name="importance_score", dtype=DataType.FLOAT)
+    ]
+    
+    schema = CollectionSchema(fields, description="RAG Hybrid Collection")
+    collection = Collection(collection_name, schema)
+    
+    # Create indexes
+    dense_index = {
+        "index_type": "HNSW",
+        "metric_type": "COSINE",
+        "params": {"M": 16, "efConstruction": 256}
+    }
+    
+    sparse_index = {
+        "index_type": "SPARSE_INVERTED_INDEX",
+        "metric_type": "IP"
+    }
+    
+    collection.create_index("dense_vector", dense_index)
+    collection.create_index("sparse_vector", sparse_index)
+    
+    logger.info(f"Created collection {collection_name} with hybrid indexes")
+    return collection
+
+
+async def hybrid_search_with_rerank(
+    query_text: str,
+    collection: Collection,
+    filter_expr: str = None,
+    top_k_dense: int = 20,
+    top_k_sparse: int = 20,
+    final_top_k: int = 7,
+    alpha: float = 0.2,
+    beta: float = 0.8,
+    gamma: float = 0.2
+) -> List[Dict[str, Any]]:
     """
-    Minimal adapter for BAAI/bge-m3. The model produces dense + sparse vectors
-    from the same forward pass. Sparse vectors are approximated when the native
-    tokenizer is unavailable to keep development environments lightweight.
+    Hybrid search with importance score and cross-encoder reranking.
+    
+    Args:
+        query_text: User query
+        collection: Milvus collection
+        filter_expr: Optional filter expression
+        top_k_dense: Top K for dense search
+        top_k_sparse: Top K for sparse search
+        final_top_k: Final number of chunks to return
+        alpha: Weight for importance score in hybrid search
+        beta: Weight for cross-encoder in final ranking
+        gamma: Weight for importance score in final ranking
     """
-
-    def __init__(self) -> None:
-        model_name = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-        device = os.getenv("EMBEDDING_DEVICE", "cpu")
-        self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
-        self.model = SentenceTransformer(model_name, device=device)
-
-    def encode_texts(self, texts: Sequence[str]) -> List[HybridEmbedding]:
-        dense = self.model.encode(
-            list(texts),
-            batch_size=self.batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
-        sparse_vectors = [self._bag_of_words(text) for text in texts]
-        embeddings: List[HybridEmbedding] = []
-        for idx, row in enumerate(dense):
-            importance = min(1.0, len(texts[idx]) / 1500.0)
-            embeddings.append(
-                HybridEmbedding(
-                    dense=row.astype(np.float32).tolist(),
-                    sparse=sparse_vectors[idx],
-                    importance=float(importance),
-                )
+    if bge_m3_model is None:
+        raise RuntimeError("Embedding model not loaded")
+    
+    # Encode query
+    query_emb = bge_m3_model.encode(
+        queries=[query_text],
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False
+    )[0]
+    
+    dense_vec = query_emb['dense'].tolist()
+    sparse_vec = query_emb['lexical_weights']
+    
+    # Create ANN requests
+    dense_request = AnnSearchRequest(
+        data=[dense_vec],
+        anns_field="dense_vector",
+        param={"metric_type": "COSINE", "params": {"efSearch": 128}},
+        limit=top_k_dense
+    )
+    
+    sparse_request = AnnSearchRequest(
+        data=[sparse_vec],
+        anns_field="sparse_vector",
+        param={"metric_type": "IP", "params": {"drop_ratio_search": 0.1}},
+        limit=top_k_sparse
+    )
+    
+    # Hybrid search
+    raw_results = collection.hybrid_search(
+        reqs=[dense_request, sparse_request],
+        rerank=WeightedRanker(0.7, 0.3),
+        limit=top_k_dense + top_k_sparse,
+        output_fields=["content", "file_id", "page_number", "importance_score"],
+        expr=filter_expr
+    )[0]
+    
+    # Aggregate and deduplicate
+    candidate_chunks = []
+    seen_ids = set()
+    
+    for hit in raw_results:
+        if hit.id in seen_ids:
+            continue
+        seen_ids.add(hit.id)
+        
+        imp_score = hit.entity.get("importance_score", 0.0)
+        combined_score = hit.distance + alpha * imp_score
+        
+        candidate_chunks.append({
+            "id": hit.id,
+            "content": hit.entity.get("content"),
+            "file_id": hit.entity.get("file_id"),
+            "page_number": hit.entity.get("page_number"),
+            "distance": hit.distance,
+            "importance_score": imp_score,
+            "combined_score": combined_score
+        })
+    
+    # Early return if few candidates
+    if len(candidate_chunks) <= final_top_k:
+        return candidate_chunks
+    
+    # Cross-encoder rerank
+    if bge_reranker:
+        top_candidates = candidate_chunks[:50]
+        query_chunk_pairs = [(query_text, chunk["content"]) for chunk in top_candidates]
+        
+        with torch.no_grad():
+            rerank_scores = bge_reranker.compute_score(
+                query_chunk_pairs,
+                batch_size=16,
+                max_length=512,
+                normalize=True
             )
-        return embeddings
-
-    def encode_query(self, query: str) -> HybridEmbedding:
-        return self.encode_texts([query])[0]
-
-    @staticmethod
-    def _bag_of_words(text: str) -> Dict[int, float]:
-        """
-        Lightweight sparse approximation: hashed term-frequency vector.
-        """
-        vocab_size = 4096
-        sparse: Dict[int, float] = {}
-        tokens = [token.lower() for token in text.split()]
-        if not tokens:
-            return sparse
-        tf = {}
-        for token in tokens:
-            tf[token] = tf.get(token, 0) + 1
-        max_tf = max(tf.values())
-        for token, freq in tf.items():
-            index = hash(token) % vocab_size
-            sparse[index] = freq / max_tf
-        return sparse
+        
+        # Combine rerank score with importance
+        for chunk, score in zip(top_candidates, rerank_scores):
+            chunk["final_score"] = beta * score + gamma * chunk["importance_score"]
+        
+        # Sort and return top K
+        final_chunks = sorted(top_candidates, key=lambda x: x["final_score"], reverse=True)[:final_top_k]
+        return final_chunks
+    
+    return candidate_chunks[:final_top_k]
 
 
-# ---------------------------------------------------------------------------
-# Milvus hybrid store
-# ---------------------------------------------------------------------------
+def build_rag_prompt(
+    query: str,
+    chunks: List[Dict[str, Any]],
+    conversation_context: str = ""
+) -> str:
+    """Build structured RAG prompt with citations"""
+    
+    prompt = f"""You are an expert financial assistant. Use only the information provided below. Do not hallucinate or invent data.
 
-
-class MilvusHybridStore:
-    """
-    Milvus collection capable of storing dense + sparse vectors, chunk metadata,
-    and importance scores. All schema definitions follow the design doc.
-    """
-
-    def __init__(self) -> None:
-        host = os.getenv("MILVUS_HOST", "localhost")
-        port = os.getenv("MILVUS_PORT", "19530")
-        self.collection_name = os.getenv(
-            "MILVUS_COLLECTION_NAME", "rag_hybrid_collection"
-        )
-        connections.connect(alias="default", host=host, port=port)
-        if not utility.has_collection(self.collection_name):
-            self._create_collection()
-        self.collection = Collection(self.collection_name)
-        self.collection.load()
-
-    def _create_collection(self) -> None:
-        fields = [
-            FieldSchema(
-                name="id", dtype=DataType.INT64, is_primary=True, auto_id=True
-            ),
-            FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
-            FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
-            FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-            FieldSchema(name="file_id", dtype=DataType.VARCHAR, max_length=64),
-            FieldSchema(name="page_number", dtype=DataType.INT64),
-            FieldSchema(name="importance_score", dtype=DataType.FLOAT),
-        ]
-        schema = CollectionSchema(
-            fields=fields,
-            description="Hybrid dense+sparse store aligned with BGE-M3 embeddings",
-        )
-        collection = Collection(name=self.collection_name, schema=schema)
-        collection.create_index(
-            field_name="dense_vector",
-            index_params={
-                "index_type": "HNSW",
-                "metric_type": "COSINE",
-                "params": {"M": 16, "efConstruction": 200},
-            },
-        )
-        collection.create_index(
-            field_name="sparse_vector",
-            index_params={"index_type": "SPARSE_INVERTED_INDEX"},
-        )
-
-    def insert_chunks(
-        self,
-        *,
-        file_id: str,
-        dense_vectors: Sequence[Sequence[float]],
-        sparse_vectors: Sequence[Dict[int, float]],
-        texts: Sequence[str],
-        pages: Sequence[int],
-        importance: Sequence[float],
-    ) -> None:
-        payload = [
-            list(dense_vectors),
-            list(sparse_vectors),
-            list(texts),
-            [file_id] * len(texts),
-            list(pages),
-            list(importance),
-        ]
-        self.collection.insert(payload)
-        self.collection.flush()
-
-    def delete_file(self, file_id: str) -> None:
-        self.collection.delete(expr=f'file_id == "{file_id}"')
-        self.collection.flush()
-
-    def stats(self) -> Dict[str, int]:
-        return {
-            "entities": self.collection.num_entities,
-            "indexes": len(self.collection.indexes),
-        }
-
-    def hybrid_search(
-        self,
-        query_embedding: HybridEmbedding,
-        *,
-        filter_expr: Optional[str] = None,
-        top_k_dense: int = 20,
-        top_k_sparse: int = 20,
-        final_top_k: int = 7,
-        dense_weight: float = 0.7,
-        sparse_weight: float = 0.3,
-        rerank_weight: float = 0.8,
-        importance_weight: float = 0.2,
-        reranker: Optional["Reranker"] = None,
-        query_text: Optional[str] = None,
-    ) -> List[Dict]:
-        dense_request = AnnSearchRequest(
-            data=[query_embedding.dense],
-            anns_field="dense_vector",
-            param={"metric_type": "COSINE", "params": {"efSearch": 128}},
-            limit=top_k_dense,
-        )
-        sparse_request = AnnSearchRequest(
-            data=[query_embedding.sparse],
-            anns_field="sparse_vector",
-            param={"metric_type": "IP", "params": {"drop_ratio_search": 0.1}},
-            limit=top_k_sparse,
-        )
-        raw_results = self.collection.hybrid_search(
-            reqs=[dense_request, sparse_request],
-            rerank=WeightedRanker(dense_weight, sparse_weight),
-            limit=top_k_dense + top_k_sparse,
-            output_fields=[
-                "content",
-                "file_id",
-                "page_number",
-                "importance_score",
-            ],
-            expr=filter_expr,
-        )[0]
-
-        deduped: Dict[int, Dict] = {}
-        for hit in raw_results:
-            if hit.id in deduped:
-                continue
-            importance = hit.entity.get("importance_score", 0.0)
-            deduped[hit.id] = {
-                "id": hit.id,
-                "text": hit.entity.get("content"),
-                "file_id": hit.entity.get("file_id"),
-                "page_number": hit.entity.get("page_number"),
-                "importance_score": importance,
-                "score": 1 - hit.distance,
-            }
-
-        candidates = list(deduped.values())
-        if not candidates:
-            return []
-
-        if reranker and query_text:
-            reranked = reranker.rerank(
-                query_text,
-                candidates,
-                final_top_k=final_top_k,
-                rerank_weight=rerank_weight,
-                importance_weight=importance_weight,
-            )
-            return reranked
-
-        candidates.sort(key=lambda row: row["score"], reverse=True)
-        return candidates[:final_top_k]
-
-
-# ---------------------------------------------------------------------------
-# Reranker
-# ---------------------------------------------------------------------------
-
-
-class Reranker:
-    def __init__(self) -> None:
-        model_name = os.getenv(
-            "RERANKER_MODEL", "BAAI/bge-reranker-large"
-        )
-        device = os.getenv("RERANKER_DEVICE", "cpu")
-        self.model = CrossEncoder(model_name, device=device, max_length=512)
-
-    def rerank(
-        self,
-        query: str,
-        documents: Sequence[Dict],
-        *,
-        final_top_k: int,
-        rerank_weight: float,
-        importance_weight: float,
-    ) -> List[Dict]:
-        if not documents:
-            return []
-        pairs = [[query, doc["text"]] for doc in documents]
-        scores = self.model.predict(pairs, convert_to_numpy=True)
-        enriched: List[Dict] = []
-        for doc, score in zip(documents, scores):
-            final_score = (
-                rerank_weight * float(score)
-                + importance_weight * float(doc.get("importance_score", 0.0))
-            )
-            enriched.append({**doc, "rerank_score": float(final_score)})
-        enriched.sort(key=lambda row: row["rerank_score"], reverse=True)
-        return enriched[:final_top_k]
-
-
-# ---------------------------------------------------------------------------
-# LLM Router
-# ---------------------------------------------------------------------------
-
-
-class LLMRouter:
-    """
-    Route prompts to Gemini (primary) with Ollama fallback. Supports both
-    streaming and blocking generations.
-    """
-
-    def __init__(self) -> None:
-        self.ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-        self.gemini_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        self.gemini_key = os.getenv("GOOGLE_API_KEY")
-
-    def stream(self, prompt: str):
-        if self.gemini_key:
-            try:
-                yield from self._stream_gemini(prompt)
-                return
-            except Exception:  # pragma: no cover - external dependency
-                logger.warning("Gemini streaming failed, switching to Ollama")
-        yield from self._stream_ollama(prompt)
-
-    def complete(self, prompt: str) -> Dict[str, str]:
-        text_parts: List[str] = []
-        model = "unknown"
-        for chunk in self.stream(prompt):
-            text_parts.append(chunk["token"])
-            model = chunk["model"]
-        return {"text": "".join(text_parts), "model": model}
-
-    def _stream_gemini(self, prompt: str):
-        headers = {"Authorization": f"Bearer {self.gemini_key}"}
-        payload = {
-            "model": "gemini-2.0-flash",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
-            "stream": True,
-        }
-        with requests.post(
-            self.gemini_url, headers=headers, json=payload, stream=True, timeout=60
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                token = line.decode("utf-8")
-                yield {"token": token, "model": "gemini-2.0-flash"}
-
-    def _stream_ollama(self, prompt: str):
-        payload = {
-            "model": self.ollama_model,
-            "prompt": prompt,
-            "stream": True,
-            "options": {"temperature": float(os.getenv("LLM_TEMPERATURE", "0.2"))},
-        }
-        with requests.post(
-            f"{self.ollama_url}/api/generate", json=payload, stream=True, timeout=120
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                content = line.decode("utf-8")
-                yield {"token": content, "model": self.ollama_model}
-
-
-# ---------------------------------------------------------------------------
-# Prompt builder & RAG engine
-# ---------------------------------------------------------------------------
-
-
-class PromptBuilder:
-    """Prompt templates for the financial assistant style guide."""
-
-    @staticmethod
-    def build(
-        *,
-        query: str,
-        context_chunks: Sequence[Dict],
-        conversation: Sequence[Dict],
-    ) -> str:
-        history_lines = [
-            f"{item['role'].upper()}: {item['content']}" for item in conversation
-        ]
-        history = "\n".join(history_lines) if history_lines else "No previous messages"
-        documents = "\n".join(
-            [
-                f"- Source: {chunk.get('file_id')} page {chunk.get('page_number')}"
-                f"\n  Content: {chunk['text']}"
-                for chunk in context_chunks
-            ]
-        )
-        return f"""
-You are an expert financial assistant. Use only the evidence below.
-
-=== CONVERSATION MEMORY ===
-{history}
+=== CONVERSATION CONTEXT ===
+{conversation_context}
 
 === DOCUMENTS ===
-{documents}
-
-=== QUESTION ===
+"""
+    
+    for i, chunk in enumerate(chunks, 1):
+        prompt += f"\n[Document {i}]\n"
+        prompt += f"Source: File ID {chunk['file_id']}, Page {chunk['page_number']}\n"
+        prompt += f"Content: {chunk['content']}\n"
+    
+    prompt += f"""
+=== USER QUESTION ===
 {query}
 
 === INSTRUCTIONS ===
-1. Provide concise, structured answers with bullet lists where possible.
-2. Reference each fact using (source, page).
-3. If information is missing, respond with "I do not have enough information."
+1. Provide a concise, accurate answer based on the documents.
+2. Always cite sources using [Document N] notation.
+3. If the documents don't contain sufficient information, say: "I don't have enough information to answer that accurately."
+4. Do not guess or use external knowledge unless you explicitly indicate so.
+5. Be professional, clear, and structured in your response.
 """
+    
+    return prompt
 
 
-class RAGEngine:
-    def __init__(self) -> None:
-        self.encoder = BgeM3Encoder()
-        self.vector_store = MilvusHybridStore()
-        self.reranker = Reranker() if os.getenv("ENABLE_RERANKING", "true").lower() == "true" else None
-        self.llm = LLMRouter()
-
-    def retrieve(
-        self,
-        query: str,
-        *,
-        filter_expr: Optional[str] = None,
-        top_k: int = 5,
-    ) -> List[Dict]:
-        embedding = self.encoder.encode_query(query)
-        return self.vector_store.hybrid_search(
-            embedding,
-            filter_expr=filter_expr,
-            final_top_k=top_k,
-            reranker=self.reranker,
-            query_text=query,
+def get_conversation_context(session_id: str, max_messages: int = 6) -> str:
+    """
+    Retrieve conversation context using 3-3 memory mechanism.
+    Returns: checkpoint + summaries + recent messages
+    """
+    db = SessionLocal()
+    try:
+        # Get checkpoint (most recent master summary)
+        checkpoint = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.event_type == EventType.CHECKPOINT
+        ).order_by(ChatEvent.sequence_num.desc()).first()
+        
+        # Get summaries after checkpoint
+        summaries = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.event_type == EventType.SUMMARY
         )
+        
+        if checkpoint:
+            summaries = summaries.filter(
+                ChatEvent.sequence_num > checkpoint.sequence_num
+            )
+        
+        summaries = summaries.order_by(ChatEvent.sequence_num).all()
+        
+        # Get recent normal messages
+        recent_messages = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.event_type == EventType.NORMAL,
+            ChatEvent.visibility == Visibility.VISIBLE
+        ).order_by(ChatEvent.sequence_num.desc()).limit(max_messages).all()
+        
+        recent_messages = list(reversed(recent_messages))
+        
+        # Build context
+        context_parts = []
+        
+        if checkpoint:
+            context_parts.append(f"[Master Summary]\n{checkpoint.content}\n")
+        
+        if summaries:
+            context_parts.append("[Recent Summaries]")
+            for summary in summaries:
+                context_parts.append(summary.content)
+            context_parts.append("")
+        
+        if recent_messages:
+            context_parts.append("[Recent Messages]")
+            for msg in recent_messages:
+                context_parts.append(f"{msg.role.value}: {msg.content}")
+        
+        return "\n".join(context_parts)
+        
+    finally:
+        db.close()
 
-    def generate(
-        self,
-        *,
-        query: str,
-        retrieved: Sequence[Dict],
-        conversation: Sequence[Dict],
-    ) -> Dict:
-        prompt = PromptBuilder.build(
-            query=query, context_chunks=retrieved, conversation=conversation
+
+async def generate_with_gemini(prompt: str) -> AsyncGenerator[str, None]:
+    """Generate response using Gemini API with streaming"""
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(prompt, stream=True)
+        
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+                
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        yield f"[Error: {str(e)}]"
+
+
+async def generate_with_ollama(prompt: str) -> AsyncGenerator[str, None]:
+    """Fallback: Generate response using local Ollama"""
+    import httpx
+    
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "http://ollama:11434/api/generate",
+                json={
+                    "model": "llama3.2:3b",
+                    "prompt": prompt,
+                    "stream": True
+                },
+                timeout=60.0
+            )
+            
+            async for line in response.aiter_lines():
+                if line:
+                    data = json.loads(line)
+                    if "response" in data:
+                        yield data["response"]
+                        
+    except Exception as e:
+        logger.error(f"Ollama error: {e}")
+        yield f"[Error: {str(e)}]"
+
+
+async def hybrid_search_and_generate(
+    query_text: str,
+    session_id: str,
+    collection: Collection,
+    top_k: int = 7,
+    use_rag: bool = True
+) -> AsyncGenerator[str, None]:
+    """
+    Main RAG pipeline: search → rerank → generate
+    Yields streaming response chunks
+    """
+    db = SessionLocal()
+    
+    try:
+        # Get next sequence number
+        max_seq = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id)
+        ).count()
+        
+        # Save user message
+        user_event = ChatEvent(
+            session_id=uuid.UUID(session_id),
+            sequence_num=max_seq + 1,
+            role=MessageRole.USER,
+            content=query_text,
+            event_type=EventType.NORMAL,
+            visibility=Visibility.VISIBLE
         )
-        text = ""
-        model = "unknown"
-        for chunk in self.llm.stream(prompt):
-            text += chunk["token"]
-            model = chunk["model"]
-        return {"answer": text, "model_used": model}
-
-    def stream(
-        self,
-        *,
-        query: str,
-        retrieved: Sequence[Dict],
-        conversation: Sequence[Dict],
-    ):
-        prompt = PromptBuilder.build(
-            query=query, context_chunks=retrieved, conversation=conversation
+        db.add(user_event)
+        db.commit()
+        
+        # Get conversation context
+        context = get_conversation_context(session_id)
+        
+        # Perform RAG if enabled
+        chunks = []
+        if use_rag and collection:
+            chunks = await hybrid_search_with_rerank(
+                query_text=query_text,
+                collection=collection,
+                final_top_k=top_k
+            )
+        
+        # Build prompt
+        prompt = build_rag_prompt(query_text, chunks, context)
+        
+        # Generate response
+        full_response = ""
+        
+        # Try Gemini first, fallback to Ollama
+        if GEMINI_API_KEY:
+            async for chunk in generate_with_gemini(prompt):
+                full_response += chunk
+                yield json.dumps({"type": "content", "content": chunk})
+        else:
+            async for chunk in generate_with_ollama(prompt):
+                full_response += chunk
+                yield json.dumps({"type": "content", "content": chunk})
+        
+        # Save assistant response
+        assistant_event = ChatEvent(
+            session_id=uuid.UUID(session_id),
+            sequence_num=max_seq + 2,
+            role=MessageRole.ASSISTANT,
+            content=full_response,
+            event_type=EventType.NORMAL,
+            visibility=Visibility.VISIBLE,
+            model_used="gemini-2.0-flash" if GEMINI_API_KEY else "llama3.2:3b"
         )
-        for chunk in self.llm.stream(prompt):
-            yield chunk
-
+        db.add(assistant_event)
+        
+        # Update session timestamp
+        session = db.query(ChatSession).filter(
+            ChatSession.id == uuid.UUID(session_id)
+        ).first()
+        if session:
+            session.updated_at = datetime.utcnow()
+        
+        db.commit()
+        
+        # Send sources metadata
+        if chunks:
+            sources = [
+                {
+                    "file_id": chunk["file_id"],
+                    "page_number": chunk["page_number"],
+                    "score": chunk.get("final_score", chunk.get("combined_score", 0.0))
+                }
+                for chunk in chunks
+            ]
+            yield json.dumps({"type": "sources", "sources": sources})
+        
+        # Check if summary needed (every 3 message pairs = 6 messages)
+        message_count = db.query(ChatEvent).filter(
+            ChatEvent.session_id == uuid.UUID(session_id),
+            ChatEvent.event_type == EventType.NORMAL
+        ).count()
+        
+        if message_count % 6 == 0:
+            # Generate summary (simplified - should use LLM)
+            summary = f"Summary: Discussed {query_text[:50]}..."
+            summary_event = ChatEvent(
+                session_id=uuid.UUID(session_id),
+                sequence_num=max_seq + 3,
+                role=MessageRole.SYSTEM,
+                content=summary,
+                event_type=EventType.SUMMARY,
+                visibility=Visibility.HIDDEN
+            )
+            db.add(summary_event)
+            db.commit()
+        
+    except Exception as e:
+        logger.error(f"RAG pipeline error: {e}", exc_info=True)
+        yield json.dumps({"type": "error", "error": str(e)})
+    
+    finally:
+        db.close()
