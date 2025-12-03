@@ -1,27 +1,21 @@
+# 📘 DESIGN SPECIFICATION: RAG 
 
------
+**Model:** Microservices / Hybrid Search / GPU-Accelerated
 
-# 📘 HỒ SƠ THIẾT KẾ: RAG V2 ULTIMATE
+---
 
+## 1. SYSTEM OVERVIEW
 
-**Mô hình:** Microservices / Hybrid Search / GPU-Accelerated
+### 1.1. Objectives
 
+Build an **AI Financial Assistant** capable of:
 
------
+1. **Deep Document Understanding:** Accurately search and retrieve information from thousands of pages (PDF/Doc).
+2. **Factually Accurate Responses:** Every answer cites its source clearly.
+3. **Long-Term Memory:** Maintain conversation context indefinitely without being constrained by context window.
+4. **High Speed:** Responses under 3 seconds with GPU acceleration.
 
-## 1\. TỔNG QUAN HỆ THỐNG (System Overview)
-
-### 1.1. Mục tiêu
-
-Xây dựng một hệ thống **Trợ lý AI Tài chính** có khả năng:
-
-1.  **Hiểu sâu tài liệu:** Tra cứu chính xác trong hàng nghìn trang văn bản (PDF/Doc).
-2.  **Không ảo giác:** Trích dẫn nguồn gốc rõ ràng cho mọi câu trả lời.
-3.  **Trí nhớ dài hạn:** Ghi nhớ ngữ cảnh hội thoại dài vô tận mà không bị giới hạn bởi Context Window.
-4.  **Tốc độ cao:** Phản hồi dưới 3 giây nhờ tăng tốc phần cứng (GPU).
-
-### 1.2. Kiến trúc Tổng thể (High-Level Architecture)
-
+### 1.2. High-Level Architecture
 
 ```mermaid
 graph TD
@@ -32,71 +26,114 @@ graph TD
         API -->|Async| Worker[Background Ingest]
     end
 
-    subgraph "Data Storage (Hybrid)"
-        API <-->|Semantic Search| Milvus[(Milvus Vector DB)]
-        API <-->|Keyword Search| PG[(PostgreSQL FTS)]
-        Milvus <-->|Fusion Logic| PG
+    subgraph "Storage Layer"
+        API <-->|State & History| PG[(PostgreSQL)]
+        API <-->|Hybrid Search Dense+Sparse| Milvus[(Milvus 2.4+)]
+        Worker -->|Insert Vectors| Milvus
     end
 
     subgraph "GPU Computation Layer"
-        Worker -->|Batch Embed| Embed_Model[Nomic Embed]
+        Worker -->|Generate Dense/Sparse| Embed_Model[BGE-M3 Model]
         API -->|Re-rank| Rerank_Model[BGE-M3 Reranker]
         API -.->|Fallback Gen| Local_LLM[Llama 3.2 3B]
     end
 
     API -->|Primary Gen| Cloud_LLM[Google Gemini API]
 ```
+---
 
-### 1.3. CHIẾN LƯỢC MÔ HÌNH AI (AI Model Strategy) - QUAN TRỌNG
+### 1.3. Project Structure
 
-Để giải quyết bài toán: "Embedding chạy nhiều, LLM Fallback ít dùng", chúng ta phân bổ lại Stack như sau trên 1 GPU (ví dụ 16GB VRAM):
+```bash
+rag/
+├── api/
+│   ├── app/
+│   │   ├── database.py       # PostgreSQL connection & ORM models
+│   │   ├── ingest.py         # File ingestion, chunking, embedding to Milvus
+│   │   ├── rag.py            # RAG query & retrieval logic
+│   │   ├── main.py           # FastAPI app entry point
+│   │   └── __init__.py
+│   ├── data/                 # Preloaded files for initial knowledge base
+│   ├── Dockerfile
+│   └── requirements.txt
+├── ui/
+│   ├── app.py                 # Streamlit frontend
+│   ├── Dockerfile
+│   └── requirements.txt
+├── docker-compose.yml         # Orchestrates API, UI, DB, Milvus, MinIO, etc.
+├── Makefile                   # Utility scripts for build/start/stop
+├── .env.example               # Environment variable template
+├── .gitignore
+└── README.md
+```
 
-| Thành phần      | Model                         | VRAM Ước tính             | Vai trò & Lý do chọn                                                                 |
-|-----------------|-------------------------------|----------------------------|---------------------------------------------------------------------------------------|
-| Primary LLM     | `Gemini 2.0 Flash`              | 0 GB (API)                 | Chính. Tốc độ cực nhanh, context lớn, miễn phí/rẻ.                                   |
-| Embedding       | `nomic-embed-text`              | ~0.5 GB + Batching         | Hoạt động liên tục. Vector 768 chiều chất lượng cao, tăng `BATCH_SIZE` để index nhanh. |
-| Reranker        | `BAAI/bge-reranker-v2-m3`       | ~1.5 GB                    | Chốt chặn chất lượng. Model SOTA, chạy GPU để lọc kết quả tìm kiếm.                  |
-| Fallback LLM    | `Llama 3.2:3b`                  | ~2.5 GB                    | Dự phòng khi Gemini mất kết nối. Nhẹ, đủ thông minh cho câu cơ bản.                   |
-Tổng VRAM tiêu thụ: ~4.5 GB (Model) + KV Cache & Batching overhead. Rất an toàn và hiệu năng cao.
------
+---
 
-## 2\. THIẾT KẾ CƠ SỞ DỮ LIỆU (Database Design)
+### **Directory Purpose & Workflow**
 
-Chúng ta sử dụng mô hình **Hybrid Storage**: Kết hợp sức mạnh quan hệ (Postgres) và sức mạnh vector (Milvus).
+* **api/**: FastAPI backend, ingestion logic, and RAG engine.
+
+* **api/data/**: Stores preloaded files that form the **initial knowledge base**. On system startup:
+
+  1. FastAPI scans all files in `api/data/`.
+  2. Checks if the file already exists in `file_registry` (via hash).
+  3. If not process yet or process not success, inserts metadata into PostgreSQL (`status=PENDING`) and triggers ingestion.
+  4. Chunks file → generates dense + sparse embeddings → inserts into Milvus.
+  5. Updates status to `COMPLETED`.
+
+* **ui/**: Streamlit frontend for chat, file management, and system monitoring.
+
+* **docker-compose.yml**: Orchestrates all services including API, UI, PostgreSQL, Milvus, MinIO, and etcd.
+
+* **Makefile & .env**: Utility scripts and environment configuration.
+
+---
+### 1.4. AI Model Strategy 
+
+To handle **high embedding load but low fallback LLM usage**, stack allocation per GPU (e.g., 16GB VRAM) is as follows:
+
+| Component    | Model                    | VRAM    | Role & Reason                                                                                                                               |
+| ------------ | ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Embedding    | BAAI/bge-m3              | ~1.5 GB | Core of the system. Generates both:<br>1. **Dense Vector** – Semantic search.<br>2. **Sparse Vector** – Keyword search (replaces BM25/FTS). |
+| Primary LLM  | Gemini 2.0 Flash         | API     | High speed, large context.                                                                                                                  |
+| Reranker     | BAAAI/bge-reranker-v2-m3 | ~1.5 GB | Fully compatible with BGE-M3 embeddings.                                                                                                    |
+| Fallback LLM | Llama 3.2:3b             | ~2.5 GB | Offline backup (Ollama).                                                                                                                    |
+
+**Enhancements:**
+
+* Add **embedding versioning** to track which embeddings were generated with which model/version.
+* Use **chunk hashes** to prevent duplicate embeddings even if the file content is modified slightly.
+---
+
+## 2. DATABASE DESIGN
+
+We adopt a **Hybrid Storage** model: relational (Postgres) + vector (Milvus).
 
 ### 2.1. PostgreSQL Schema (`rag_db`)
 
-Chịu trách nhiệm về tính toàn vẹn dữ liệu, quản lý file và tìm kiếm từ khóa (Keyword Search).
+Responsible for **data integrity** and **file/conversation management**.
 
-**Hệ quản trị CSDL:** PostgreSQL 15+
+**Database:** PostgreSQL 15+
 
-**Mục tiêu:** Quản lý tài liệu (Knowledge Base), Tìm kiếm lai (Hybrid Search) và Quản lý ngữ cảnh hội thoại thông minh (Smart Context Window).
+**Purpose:** Manage Knowledge Base and Smart Conversation Context.
 
-## A\. SƠ ĐỒ QUAN HỆ THỰC THỂ (ERD - Entity Relationship Diagram)
+---
 
-Mô hình dữ liệu được chia làm 2 cụm chính: **Quản lý Tài liệu** (Ingestion) và **Quản lý Hội thoại** (Conversation).
+### A. Entity-Relationship Diagram (ERD)
+
+Two main clusters: **Document Management (Ingestion)** and **Conversation Management**.
 
 ```mermaid
 erDiagram
-    FILE_REGISTRY ||--o{ DOCUMENT_CHUNKS : "chia thành"
-    CHAT_SESSIONS ||--o{ CHAT_EVENTS : "chứa"
+    CHAT_SESSIONS ||--o{ CHAT_EVENTS : "contains"
 
     FILE_REGISTRY {
         uuid id PK
         string filename
         string file_hash "Unique MD5"
-        enum status "PENDING, COMPLETED..."
-        jsonb meta_info "Metadata linh động"
+        enum status "PENDING, COMPLETED, PROCESSING, FAILED"
+        jsonb meta_info "Flexible metadata"
         timestamp created_at
-    }
-
-    DOCUMENT_CHUNKS {
-        uuid id PK
-        uuid file_id FK
-        int chunk_index
-        text content "Nội dung gốc"
-        tsvector search_vector "Index tìm kiếm Full-Text"
-        int page_number
     }
 
     CHAT_SESSIONS {
@@ -109,7 +146,7 @@ erDiagram
     CHAT_EVENTS {
         uuid id PK
         uuid session_id FK
-        int sequence_num "Thứ tự tin nhắn"
+        int sequence_num "Message order"
         enum role "USER, ASSISTANT, SYSTEM"
         text content
         enum event_type "NORMAL, SUMMARY, CHECKPOINT"
@@ -118,130 +155,102 @@ erDiagram
     }
 ```
 
------
+---
 
-## B\. CHI TIẾT CÁC BẢNG (TABLE SPECIFICATIONS)
+### B. Table Details
 
-### Cụm 1: Quản lý Hội Thoại (Conversation Cluster)
+#### Cluster 1: Conversation Management
 
-Đây là phần quan trọng nhất để tạo nên "trí nhớ" cho AI.
+**`chat_sessions`** – Stores overarching session info.
 
-#### 2.1.1. Bảng `chat_sessions`
+| Column       | Type           | Constraint                       | Description                                |
+| ------------ | -------------- | -------------------------------- | ------------------------------------------ |
+| **`id`**     | `UUID`         | PK, default `uuid_generate_v4()` | Unique session identifier.                 |
+| `title`      | `VARCHAR(255)` | Default `New Chat`               | Auto trigger whenever updating new `SUMMARY` or `CHECKPOINT` |
+| `created_at` | `TIMESTAMPTZ`  | Default `NOW()`                  | Session start time.                        |
+| `updated_at` | `TIMESTAMPTZ`  | Default `NOW()`                  | Last message time (for sorting sidebar).   |
 
-Lưu trữ thông tin bao quát về một cuộc hội thoại.
+---
 
-| Cột (Column) | Kiểu (Type) | Ràng buộc (Constraint) | Mô tả (Description) |
-| :--- | :--- | :--- | :--- |
-| **`id`** | `UUID` | **PK**, Default `uuid_generate_v4()` | Định danh duy nhất cho phiên chat. Dùng UUID để bảo mật và dễ scale. |
-| `title` | `VARCHAR(255)` | Default `New Chat` | Tiêu đề phiên chat (có thể do AI tự đặt sau vài câu đầu). |
-| `created_at` | `TIMESTAMPTZ` | Default `NOW()` | Thời điểm bắt đầu chat. |
-| `updated_at` | `TIMESTAMPTZ` | Default `NOW()` | Thời điểm tin nhắn cuối cùng xuất hiện (dùng để sort list bên Sidebar). |
+**`chat_events`** – Core memory table for AI context.
 
------
+| Column           | Type          | Constraint                                   | Description & Business Logic                                                                                                                                             |
+| ---------------- | ------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`id`**         | `UUID`        | PK                                           | Unique event ID.                                                                                                                                                         |
+| `session_id`     | `UUID`        | FK → `chat_sessions.id`, `ON DELETE CASCADE` | Ensures all events are deleted if session deleted.                                                                                                                       |
+| `sequence_num`   | `INTEGER`     | NOT NULL                                     | Absolute message order (independent of timestamp).                                                                                                                       |
+| `role`           | `ENUM`        | USER, ASSISTANT, SYSTEM                      | Originator of the message.                                                                                                                                               |
+| `content`        | `TEXT`        | NOT NULL                                     | Message or summary content.                                                                                                                                              |
+| **`event_type`** | `ENUM`        | NORMAL, SUMMARY, CHECKPOINT                  | Implements **3-3 Memory:**<br>- `NORMAL`: Regular message.<br>- `SUMMARY`: Short summary after 3 message pairs.<br>- `CHECKPOINT`: Aggregated summary after 3 summaries. |
+| **`visibility`** | `ENUM`        | VISIBLE, HIDDEN                              | Controls UI display vs AI-only context.                                                                                                                                  |
+| `model_used`     | `VARCHAR(50)` | Nullable                                     | Tracks model used for response (e.g., `gemini-2.0-flash`).                                                                                                                     |
 
-#### 2.1.2. Bảng `chat_events` (Core Memory Table)
+**Index Strategy:**
 
-Lưu trữ từng tương tác chi tiết. Không chỉ lưu tin nhắn, bảng này lưu cả **trạng thái bộ nhớ** của AI.
+* `idx_session_sequence (session_id, sequence_num)` → Fast sequential chat retrieval.
 
-| Cột (Column) | Kiểu (Type) | Ràng buộc | Mô tả Chi tiết & Logic Nghiệp vụ |
-| :--- | :--- | :--- | :--- |
-| **`id`** | `UUID` | **PK** | Định danh sự kiện. |
-| **`session_id`**| `UUID` | **FK** -\> `chat_sessions.id` | Liên kết với phiên chat. Có `ON DELETE CASCADE` (Xóa session là xóa hết tin nhắn). |
-| `sequence_num` | `INTEGER` | `NOT NULL` | **Quan trọng:** Số thứ tự tăng dần (1, 2, 3...). Đảm bảo thứ tự tin nhắn chính xác tuyệt đối, không phụ thuộc vào timestamp (tránh lỗi mili-giây). |
-| `role` | `ENUM` | `USER`, `ASSISTANT`, `SYSTEM` | Ai là người tạo ra sự kiện này? |
-| `content` | `TEXT` | `NOT NULL` | Nội dung tin nhắn hoặc nội dung tóm tắt. |
-| **`event_type`** | `ENUM` | `NORMAL`, `SUMMARY`, `CHECKPOINT` | **Cơ chế 3-3 Memory:**<br>- `NORMAL`: Tin nhắn chat bình thường.<br>- `SUMMARY`: Tóm tắt ngắn sau mỗi 3 lượt hội thoại.<br>- `CHECKPOINT`: Bản tóm tắt tổng hợp sau mỗi 3 summary. |
-| **`visibility`** | `ENUM` | `VISIBLE`, `HIDDEN` | **Cơ chế hiển thị:**<br>- `VISIBLE`: Hiện lên UI cho người dùng xem.<br>- `HIDDEN`: Ẩn với người dùng (dành cho Summary/Checkpoint), chỉ gửi ngầm cho AI để gợi nhớ context. |
-| `model_used` | `VARCHAR(50)` | Nullable | Ghi lại model nào đã trả lời (ví dụ: `gemini-2.0`, `llama3.2`). Phục vụ A/B testing sau này. |
+---
 
-**Index Chiến lược:**
+#### Cluster 2: Knowledge Base & Document Management
 
-  * `idx_session_sequence`: (`session_id`, `sequence_num`) -\> Giúp query lịch sử chat cực nhanh theo đúng thứ tự.
+**`file_registry`** – Keeps record of uploaded files.
 
------
+| Column       | Type           | Constraint                             | Description                                             |
+| ------------ | -------------- | -------------------------------------- | ------------------------------------------------------- |
+| **`id`**     | `UUID`         | PK                                     | File identifier.                                        |
+| `file_hash`  | `VARCHAR(32)`  | UNIQUE                                 | MD5 hash for deduplication.                             |
+| `filename`   | `VARCHAR(255)` | NOT NULL                               | Original filename.                                      |
+| `status`     | `ENUM`         | PENDING, PROCESSING, COMPLETED, FAILED | Processing state for UI display.                        |
+| `meta_info`  | `JSONB`        | Default `{}`                           | Flexible metadata: `{ "pages": 150, "author": "CEO" }`. |
+| `created_at` | `TIMESTAMPTZ`  | Default `NOW()`                        | Creation time.                                          |
 
-### Cụm 2: Quản lý Tài liệu & Tìm kiếm (Knowledge Base Cluster)
+**Index Strategy:**
 
-Phục vụ cho tính năng RAG Hybrid Search.
+* `idx_file_meta_gin` → GIN index for fast JSONB metadata queries.
 
-#### 2.1.3. Bảng `file_registry`
+**Enhancements:**
 
-Sổ cái ghi nhận mọi file được tải lên hệ thống.
+* Consider adding **importance score** per chunk to prioritize retrieval.
+* Keep **ingestion timestamp** per chunk in Milvus for incremental updates.
 
-| Cột (Column) | Kiểu (Type) | Ràng buộc | Mô tả |
-| :--- | :--- | :--- | :--- |
-| **`id`** | `UUID` | **PK** | Định danh file. |
-| `file_hash` | `VARCHAR(32)` | `UNIQUE`, Index | Mã MD5 của nội dung file. **Chống trùng lặp:** Nếu user upload file cũ, hệ thống phát hiện ngay lập tức và không xử lý lại. |
-| `filename` | `VARCHAR(255)`| `NOT NULL` | Tên file gốc (ví dụ: `Bao_cao_TC_2024.pdf`). |
-| `status` | `ENUM` | `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED` | Trạng thái xử lý. Giúp UI hiển thị thanh tiến trình hoặc báo lỗi. |
-| `meta_info` | `JSONB` | Default `{}` | Lưu trữ linh hoạt: `{ "pages": 150, "author": "CEO", "size_kb": 2048 }`. |
+---
 
-**Index Chiến lược:**
+### C. Why This Design is Optimal
 
-  * `idx_file_meta_gin`: GIN Index trên cột `meta_info`. Cho phép query siêu nhanh kiểu: *"Tìm tất cả file có số trang \> 100"*.
+1. **Data Integrity:**
 
------
+   * Foreign keys with cascade delete avoid orphan data.
+   * Enums prevent typos in message roles and event types.
 
-#### 2.1.4. Bảng `document_chunks` (The Search Engine)
+2. **High Performance:**
 
-Đây là bảng thay thế cho ElasticSearch. Nó biến Postgres thành một công cụ tìm kiếm Full-Text mạnh mẽ.
+   * Hybrid search fully on Milvus (dense + sparse).
+   * JSONB allows future metadata expansion without schema changes.
 
-| Cột (Column) | Kiểu (Type) | Ràng buộc | Mô tả |
-| :--- | :--- | :--- | :--- |
-| **`id`** | `UUID` | **PK** | Định danh chunk. |
-| **`file_id`** | `UUID` | **FK** -\> `file_registry.id` | Thuộc về file nào? `ON DELETE CASCADE`: Xóa file gốc là xóa sạch chunks này. |
-| `chunk_index` | `INTEGER` | `NOT NULL` | Thứ tự đoạn văn trong file gốc. Giúp AI hiểu ngữ cảnh trước/sau. |
-| `content` | `TEXT` | `NOT NULL` | Nội dung văn bản thô của đoạn này. |
-| `page_number` | `INTEGER` | Default 0 | Số trang (để AI trích dẫn: *"Thông tin này ở trang 5"*). |
-| **`search_vector`**| `TSVECTOR` | Generated | **Vũ khí bí mật:** Postgres tự động tách từ, loại bỏ stop-words, và đưa về dạng vector ngôn ngữ để tìm kiếm từ khóa. |
+3. **Smart Memory Architecture:**
 
-**Cơ chế Tự động hóa (Automation):**
+   * `chat_events` table with `event_type` + `visibility` enables **Infinite Context** efficiently.
+   * Reduces token cost by sending summaries/checkpoints instead of all raw messages.
 
-  * Sử dụng **Database Trigger**: Mỗi khi Insert/Update vào cột `content`, trigger sẽ tự động tính toán và cập nhật lại `search_vector`. Code backend không cần lo việc này.
-  * **GIN Index** trên `search_vector`: Giúp tìm kiếm cụm từ trong hàng triệu dòng chỉ mất vài mili-giây.
+4. **Analytics-Ready:**
 
------
+   * Clean separation of tables allows easy sync to ClickHouse for advanced analytics.
 
-## C\. TẠI SAO THIẾT KẾ NÀY TỐI ƯU? (Selling Points)
+---
 
-Khi trình bày thiết kế này, bạn có thể nhấn mạnh các điểm sau:
-
-1.  **Tính Toàn Vẹn Dữ Liệu (Data Integrity):**
-
-      * Sử dụng **Foreign Keys** và **Cascade Delete** chặt chẽ. Không bao giờ có chuyện file đã xóa mà "rác" (chunks) vẫn còn tồn tại trong DB.
-      * Sử dụng **Enum** (MessageRole, EventType) thay vì String tự do. Ngăn chặn lỗi typo trong code (ví dụ: gõ nhầm "user" thành "usr").
-
-2.  **Hiệu Năng Cao (High Performance):**
-
-      * **Hybrid Search tại chỗ:** Không cần cài thêm ElasticSearch nặng nề. Postgres `TSVECTOR` + GIN Index đủ sức cân hàng triệu bản ghi cho Keyword Search.
-      * **JSONB:** Cho phép mở rộng metadata của file trong tương lai mà không cần sửa cấu trúc bảng (Schema Migration).
-
-3.  **Cơ Chế Bộ Nhớ Thông Minh (Smart Memory Architecture):**
-
-      * Thiết kế bảng `chat_events` với `event_type` và `visibility` là nền tảng cho thuật toán **"Infinite Context"** (Ngữ cảnh vô hạn).
-      * Chúng ta có thể lưu hàng ngàn tin nhắn nhưng chỉ gửi cho LLM bản Tóm tắt (Summary/Checkpoint) -\> **Tiết kiệm chi phí Token và tăng tốc độ phản hồi.**
-
-4.  **Sẵn Sàng Cho Analytics:**
-
-      * Việc tách biệt rõ ràng các bảng giúp dễ dàng đồng bộ dữ liệu sang ClickHouse sau này nếu cần Analytics chuyên sâu hơn.
-
------
-
-## D\. SQL SCRIPT (Để khởi tạo nhanh)
-
-Dưới đây là mã SQL tóm tắt để tạo các cấu trúc trên (bạn có thể copy vào slide trình bày):
+### D. SQL Script (Quick Setup)
 
 ```sql
--- 1. Enable UUID extension
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 2. Define ENUMs for strict typing
-CREATE TYPE filestatus AS ENUM ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED');
-CREATE TYPE messagerole AS ENUM ('USER', 'ASSISTANT', 'SYSTEM');
-CREATE TYPE eventtype AS ENUM ('NORMAL', 'SUMMARY', 'CHECKPOINT');
-CREATE TYPE visibility AS ENUM ('VISIBLE', 'HIDDEN');
+-- Define Enums
+CREATE TYPE filestatus AS ENUM ('PENDING','PROCESSING','COMPLETED','FAILED');
+CREATE TYPE messagerole AS ENUM ('USER','ASSISTANT','SYSTEM');
+CREATE TYPE eventtype AS ENUM ('NORMAL','SUMMARY','CHECKPOINT');
+CREATE TYPE visibility AS ENUM ('VISIBLE','HIDDEN');
 
--- 3. File Registry Table
+-- File Registry
 CREATE TABLE file_registry (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     file_hash VARCHAR(32) NOT NULL UNIQUE,
@@ -251,22 +260,15 @@ CREATE TABLE file_registry (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 4. Document Chunks (with FTS)
-CREATE TABLE document_chunks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    file_id UUID REFERENCES file_registry(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    search_vector TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
-);
-CREATE INDEX idx_search_vector ON document_chunks USING GIN(search_vector);
-
--- 5. Chat History Tables
+-- Chat Sessions
 CREATE TABLE chat_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     title VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Chat Events
 CREATE TABLE chat_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id UUID REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -275,281 +277,731 @@ CREATE TABLE chat_events (
     content TEXT NOT NULL,
     event_type eventtype DEFAULT 'NORMAL',
     visibility visibility DEFAULT 'VISIBLE',
-    UNIQUE(session_id, sequence_num) -- Đảm bảo thứ tự không bị trùng
+    model_used VARCHAR(50),
+    UNIQUE(session_id, sequence_num)
 );
 ```
 
-### 2.2. Milvus Schema (`rag_collection`)
+---
 
-Chịu trách nhiệm tìm kiếm ngữ nghĩa (Semantic Search).
+### 2.2. Milvus Schema (`rag_hybrid_collection`)
 
-  * **Fields:** `id` (Auto), `vector` (Float[768]), `text` (VarChar), `file_id` (VarChar).
-  * **Index:** `HNSW` (Graph-based index). Tốc độ tìm kiếm nhanh gấp 10 lần index phẳng (IVF\_FLAT).
+| Field            | Type              | Dimension / Max | Index                 | Description                                 |
+| ---------------- | ----------------- | --------------- | --------------------- | ------------------------------------------- |
+| id               | Int64             | AutoID          | -                     | Primary key.                                |
+| dense_vector     | FloatVector       | 1024            | HNSW                  | Semantic search (cosine).                   |
+| sparse_vector    | SparseFloatVector | -               | SPARSE_INVERTED_INDEX | Keyword search (inner product).             |
+| content          | VarChar           | 65535           | -                     | Original chunk text.                        |
+| file_id          | VarChar           | 36              | Scalar Index          | Foreign key to `file_registry.id`.          |
+| page_number      | Int32             | -               | -                     | Page number metadata.                       |
+| importance_score | Float             | -               | -                     | Optional score to boost retrieval priority. |
 
------
+**Enhancements:**
 
-## 3\. THUẬT TOÁN CỐT LÕI (Core Algorithms)
-
-### 3.1. Quy trình Dual-Ingestion (Nhập liệu Kép)
-
-Khi file được tải lên, hệ thống không chỉ lưu một chỗ mà tách làm 2 luồng song song:
-
-1.  **Luồng 1 (Keyword):** Lưu text vào Postgres -\> Trigger tự động tạo Index từ khóa (`search_vector`).
-2.  **Luồng 2 (Semantic):**
-      * Gửi text vào GPU (Ollama) để biến thành Vector.
-      * Lưu Vector vào Milvus.
-      * **Tối ưu:** Sử dụng `EMBEDDING_BATCH_SIZE=64` để tận dụng VRAM của GPU, tăng tốc độ xử lý lên 48 lần so với CPU.
-
-### 3.2. Thuật toán Hybrid Search & RRF Fusion
-
-Đây là logic phức tạp nhất để đảm bảo AI tìm kiếm thông minh.
-
-1.  **Bước 1: Parallel Retrieval (Tìm kiếm song song)**
-      * Gửi Query đến Milvus (Lấy **Top 10** theo ý nghĩa).
-      * Gửi Query đến Postgres (Lấy **Top 10** theo từ khóa chính xác - dùng hàm `websearch_to_tsquery`).
-2.  **Bước 2: Fusion (Hợp nhất)**
-      * Áp dụng công thức **Reciprocal Rank Fusion (RRF)**:
-        $$Score(d) = \sum \frac{1}{Rank(d) + k}$$
-      * Giúp cân bằng công bằng giữa kết quả vector và từ khóa.
-3.  **Bước 3: Re-ranking (Sắp xếp lại)**
-      * Lấy **Top 10** kết quả sau khi trộn.
-      * Dùng mô hình **Cross-Encoder (TinyBERT)** chạy trên GPU để "đọc hiểu" kỹ lưỡng mức độ liên quan giữa Câu hỏi và Đoạn văn.
-      * Chọn ra **Top 5** xuất sắc nhất để gửi cho LLM.
-
-### 3.3. Cơ chế Bộ nhớ 3-3 (Infinite Context)
-
-Giải quyết vấn đề "quên" khi chat dài.
-
-  * **Quy tắc:**
-      * Cứ **3 lượt chat** (6 tin nhắn): Tạo 1 bản tóm tắt nhỏ (Summary).
-      * Cứ **3 bản tóm tắt**: Gộp lại thành 1 điểm lưu lớn (Checkpoint).
-  * **Khi gửi Prompt:** Hệ thống chỉ gửi: `[Checkpoint Mới Nhất] + [Các Summary lẻ] + [Các tin nhắn lẻ]`.
-  * **Kết quả:** AI nắm được toàn bộ ngữ cảnh quá khứ mà không tốn quá nhiều Token.
-
------
-
-## 4\. THIẾT KẾ UI/UX (Streamlit)
-
-Giao diện được thiết kế tối giản nhưng đầy đủ thông tin kỹ thuật.
-
-1.  **Trạng thái hệ thống (System Health):**
-      * Khi mở app, tự động hiển thị màn hình **Loading Screen** chặn người dùng thao tác cho đến khi API & DB kết nối thành công (tránh lỗi crash).
-2.  **Minh bạch hoạt động (Transparency):**
-      * Mỗi câu trả lời của AI đi kèm với một **Metadata Badge**:
-          * 📘 **Knowledge Base:** Nếu câu trả lời dựa trên tài liệu.
-          * 📊 **SQL Analytics:** Nếu câu trả lời từ tính toán số liệu.
-      * Phần **Source Documents** được giấu trong thẻ Expander ("View Sources") để giữ giao diện sạch.
-3.  **Quản lý File:** Tab riêng biệt để xem danh sách file đã Index, trạng thái xử lý và nút xóa file (Sync xóa cả trong DB/Milvus).
+* Track **chunk version** and **hash** to allow incremental updates.
+* Store **embedding timestamp** to handle model upgrades.
 
 ---
 
-### **4.1. Danh sách Endpoint Backend (FastAPI Gateway)**
+## 3. CORE ALGORITHMS
 
-| Nhóm                  | Endpoint                      | Chức năng                                                 |
-| --------------------- | ----------------------------- | --------------------------------------------------------- |
-| **Health Check**      | `GET /health`                 | Trả trạng thái toàn hệ thống (DB, Milvus, Model, Network) |
-|                       | `GET /health/db`              | Kiểm tra PostgreSQL                                       |
-|                       | `GET /health/vector-db`       | Kiểm tra Milvus                                           |
-| **Chat Sessions**     | `GET /sessions`               | Lấy danh sách session                                     |
-|                       | `POST /sessions`              | Tạo session mới                                           |
-|                       | `GET /sessions/{id}`          | Lấy metadata session                                      |
-| **Chat Events**       | `GET /sessions/{id}/events`   | Lấy lịch sử chat dạng append-only                         |
-|                       | `POST /sessions/{id}/message` | Gửi tin nhắn / nhận phản hồi từ LLM                       |
-| **File Ingest**       | `GET /files`                  | Danh sách file đã ingest                                  |
-|                       | `POST /files/upload`          | Upload file vào hàng đợi xử lý                            |
-|                       | `DELETE /files/{id}`          | Xóa file trong DB + Milvus                                |
-| **Processing Status** | `GET /files/status`           | Kiểm tra trạng thái ingest của từng file                  |
-| **Admin Ops**         | `GET /system/services`        | Danh sách dịch vụ backend đang chạy                       |
+The RAG system relies on **efficient retrieval and relevance ranking** to provide accurate answers. The design leverages BGE-M3 embeddings with Milvus vector DB and an optional cross-encoder reranker.
 
 ---
 
-### **4.2. Địa chỉ truy cập các dịch vụ (dựa trên docker-compose)**
+### 3.1. Ingestion Workflow (Using BGE-M3)
 
-| Thành phần                | URL                                            | Mục đích                                   |
-| ------------------------- | ---------------------------------------------- | ------------------------------------------ |
-| **UI (Streamlit)**        | [http://localhost:8501](http://localhost:8501) | Giao diện ứng dụng                         |
-| **Backend (FastAPI)**     | [http://localhost:8000](http://localhost:8000) | API Gateway                                |
-| **PostgreSQL (RAG DB)**   | localhost:5433                                 | Lưu chat_sessions, chat_events, file_index |
-| **PostgreSQL (Superset)** | localhost:5434                                 | Dữ liệu cho Superset                       |
-| **ClickHouse**            | localhost:8123                                 | Truy vấn phân tích thời gian thực          |
-| **Milvus**                | localhost:19530                                | Vector search                              |
-| **etcd (Milvus)**         | localhost:2379                                 | Metadata store                             |
-| **MinIO (Milvus)**        | localhost:9000                                 | S3 backend để lưu vector segments          |
+1. **Chunking:** Split each document into chunks of 512–1024 tokens.
+2. **Embedding (BGE-M3):**
 
-*Toàn bộ địa chỉ này sẽ được UI hiển thị trong mục System Status Dashboard.*
+   * Generate both dense and sparse embeddings in a **single model call**.
+   * Output:
 
----
+     ```python
+     {'dense': [...], 'sparse': {index: weight, ...}}
+     ```
+   * Dense vectors capture semantic meaning; sparse vectors capture keyword-weight information.
+3. **Insert into Milvus:**
 
-### **4.3. Tính năng UI & Cách Tương Tác Với Database**
+   * Combine: `dense_vector + sparse_vector + content + file_id`.
+   * Insert into the Milvus collection for later hybrid search.
 
-Dưới đây là mô tả đầy đủ từng tính năng UI và cách nó giao tiếp với backend + DB.
+**Algorithm Description:**
 
----
-
-#### **1) System Health – Màn hình Loading khi mở app**
-
-Luồng hoạt động:
-
-1. UI gọi `GET /health` mỗi 1 giây
-2. Khi backend trả về:
-
-   ```json
-   {
-     "postgres": "ok",
-     "milvus": "ok",
-     "models": "ok",
-     "internet": "ok"
-   }
-   ```
-3. UI tắt Loading Screen → vào giao diện chính
-
-**Lý do:**
-Tránh trường hợp user click Upload File khi Milvus chưa chạy → crash.
+* Dense embeddings allow semantic search, understanding the meaning of the text beyond keywords.
+* Sparse embeddings are closer to TF-IDF style keyword matching but with learned weights, improving precision for domain-specific queries (e.g., finance).
+* Milvus stores both types of vectors, enabling hybrid search that combines semantic and keyword relevance.
 
 ---
 
-#### **2) Chat Interface – Tương tác với chat_sessions & chat_events**
+### 3.2. Milvus Native Hybrid Search Algorithm 
 
-#### 2.1. Tự động tạo session
+This search approach **delegates most of the search logic to Milvus**. It retrieves candidate chunks using a combination of dense and sparse vectors, boosts them with `importance_score`, and optionally reranks them using a cross-encoder.
 
-Khi người dùng mở tab Chat:
+**Step-by-step Explanation:**
 
-* UI gọi `POST /sessions` → backend tạo session mới trong bảng `chat_sessions`
-* Backend trả về:
+1. **Encode Query:** Use BGE-M3 to obtain both dense and sparse representations.
+2. **Separate ANN Requests:**
 
-  ```json
-  {
-     "session_id": "uuid",
-     "title": "New chat"
-  }
-  ```
+   * **Dense Request:** cosine similarity search over dense vectors.
+   * **Sparse Request:** inner product search over sparse vectors.
+3. **Hybrid Search Fusion with Importance Score:**
 
-#### 2.2. Tự động cập nhật session title
+   * Milvus combines the results using a `WeightedRanker` (e.g., 0.7 dense + 0.3 sparse).
+   * `importance_score` is added to boost critical chunks in initial ranking.
+4. **Candidate Deduplication:** Remove repeated chunks by ID.
+5. **Optional Cross-Encoder Reranking:**
 
-Khi user gửi tin nhắn đầu tiên:
+   * Pairs the query with candidate chunks and produces fine-grained relevance scores.
+   * `importance_score` is combined with rerank scores to prioritize high-importance content.
+6. **Return Top-K Chunks:** Only return the final `top_k` high-quality chunks for prompting the LLM.
 
-* Backend sinh ra title bằng model summarizer
-  vd: `"Phân tích báo cáo tài chính HPG Q2/2024"`
-* Backend update vào bảng `chat_sessions.title`
+**Python Implementation:**
 
-UI tự động update bằng polling `GET /sessions/{id}` mỗi 3 giây.
+```python
+from pymilvus import Collection, AnnSearchRequest, WeightedRanker
+from typing import List, Dict, Any
+import torch
+import numpy as np
 
----
+# Assume these two models are already loaded on GPU
+bge_m3_embedder = None      # BAAI/bge-m3 (dense + sparse)
+bge_reranker = None         # BAAI/bge-reranker-v2-m3  (cross-encoder)
 
-#### **3) Chat Rendering – Hiển thị câu trả lời với Metadata Badge**
+# Milvus Collection
+collection = Collection("rag_hybrid_collection")
+collection.load()
 
-Mỗi response từ API `/sessions/{id}/message` có format:
+async def hybrid_search_with_importance(
+    query_text: str,
+    filter_expr: str = None,           # e.g., "year == 2024 && company == 'HPG'"
+    top_k_dense: int = 20,
+    top_k_sparse: int = 20,
+    final_top_k: int = 7,              # number of chunks to include in the prompt
+    alpha: float = 0.2,                # importance boost weight for hybrid score
+    beta: float = 0.8,                 # cross-encoder weight
+    gamma: float = 0.2                 # importance weight in final rerank
+) -> List[Dict[str, Any]]:
 
-```json
-{
-  "reply": "...",
-  "source_type": "knowledge_base / sql / mixed / llm_only",
-  "sources": [...],
-  "latency": 1.82
-}
+    # ----------------------------
+    # Step 1: Encode query
+    # ----------------------------
+    query_emb = bge_m3_embedder.encode(
+        queries=[query_text],
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False
+    )[0]
+
+    dense_vec = query_emb['dense'].tolist()
+    sparse_vec = query_emb['sparse']
+
+    # ----------------------------
+    # Step 2: Create ANN requests
+    # ----------------------------
+    dense_request = AnnSearchRequest(
+        data=[dense_vec],
+        anns_field="dense_vector",
+        param={"metric_type": "COSINE", "params": {"efSearch": 128}},
+        limit=top_k_dense
+    )
+    sparse_request = AnnSearchRequest(
+        data=[sparse_vec],
+        anns_field="sparse_vector",
+        param={"metric_type": "IP", "params": {"drop_ratio_search": 0.1}},
+        limit=top_k_sparse
+    )
+
+    # ----------------------------
+    # Step 3: Hybrid search (Milvus fusion + importance boost)
+    # ----------------------------
+    raw_results = collection.hybrid_search(
+        reqs=[dense_request, sparse_request],
+        rerank=WeightedRanker(0.7, 0.3),  # dense + sparse fusion
+        limit=top_k_dense + top_k_sparse,
+        output_fields=["content", "file_id", "page_number", "company", "year", "importance_score"],
+        expr=filter_expr
+    )[0]
+
+    # ----------------------------
+    # Step 4: Aggregate hits & apply importance_score boost
+    # ----------------------------
+    candidate_chunks = []
+    seen_ids = set()
+    for hit in raw_results:
+        if hit.id in seen_ids:
+            continue
+        seen_ids.add(hit.id)
+
+        imp_score = hit.entity.get("importance_score", 0.0)
+        # Combine hybrid distance and importance
+        combined_score = hit.distance * 0.7 + hit.distance * 0.3 + alpha * imp_score
+
+        candidate_chunks.append({
+            "id": hit.id,
+            "content": hit.entity.get("content"),
+            "file_id": hit.entity.get("file_id"),
+            "page_number": hit.entity.get("page_number"),
+            "company": hit.entity.get("company"),
+            "year": hit.entity.get("year"),
+            "distance": hit.distance,
+            "importance_score": imp_score,
+            "combined_score": combined_score
+        })
+
+    # Early return if few candidates
+    if len(candidate_chunks) <= final_top_k:
+        return candidate_chunks
+
+    # ----------------------------
+    # Step 5: Optional cross-encoder rerank
+    # ----------------------------
+    top_rerank_candidates = candidate_chunks[:50]  # limit GPU usage
+    query_chunk_pairs = [(query_text, chunk["content"]) for chunk in top_rerank_candidates]
+
+    with torch.no_grad():
+        inputs = bge_reranker.encode(
+            query_chunk_pairs,
+            batch_size=16,
+            max_length=512,
+            return_tensors="pt"
+        ).to("cuda")
+        rerank_scores = bge_reranker(**inputs, normalize=True).logits.squeeze(1).cpu().numpy()
+
+    # ----------------------------
+    # Step 6: Combine rerank_score with importance_score
+    # ----------------------------
+    for chunk, score in zip(top_rerank_candidates, rerank_scores):
+        chunk["final_score"] = beta * score + gamma * chunk["importance_score"]
+
+    # ----------------------------
+    # Step 7: Return top final_top_k chunks
+    # ----------------------------
+    final_chunks = sorted(top_rerank_candidates, key=lambda x: x["final_score"], reverse=True)[:final_top_k]
+
+    return final_chunks
 ```
+---
 
-UI sẽ render:
+**Advantages of this version:**
 
-* Nếu `"source_type": "knowledge_base"` → badge 📘 **Knowledge Base**
-* Nếu `"sql"` → badge 📊 **SQL Analytics**
-* Nếu `"mixed"` → hai badge
-* Expander “View Sources” để tránh rác giao diện
+* Fully integrates `importance_score` into both **initial hybrid search** and **cross-encoder reranking**.
+* GPU-efficient: reranks only top N candidates.
+* Parameterizable weights (`alpha`, `beta`, `gamma`) for tuning importance impact.
+* Deduplication ensures unique chunks for LLM prompts.
 
 ---
 
-### **4.4. File Manager – Ingest & Trạng thái xử lý**
+### 3.3. 3-3 Memory Mechanism (Infinite Context)
 
-File Manager UI gồm:
+To handle long chats without losing context:
 
-#### 1) Danh sách file đã upload
+* Every **3 chat turns (6 messages):** generate a small summary.
+* Every **3 summaries:** merge into the master **checkpoint** (The master checkpoint after update can append to the table in database for easy operating instad of updating its old row).
+* Prompt sent to LLM: `[Checkpoint] + [Remaining Summaries] + [Recent Messages]`.
 
-UI gọi `GET /files` → backend trả về:
-
-```json
-[
-  {
-    "file_id": "...",
-    "filename": "BCTC_HPG_2024.pdf",
-    "status": "completed / pending / failed / processing",
-    "page_count": 42,
-    "embedding_done": true,
-    "chunks": 1300
-  }
-]
-```
-
-#### 2) Xử lý ingest tự động khi khởi động hệ thống
-
-Backend Worker khi boot:
-
-1. Quét bảng `files`
-2. Nếu file có status:
-
-   * `pending`
-   * `processing` nhưng chưa completed (retry after crash)
-3. Tiến hành ingest lại
-4. Cập nhật trạng thái (`pending → processing → completed`)
-
-**UI chỉ cần call `/files/status` mỗi 5 giây** để realtime hiển thị progress.
+**Benefit:** AI retains the **full historical context** without consuming excessive tokens.
 
 ---
 
-### **4.5. System Status Dashboard – Đọc dịch vụ từ docker-compose**
+## 4. UI/UX DESIGN (Streamlit)
 
-UI hiển thị danh sách service bằng API:
+The UI is designed for **clarity, minimalism, and technical transparency**. It serves as the user’s window to the AI, providing access to **chat, file management, and system monitoring**.
 
-`GET /system/services`
+* **System Health & Dashboard:** Monitor service status in real time.
+* **Chat Interface:** Interact with the AI using **knowledge base, SQL, or hybrid sources**, complete with metadata badges.
+* **File Manager:** Upload, track, and manage documents in the ingestion pipeline.
 
-Backend đọc file docker-compose (hoặc hardcode map service → URL):
-
-| Service    | URL                                            | Trạng thái |
-| ---------- | ---------------------------------------------- | ---------- |
-| FastAPI    | [http://localhost:8000](http://localhost:8000) | 🟢         |
-| Streamlit  | [http://localhost:8501](http://localhost:8501) | 🟢         |
-| PostgreSQL | localhost:5433                                 | 🟢         |
-| ClickHouse | localhost:8123                                 | 🟢         |
-| Milvus     | localhost:19530                                | 🟢         |
-| etcd       | localhost:2379                                 | 🟢         |
-| MinIO      | localhost:9000                                 | 🟢         |
-
-UI vẽ bảng + icon (🟢 🟡 🔴) theo health check tương ứng.
+The UI communicates with the backend via **RESTful FastAPI endpoints**, using polling and streaming to ensure a responsive experience.
 
 ---
 
-### **4.6. Tổng quan luồng UI ↔ Backend ↔ Database**
+### 4.1. Backend Endpoints (FastAPI Gateway)
+
+#### A. **LIFECYCLE**
+
+| # | HTTP Method / Event | Endpoint / Trigger | Description                                                                                                           |
+| - | ------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| 1 | @app.on_event       | `"startup"`        | Initializes DB, loads models, creates directories, starts ingestion workers, and auto-ingests files from `api/data/`. |
+| 2 | @app.on_event       | `"shutdown"`       | Cleans up resources, closes DB/vector connections, and gracefully stops workers.                                      |
+
+---
+
+#### B. **SYSTEM & HEALTH**
+
+| # | HTTP Method | Endpoint          | Description                                                              |
+| - | ----------- | ----------------- | ------------------------------------------------------------------------ |
+| 3 | GET         | /health           | Returns overall system health (DB, Milvus, Model Engine).                |
+| 4 | GET         | /health/db        | Verifies PostgreSQL connectivity and version.                            |
+| 5 | GET         | /health/vector-db | Verifies Milvus connectivity and collection statistics.                  |
+| 6 | GET         | /stats/milvus     | Returns detailed Milvus stats (index state, row count, segments).        |
+| 7 | GET         | /stats/system     | Aggregated system stats (total files, processed chunks, message count).  |
+| 8 | GET         | /system/services  | Lists status & URLs of linked services (UI, MinIO, Attu, etc.).          |
+| 9 | GET         | /features         | Lists enabled system features (Hybrid Search, Rerank, Chunking options). |
+
+---
+
+#### C. **CHAT SESSIONS**
+
+| #  | HTTP Method | Endpoint                       | Description                                                                    |
+| -- | ----------- | ------------------------------ | ------------------------------------------------------------------------------ |
+| 10 | POST        | /chat                          | Main RAG endpoint (streaming). Handles query → retrieve → rerank → generate.   |
+| 11 | GET         | /sessions                      | Lists all chat sessions with metadata.                                         |
+| 12 | POST        | /sessions                      | Creates a new chat session.                                                    |
+| 13 | GET         | /sessions/{session_id}         | Retrieves metadata for a specific session.                                     |
+| 14 | DELETE      | /sessions/{session_id}         | Deletes a session and all messages.                                            |
+| 15 | GET         | /sessions/{session_id}/history | Retrieves visible user + assistant messages.                                   |
+| 16 | GET         | /sessions/{session_id}/events  | Retrieves raw event logs (includes system summaries, memory, hidden messages). |
+| 17 | POST        | /sessions/{session_id}/message | Sends a user message and returns a **non-streaming** response.                 |
+
+---
+
+#### D. **FILE MANAGEMENT (Document Ingestion Pipeline)**
+
+| #  | HTTP Method | Endpoint         | Description                                                                  |
+| -- | ----------- | ---------------- | ---------------------------------------------------------------------------- |
+| 18 | POST        | /files/upload    | Uploads a PDF/Doc for background ingestion. *(Primary endpoint)*             |
+| 19 | GET         | /files           | Returns all uploaded files with detailed ingestion metadata.                 |
+| 20 | GET         | /files/status    | Returns lightweight aggregated counts (pending/processing/completed/failed). |
+| 21 | GET         | /files/{file_id} | Returns full detail, chunk stats, and error logs for a file.                 |
+| 22 | DELETE      | /files/{file_id} | Deletes a file and all its associated vectors in Milvus.                     |
+
+
+---
+
+### **4.2. Service URLs (Docker Compose Runtime)**
+
+This table reflects **every service** defined in the Docker Compose stack. It provides the accessible URLs, exposed ports, and functional roles within the RAG system.
+
+---
+
+#### **Service Overview Table**
+
+| Component                     | URL / Host:Port                                                | Purpose                                          | Notes                                              |
+| ----------------------------- | -------------------------------------------------------------- | ------------------------------------------------ | -------------------------------------------------- |
+| **UI (Streamlit)**            | [http://localhost:8501](http://localhost:8501)                 | Frontend application                             | Communicates with API via internal DNS `api:8000`. |
+| **Backend API (FastAPI)**     | [http://localhost:8000](http://localhost:8000)                 | RAG engine, embeddings, reranking, hybrid search | Runs GPU-accelerated BGE-M3 + reranker.            |
+| **Ollama (Local LLM Server)** | [http://localhost:11435](http://localhost:11435)               | Chat model provider (Llama 3.2 3B)               | Embeddings NOT from Ollama; only chat.             |
+| **PostgreSQL**                | localhost:5433                                                 | Metadata DB, chat history, file registry         | Accessible from host for debugging with pgAdmin.   |
+| **Milvus (Standalone)**       | milvus:19530 → mapped to localhost:19530                       | Vector store for hybrid search                   | Stores dense+lexical embeddings.                   |
+| **Milvus Health Monitor**     | [http://localhost:9091/healthz](http://localhost:9091/healthz) | Milvus health endpoint                           | Used by Docker healthcheck.                        |
+| **etcd**                      | etcd:2379 (internal only)                                      | Milvus metadata store                            | Not exposed to host—internal service only.         |
+| **MinIO Console**             | [http://localhost:9001](http://localhost:9001)                 | Web UI for Milvus segment storage                | Useful to inspect raw segment files.               |
+| **MinIO API**                 | [http://localhost:9003](http://localhost:9003)                 | S3-compatible storage backend                    | Milvus stores vector segments here.                |
+| **Attu (Milvus UI)**          | [http://localhost:3000](http://localhost:3000)                 | Milvus cluster inspection & vector debugging     | Recommended for evaluating vectors/chunks.         |
+| **HF Cache Volume**           | N/A (volume)                                                   | Stores downloaded BGE-M3 models                  | Improves cold-start speed.                         |
+| **Ollama Data Volume**        | N/A (volume)                                                   | Stores downloaded/pulled Ollama models           | Ensures persistence across restarts.               |
+
+---
+
+#### 🔍 Notes and Validations
+
+#### ✔ **Accurate Port Mapping**
+
+All host-facing ports exactly match the Docker Compose definitions:
+
+* UI → 8501
+* API → 8000
+* Ollama → 11435 (host) → 11434 (container)
+* PostgreSQL → 5433
+* Milvus → 19530 + 9091
+* MinIO → 9001 (console), 9003 (API)
+* Attu → 3000
+
+#### ✔ **Matches RAG System Roles**
+
+Every component appears with a clearly defined purpose:
+
+* **UI** as UX layer
+* **API** as orchestrator + RAG engine
+* **Ollama** as chat LLM
+* **Milvus** as vector DB
+* **PostgreSQL** as metadata/history DB
+* **MinIO + etcd** backing Milvus
+* **Attu** for observability
+
+#### ✔ **All internal-only services noted**
+`etcd` is correctly marked non-public (internal only).
+
+---
+
+### 4.3. File Manager (Aligned to FastAPI Endpoints)
+
+* **List files:** `GET /files` → Returns all uploaded files along with status, page count, and chunk/embedding info.
+* **Upload documents:** `POST /files/upload` → Upload PDF or Doc for background ingestion and automatic embedding.
+* **Alias upload:** `POST /upload` → Shortcut endpoint for document upload (calls `/files/upload` internally).
+* **Delete files:** `DELETE /files/{file_id}` → Removes file from `file_registry` and deletes associated vectors from Milvus.
+* **Processing status:** `GET /files/status` → Returns a summary of file ingestion progress (pending, processing, completed, failed).
+* **File details & errors:** `GET /files/{file_id}` → Returns detailed metadata and any ingestion or embedding errors for a specific file.
+
+**Notes:**
+
+* The UI should poll `/files/status` to update live progress bars.
+* For each file, metadata badges can display: page count, author (from `meta_info`), chunks, and embedding completion status.
+
+---
+
+### 4.4. Workflow Summary 
+
+#### **4.4.1. Startup Process (Automatic Ingestion of Initial Files)**
+
+**Description:**
+When the API service starts, it performs several initialization tasks:
+
+1. Ensures PostgreSQL & Milvus are reachable.
+2. Loads embedding and reranker models (BGE-M3, BGE-reranker-v2-m3).
+3. Scans `api/data/` for static preloaded documents.
+4. For each file not yet registered:
+
+   * Insert into `file_registry`
+   * Extract + chunk
+   * Embed (dense + sparse)
+   * Insert vectors into Milvus
+   * Track embedding version, timestamp, file metadata
+
+This creates a **ready-to-use knowledge base on first boot**.
 
 ```mermaid
 sequenceDiagram
-    User->>UI: Mở ứng dụng
-    UI->>API: GET /health
-    API->>DB: Ping
-    API->>Milvus: Ping
-    API->>UI: OK
-    UI->>API: POST /sessions
-    API->>DB: Insert chat_sessions
-    User->>UI: Gửi tin nhắn
-    UI->>API: POST /sessions/{id}/message
-    API->>DB: Insert chat_events (append-only)
-    API->>LLM: Query + RAG
-    API->>UI: Trả kết quả + badge + sources
-    UI->>API: GET /files/status
-    API->>Worker: Ingest file pending
+    participant DC as Docker Compose
+    participant API as FastAPI Backend
+    participant PG as PostgreSQL
+    participant MV as Milvus
+    participant ET as etcd
+    participant MO as MinIO
+    participant UI as Streamlit UI
+
+    DC->>ET: Start etcd
+    DC->>MO: Start MinIO
+    DC->>MV: Start Milvus (depends on etcd + MinIO)
+    MV->>ET: Connect to metadata store
+    MV->>MO: Connect to object storage
+
+    DC->>PG: Start PostgreSQL
+    PG->>DC: Healthy
+
+    DC->>API: Start FastAPI backend
+    API->>PG: Verify DB connection
+    API->>MV: Verify Milvus connection
+
+    API->>API: Load embedding & reranker models
+    API->>API: Scan /app/data for initial files
+    API->>PG: Register missing entries in file_registry
+    API->>API: Extract → Chunk → Embed
+    API->>MV: Insert vectors for each chunk
+
+    DC->>UI: Start Streamlit UI
 ```
------
 
-## 5\. HẠ TẦNG & TRIỂN KHAI (Infrastructure)
+**Key Points:**
 
-### 5.1. Docker Strategy
+* Ensures a **pre-built knowledge base** on startup.
+* Embedding versioning enables **safe future re-embedding** (model upgrades).
+* Initial ingestion uses the same pipeline as user uploads → consistent indexing.
 
-  * **Non-Blocking Startup:** Các container được cấu hình để khởi động ngay lập tức (`depends_on` không có condition healthy).
-  * **Application Resilience:** Code Python (API) có vòng lặp `Retry` (thử lại) kết nối Database. Nếu DB chưa lên, API sẽ đợi chứ không sập.
+---
 
-### 5.2. Yêu cầu phần cứng
+#### **4.4.2. User File Upload Workflow**
 
-  * **GPU:** NVIDIA RTX (VRAM 12GB+). Bắt buộc cài `nvidia-container-toolkit` để Docker nhìn thấy GPU.
-  * **RAM:** 32GB (Dành cho Milvus cache và OS).
-  * **Storage:** SSD NVMe (Để Postgres FTS và Milvus Index load nhanh).
+**Description:**
+Users may upload documents (PDF, DOCX, etc.) via:
 
+``` bash
+POST /files/upload
+```
 
+The system:
 
+1. Stores the file in `/app/data/uploads/`.
+2. Creates a `file_registry` entry (`status='pending'`).
+3. Adds a task to the **background worker queue**.
+4. Worker extracts → chunks → embeds → inserts into Milvus.
+5. Updates file status (`completed` or `failed`).
+
+```mermaid
+sequenceDiagram
+    participant UI as Streamlit UI
+    participant API as FastAPI Backend
+    participant PG as PostgreSQL
+    participant MV as Milvus
+
+    UI->>API: POST /files/upload (PDF/DOCX)
+    API->>PG: Insert file_registry entry (status=pending)
+    API->>API: Save file → /app/data/uploads
+    API->>API: Queue ingestion task
+
+    API->>API: Extract text → chunk
+    API->>API: Embed chunks (BGE-M3 dense + sparse)
+    API->>MV: Insert vectors into Milvus
+
+    API->>PG: Update file status → completed
+
+    UI->>API: GET /files/status
+    API->>UI: Return ingestion progress
+```
+
+**Key Points:**
+
+* Ingestion runs **asynchronously** to keep API responsive.
+* Each chunk stores `importance_score` → used later to bias hybrid ranking.
+* UI polls `/files/status` for real-time progress.
+
+---
+
+#### **4.4.3. File Deletion Workflow**
+
+**Description:**
+When a file is deleted:
+
+1. All embedded vectors in Milvus with the file’s ID are removed.
+2. Corresponding DB entries are removed from `file_registry` and related tables.
+3. UI is notified for refresh.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI as Streamlit UI
+    participant API as FastAPI Backend
+    participant PG as PostgreSQL
+    participant MV as Milvus
+
+    User->>UI: Click delete file
+    UI->>API: DELETE /files/{file_id}
+    API->>MV: Delete vectors by file_id
+    API->>PG: Delete file_registry entry
+    API->>UI: Return deletion success
+```
+
+**Key Points:**
+
+* Prevents **orphaned vectors** in Milvus.
+* Ensures total consistency between DB and vector store.
+
+---
+
+#### **4.4.4. Chat Process (Hybrid Search → Rerank → LLM Answer)**
+
+**Description:**
+The main query pipeline:
+
+1. User message stored in DB as an event.
+2. BGE-M3 produces **dense + sparse vectors**.
+3. Milvus hybrid search returns candidates.
+4. Optional **cross-encoder reranker** (BGE Reranker).
+5. Top chunks injected into RAG prompt.
+6. LLM (Ollama or Gemini) generates the final answer.
+7. Response saved in DB and streamed to the UI.
+
+```mermaid
+sequenceDiagram
+    participant UI as Streamlit UI
+    participant API as FastAPI RAG Engine
+    participant PG as PostgreSQL
+    participant MV as Milvus
+    participant OL as Ollama LLM
+
+    UI->>API: POST /sessions/{id}/message
+    API->>PG: Insert user message event
+
+    API->>API: Encode query → dense + sparse vectors
+    API->>MV: Hybrid search (WeightedRanker)
+    MV->>API: Return candidate chunks
+
+    API->>API: Optional: rerank with cross-encoder
+    API->>API: Build RAG prompt
+
+    API->>OL: Generate answer with LLM
+    OL->>API: Stream tokens
+
+    API->>PG: Store assistant response event
+    API->>UI: Stream answer + citations + metadata badges
+```
+
+**Key Points:**
+
+* `importance_score` can weight candidate scoring.
+* Hybrid search = 0.7 dense + 0.3 sparse by default.
+* 3-3 memory (3 messages + 3 summaries) optimizes context window.
+
+---
+
+#### **4.4.5. Background Worker & Task Queue**
+
+**Description:**
+The background worker is responsible for all ingestion tasks:
+
+* Startup indexing
+* User-uploaded files
+* Re-embedding tasks
+* Retry logic for failures
+* Logging
+
+```mermaid
+sequenceDiagram
+    participant API as FastAPI Backend
+    participant Worker as Ingestion Worker
+    participant MV as Milvus
+    participant PG as PostgreSQL
+
+    API->>Worker: Add ingestion task to queue
+    Worker->>Worker: Process next task (FIFO)
+
+    alt Success
+        Worker->>MV: Insert embeddings
+        Worker->>PG: Update file status → COMPLETED
+    else Failure
+        Worker->>Worker: Retry or mark FAILED
+        Worker->>PG: Update file status → FAILED
+    end
+```
+
+**Key Points:**
+
+* Decouples ingestion from the request cycle.
+* Enables **horizontal scaling** (multiple workers).
+* Ensures reliability with exponential backoff & failure tracking.
+
+---
+
+#### **4.4.6. System Health & Monitoring**
+
+**Description:**
+The UI continuously polls the backend:
+
+* `/health` → overall system readiness
+* `/health/vector-db` → Milvus status
+* `/health/db` → PostgreSQL status
+* `/stats/milvus` → index & row count
+* `/files/status` → ingestion pipeline status
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant API
+    participant PG
+    participant MV
+
+    UI->>API: GET /health
+    API->>PG: Check DB status
+    API->>MV: Check Milvus status
+    API->>UI: Return aggregated health
+
+    UI->>API: GET /stats/milvus
+    API->>UI: Return vector DB info
+
+    UI->>API: GET /files/status
+    API->>UI: Return ingestion metrics
+```
+
+**Key Points:**
+
+* Real-time visibility into ingestion, DB, vector DB, GPU usage.
+* Prevents “silent failures” during indexing or model loading.
+
+---
+Below is a refined version of your **Section 5** focusing on **5.1 (Docker/Compose Strategy)**, **5.4 (Prompting Strategy & LLM Guidance)**, and **5.5 (Monitoring, Logging & Maintenance)** — written in a design‑doc style suitable for inclusion in a project spec.
+
+---
+
+## 5. INFRASTRUCTURE & DEPLOYMENT 
+
+### 5.1. Docker / `docker-compose` Strategy
+
+* Use a **single `docker-compose.yml` (or set of compose YAMLs with optional profiles)** to orchestrate all services of the RAG system: embedding & reranker service, vector database (Milvus), relational database (PostgreSQL), LLM serving (e.g. local LLM server), ingestion worker, and frontend UI.
+* Leverage **GPU passthrough / acceleration** via `nvidia-container-toolkit` / Docker GPU support in services that require GPU (embedding generation, reranking, LLM inference). In compose file define those services with GPU resource reservations (e.g. via `runtime: nvidia` or `deploy.resources.reservations.devices`) so that GPU allocation is explicit and avoids conflicts.
+* Use **named volumes (not bind‑mounts for host‑specific data)** for all persistent data: database storage, embedding/vector data, uploaded documents, model caches. This ensures data persists across container restarts and reduces coupling to host directory structure. 
+* Define **healthchecks** for critical services (DB, vector DB, LLM server, ingestion) so compose can wait until a service is fully ready before allowing dependent services to start. Use `depends_on` with `condition: service_healthy` where appropriate. This ensures proper startup order and avoids race conditions. 
+* Avoid using floating tags like `latest`; instead, **pin Docker images to specific version tags** so deployments are reproducible and avoid unexpected behavior when base images update. 
+* Use **environment variables and `.env` file(s)** for configuration parameters (GPU device IDs, memory/cpu limits, model version, file paths, etc.) rather than hard‑coding values. This improves portability across environments (dev / staging / prod).
+* (Optional but recommended) Define **service profiles** in compose to enable selective startup of subsets of services (e.g. ingestion-only mode, inference-only mode, full stack), which is useful for resource-limited hosts or different deployment scenarios. 
+
+> **Rationale:** This compose-based orchestration provides a consistent, reproducible environment. Using volumes ensures data durability. healthchecks + GPU resource reservation + pinned versions make the deployment safer and more maintainable.
+
+---
+
+### 5.2. Prompting Strategy & LLM Guidance (Expert‑Style Answers)
+
+To ensure that the LLM responds with high-quality, reliable, and auditable answers (especially critical in financial / document-based domains), embed a structured prompting strategy and guidance as part of the system design:
+
+1. **Standardized RAG Prompt Template**
+
+   * Each time the backend constructs a prompt (to feed into the LLM), wrap retrieved chunks plus memory context in a fixed template. For example:
+
+     ```
+     You are an expert financial assistant. Use only the information provided below. Do not hallucinate or invent data.
+
+     === CONTEXT ===
+     Conversation history / memory summary:
+     <checkpoint + recent summaries + visible recent messages>
+
+     === DOCUMENTS ===
+     For each chunk:
+       - Source: <filename>, page <page_number>
+       - Content: <chunk_text>
+
+     === USER QUESTION ===
+     <user's query>
+
+     === INSTRUCTIONS ===
+     1. Provide a concise, accurate answer.
+     2. Whenever you state a fact, reference the source (filename & page).
+     3. If the documents do not contain sufficient information, say: "I don’t have enough information to answer that accurately."
+     4. Do not guess or hallucinate. Do not use external knowledge unless you explicitly indicate so.
+     ```
+
+   * This template ensures that answers are **grounded in retrieved evidence**, and makes citations explicit — improving factual reliability and auditability.
+
+2. **Answer Style Guide**
+
+   * Guide the LLM to produce **professional, formal, concise, and structured** answers (e.g., bullet lists, sections, summary + detail).
+   * Encourage **uncertainty awareness**: if confidence is low or evidence is insufficient, the assistant should flag that rather than produce misleading output.
+   * Enforce **citation discipline**: each claim or fact must have a corresponding reference. This helps especially in financial contexts where traceability is crucial.
+
+3. **Prompt / Template Versioning & Central Repository**
+
+   * Store prompt templates (and their metadata: version, purpose, performance metrics) in a **central prompt repository** (e.g. a directory under version control). This supports collaboration, reuse across different flows, experimentation, and tracking of prompt quality over time. This approach echoes patterns recommended in prompt engineering research. 
+   * Maintain change history so that modifications to prompts (e.g., updated instructions, added guardrails) are tracked for reproducibility and auditing.
+
+4. **Fallback & Fail‑Safe Behavior**
+
+   * If retrieved context yields insufficient relevant chunks (e.g. low similarity scores, missing key info), instruct the LLM to respond with a **safe fallback** such as “I don’t have enough information” rather than produce speculative answers.
+   * Optionally: mark such responses for **human review or user confirmation**, especially for high-stakes domains like finance or compliance.
+
+> **Rationale:** This prompting discipline helps reduce hallucinations, improves answer trustworthiness, and aligns output style with the expectations of an expert assistant. It transforms the LLM from “free-form generator” into a **grounded, citation-aware reasoning engine** suitable for professional contexts.
+
+---
+
+### 5.3. Monitoring, Logging & Maintenance Strategy
+
+To ensure long-term reliability, observability, and maintainability of the RAG system, embed monitoring, logging, and maintenance practices from the start:
+
+* **Health & Service Monitoring**
+
+  * Expose health endpoints (e.g. `/health`, `/health/db`, `/health/vector-db`, `/health/llm`) for all critical services (API, database, vector store, LLM server, ingestion). The orchestrator (docker-compose) relies on healthchecks to verify readiness and perform dependencies or restarts if needed. 
+  * Optionally integrate a monitoring stack (e.g. Prometheus + Grafana) to track resource usage (CPU, GPU, RAM, disk I/O), request latency, ingestion queue backlog, vector‑store size/growth, error rates. This is essential especially in production or heavy‑load use.
+
+* **Resource & Volume Management**
+
+  * Ensure persistent volumes for data storage (database, vectors, uploaded files, model caches) are regularly **backed up**. Vector store data and embeddings are expensive to regenerate, so backups (or snapshotting) are critical.
+  * Monitor disk usage and perform maintenance tasks periodically (e.g. compaction, cleanup, re-indexing, embedding version upgrades).
+
+* **Logging & Audit Trails**
+
+  * Log all user queries, retrieval results (which document/chunk IDs were retrieved), LLM prompts & responses (including citation metadata), ingestion events, errors, and system events (e.g. container restarts, healthcheck failures).
+  * Store these logs in a centralized, durable store (e.g. separate log files, logging DB, or ELK-like system) — essential for debugging, compliance, or postmortem analysis.
+  * Consider log-level control (info, warn, error) and retention policies.
+
+* **Version & Configuration Management**
+
+  * Version control **docker-compose files**, `.env` configurations, prompt templates, schema migrations — treat them like code. This ensures reproducibility and easy rollback. 
+  * Track embedding / reranker / model versions used to generate vectors in metadata (e.g. embedding version, model commit hash, build date) to support re‑indexing / auditing.
+
+* **Operational Procedures & Maintenance Windows**
+
+  * Define periodic maintenance windows for heavy tasks (e.g. re‑embedding corpus, index rebuilds, compaction).
+  * Establish alerting: e.g. if vector store growth exceeds threshold, disk usage > X%, ingestion backlog high, healthcheck failures, etc.
+  * Testing & validation: after major changes (e.g. model version, prompt template), run test queries and QA to ensure retrieval + generation quality remains acceptable.
+
+> **Rationale:** Without comprehensive monitoring, logging, and maintenance, even a well-designed RAG system can degrade over time, become unreliable, or produce incorrect responses. Embedding these practices ensures robustness, traceability, and operational maturity.
+
+---
