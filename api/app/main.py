@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 from datetime import datetime
 import uuid
+from sqlalchemy import text
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -224,7 +225,7 @@ async def health_check():
     # Check DB
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
     except Exception as e:
         db_status = f"unhealthy: {str(e)}"
@@ -263,7 +264,7 @@ async def health_check_db():
     """PostgreSQL health check"""
     try:
         db = SessionLocal()
-        result = db.execute("SELECT version()").fetchone()
+        result = db.execute(text("SELECT version()")).fetchone()
         db.close()
         return {
             "status": "healthy",
@@ -511,16 +512,7 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-
-
-@app.post("/upload", response_model=FileUploadResponse, tags=["Files"])
-async def upload_file_alias(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
-    """Alias endpoint for file upload"""
-    return await upload_file(background_tasks, file)
-
+        
 
 @app.get("/files", tags=["Files"])
 async def list_files():

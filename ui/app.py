@@ -636,4 +636,4 @@ elif page == "⚙️ System Info":
 
 st.sidebar.divider()
 st.sidebar.caption("RAG Financial Assistant v1.0.0")
-st.sidebar.caption("Powered by BGE-M3 & Gemini")
+st.sidebar.caption("RAGHouse '25")

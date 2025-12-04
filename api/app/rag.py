@@ -22,7 +22,7 @@ from .database import (
     SessionLocal, ChatSession, ChatEvent,
     MessageRole, EventType, Visibility
 )
-from .ingest import bge_m3_model
+from . import ingest
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +110,11 @@ async def hybrid_search_with_rerank(
         beta: Weight for cross-encoder in final ranking
         gamma: Weight for importance score in final ranking
     """
-    if bge_m3_model is None:
+    if ingest.bge_m3_model is None:
         raise RuntimeError("Embedding model not loaded")
     
     # Encode query
-    query_emb = bge_m3_model.encode(
+    query_emb = ingest.bge_m3_model.encode(
         queries=[query_text],
         return_dense=True,
         return_sparse=True,

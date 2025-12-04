@@ -167,9 +167,9 @@ async def process_file(
         all_chunks = []
         for page_data in pages:
             page_chunks = chunk_text(page_data["content"])
-            for chunk_text in page_chunks:
+            for chunk_str in page_chunks:
                 all_chunks.append({
-                    "content": chunk_text,
+                    "content": chunk_str,
                     "page_number": page_data["page_number"],
                     "importance_score": 0.0  # Can be enhanced with importance scoring
                 })
