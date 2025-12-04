@@ -3,6 +3,7 @@ FastAPI Gateway - Main Application Entry Point
 Handles startup, health checks, file management, and chat endpoints.
 """
 
+import asyncio
 import os
 import logging
 from pathlib import Path
@@ -435,6 +436,52 @@ async def get_enabled_features():
 # File Management Endpoints
 # ============================================
 
+@app.post("/files/reingest", tags=["Files"])
+async def reingest_all_files():
+    """
+    Re-ingest all files inside /app/data asynchronously.
+    Ensures ingestion runs only once at a time.
+    """
+    global milvus_collection, _is_reingesting
+
+    if milvus_collection is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Milvus collection is not loaded"
+        )
+
+    # Prevent concurrent reingestion
+    if _is_reingesting:
+        return {
+            "status": "running",
+            "message": "A re-ingestion process is already running"
+        }
+
+    logger.info("Manual re-ingestion requested via API")
+    _is_reingesting = True
+
+    async def run_reingest():
+        global _is_reingesting
+        try:
+            logger.info(f"[Reingest] Starting auto-ingestion in: {DATA_DIR}")
+            await auto_ingest_directory(str(DATA_DIR), milvus_collection)
+            logger.info("[Reingest] Completed successfully")
+        except Exception as e:
+            logger.error(f"[Reingest] Failed: {e}", exc_info=True)
+        finally:
+            _is_reingesting = False
+            logger.info("[Reingest] State reset. Ready for next run.")
+
+    # Run async ingestion in the background
+    asyncio.create_task(run_reingest())
+
+    return {
+        "status": "started",
+        "message": "Re-ingestion started in background",
+        "directory": str(DATA_DIR)
+    }
+
+
 @app.post("/files/upload", response_model=FileUploadResponse, tags=["Files"])
 async def upload_file(
     background_tasks: BackgroundTasks,
@@ -512,7 +559,7 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-        
+
 
 @app.get("/files", tags=["Files"])
 async def list_files():

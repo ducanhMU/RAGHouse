@@ -565,6 +565,7 @@ The UI communicates with the backend via **RESTful FastAPI endpoints**, using po
 | 20 | GET         | /files/status    | Returns lightweight aggregated counts (pending/processing/completed/failed). |
 | 21 | GET         | /files/{file_id} | Returns full detail, chunk stats, and error logs for a file.                 |
 | 22 | DELETE      | /files/{file_id} | Deletes a file and all its associated vectors in Milvus.                     |
+| 23 | POST | /files/reingest | Re-ingest all files. |
 
 
 ---
