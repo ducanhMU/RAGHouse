@@ -8,7 +8,7 @@ import hashlib
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 import fitz  # PyMuPDF
@@ -220,7 +220,7 @@ async def ingest_file_task(
                 **file_record.meta_info,
                 "pages": result.get("pages", 0),
                 "chunks": result.get("chunks", 0),
-                "processed_at": datetime.utcnow().isoformat()
+                "processed_at": datetime.now(timezone.utc).isoformat()
             }
         else:
             file_record.status = FileStatus.FAILED
