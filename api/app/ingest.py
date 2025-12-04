@@ -102,6 +102,9 @@ def generate_embeddings(texts: List[str]) -> Dict[str, Any]:
         return_sparse=True,
         return_colbert_vecs=False
     )
+
+    # DEBUG: Print keys if it fails again (optional, but helpful)
+    logger.info(f"Embedding output keys: {embeddings.keys()}")
     
     return {
         "dense": embeddings['dense'],
