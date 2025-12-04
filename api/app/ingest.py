@@ -107,7 +107,7 @@ def generate_embeddings(texts: List[str]) -> Dict[str, Any]:
     logger.info(f"Embedding output keys: {embeddings.keys()}")
     
     return {
-        "dense": embeddings['dense'],
+        "dense": embeddings['dense_vecs'],
         "sparse": embeddings['lexical_weights']
     }
 

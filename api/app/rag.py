@@ -121,7 +121,7 @@ async def hybrid_search_with_rerank(
         return_colbert_vecs=False
     )[0]
     
-    dense_vec = query_emb['dense'].tolist()
+    dense_vec = query_emb['dense_vecs'].tolist()
     sparse_vec = query_emb['lexical_weights']
     
     # Create ANN requests
