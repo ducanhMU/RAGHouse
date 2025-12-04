@@ -221,10 +221,7 @@ backups/
 *.parquet
 
 # Document files (exclude from git)
-*.pdf
-*.doc
-*.docx
-*.txt
+
 *.rtf
 *.odt
 
