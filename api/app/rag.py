@@ -115,28 +115,30 @@ async def hybrid_search_with_rerank(
     
     # Encode query
     query_emb = ingest.bge_m3_model.encode(
-        queries=[query_text],
+        [query_text],
         return_dense=True,
         return_sparse=True,
         return_colbert_vecs=False
-    )[0]
+    )
     
-    dense_vec = query_emb['dense_vecs'].tolist()
-    sparse_vec = query_emb['lexical_weights']
+    dense_vec = query_emb['dense_vecs'][0].tolist()
+    sparse_vec = query_emb['lexical_weights'][0]
     
     # Create ANN requests
     dense_request = AnnSearchRequest(
         data=[dense_vec],
         anns_field="dense_vector",
         param={"metric_type": "COSINE", "params": {"efSearch": 128}},
-        limit=top_k_dense
+        limit=top_k_dense,
+        expr=filter_expr
     )
     
     sparse_request = AnnSearchRequest(
         data=[sparse_vec],
         anns_field="sparse_vector",
         param={"metric_type": "IP", "params": {"drop_ratio_search": 0.1}},
-        limit=top_k_sparse
+        limit=top_k_sparse,
+        expr=filter_expr
     )
     
     # Hybrid search
@@ -144,8 +146,7 @@ async def hybrid_search_with_rerank(
         reqs=[dense_request, sparse_request],
         rerank=WeightedRanker(0.7, 0.3),
         limit=top_k_dense + top_k_sparse,
-        output_fields=["content", "file_id", "page_number", "importance_score"],
-        expr=filter_expr
+        output_fields=["content", "file_id", "page_number", "importance_score"]
     )[0]
     
     # Aggregate and deduplicate
