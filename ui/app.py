@@ -6,6 +6,7 @@ FIXES:
 1. Added Reingest button to re-scan api/data folder
 2. Lazy session creation - only create session on first user message
 3. Fixed duplicate session creation when selecting historical chats
+4. Auto-refresh sidebar to show updated session titles from database
 """
 
 import streamlit as st
@@ -102,6 +103,10 @@ st.markdown("""
         border-radius: 0.5rem;
         border: 1px solid #dee2e6;
     }
+    .session-title-current {
+        background-color: #e3f2fd;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -188,6 +193,17 @@ def delete_session(session_id: str) -> bool:
     except Exception as e:
         st.error(f"Error deleting session: {e}")
         return False
+
+
+def get_session_details(session_id: str) -> Optional[Dict[str, Any]]:
+    """Get session details including updated title"""
+    try:
+        response = requests.get(f"{API_URL}/sessions/{session_id}", timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error fetching session details: {e}")
+    return None
 
 
 def get_session_history(session_id: str) -> List[Dict[str, Any]]:
@@ -319,6 +335,15 @@ if "files_refresh" not in st.session_state:
 if "session_loaded" not in st.session_state:
     st.session_state.session_loaded = False
 
+if "current_session_title" not in st.session_state:
+    st.session_state.current_session_title = "New Chat"
+
+if "last_message_time" not in st.session_state:
+    st.session_state.last_message_time = None
+
+if "force_sidebar_refresh" not in st.session_state:
+    st.session_state.force_sidebar_refresh = 0
+
 
 # ============================================
 # Sidebar
@@ -357,34 +382,81 @@ with st.sidebar:
             st.session_state.current_session_id = None
             st.session_state.chat_history = []
             st.session_state.session_loaded = False
+            st.session_state.current_session_title = "New Chat"
+            st.session_state.last_message_time = None
             st.rerun()
         
+        # Refresh sessions button (manual refresh)
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("🔄", help="Refresh session list"):
+                st.session_state.force_sidebar_refresh += 1
+                st.rerun()
+        
+        # Get sessions (fresh data each time)
         sessions = list_sessions()
         
-        for session in sessions:
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                # Load existing session
-                if st.button(
-                    f"📝 {session['title'][:20]}...",
-                    key=f"session_{session['id']}",
-                    use_container_width=True
-                ):
-                    # Only load if it's a different session
-                    if st.session_state.current_session_id != session['id']:
-                        st.session_state.current_session_id = session['id']
-                        st.session_state.chat_history = get_session_history(session['id'])
-                        st.session_state.session_loaded = True
-                        st.rerun()
-            with col2:
-                if st.button("🗑️", key=f"delete_{session['id']}"):
-                    if delete_session(session['id']):
-                        st.success("Session deleted")
-                        if st.session_state.current_session_id == session['id']:
-                            st.session_state.current_session_id = None
-                            st.session_state.chat_history = []
-                            st.session_state.session_loaded = False
-                        st.rerun()
+        # If current session exists, update its title from database
+        if st.session_state.current_session_id:
+            session_details = get_session_details(st.session_state.current_session_id)
+            if session_details:
+                new_title = session_details.get("title", "New Chat")
+                if new_title != st.session_state.current_session_title:
+                    st.session_state.current_session_title = new_title
+                    # Force immediate rerun to show new title
+                    st.rerun()
+        
+        # Display current session title prominently
+        if st.session_state.current_session_id:
+            st.markdown("### 📝 Current Session")
+            st.markdown(f"**{st.session_state.current_session_title}**")
+            st.divider()
+        
+        # Session list header
+        st.markdown("### 📚 All Sessions")
+        
+        if not sessions:
+            st.info("No previous sessions")
+        else:
+            for session in sessions:
+                # Highlight current session
+                is_current = (st.session_state.current_session_id == session['id'])
+                
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    # Show session title with indicator if current
+                    button_label = f"{'▶ ' if is_current else ''}📝 {session['title'][:25]}"
+                    if len(session['title']) > 25:
+                        button_label += "..."
+                    
+                    button_type = "primary" if is_current else "secondary"
+                    
+                    # Load existing session
+                    if st.button(
+                        button_label,
+                        key=f"session_{session['id']}",
+                        use_container_width=True,
+                        type=button_type
+                    ):
+                        # Only load if it's a different session
+                        if st.session_state.current_session_id != session['id']:
+                            st.session_state.current_session_id = session['id']
+                            st.session_state.chat_history = get_session_history(session['id'])
+                            st.session_state.session_loaded = True
+                            st.session_state.current_session_title = session['title']
+                            st.session_state.last_message_time = None
+                            st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"delete_{session['id']}"):
+                        if delete_session(session['id']):
+                            st.success("Session deleted")
+                            if st.session_state.current_session_id == session['id']:
+                                st.session_state.current_session_id = None
+                                st.session_state.chat_history = []
+                                st.session_state.session_loaded = False
+                                st.session_state.current_session_title = "New Chat"
+                                st.session_state.last_message_time = None
+                            st.rerun()
 
 
 # ============================================
@@ -392,7 +464,8 @@ with st.sidebar:
 # ============================================
 
 if page == "💬 Chat":
-    st.title("💬 Chat Interface")
+    # Display current session title in main area
+    st.title(f"💬 {st.session_state.current_session_title}")
     
     # Chat settings
     with st.expander("⚙️ Chat Settings", expanded=False):
@@ -426,9 +499,13 @@ if page == "💬 Chat":
                 st.session_state.current_session_id = new_session["id"]
                 st.session_state.chat_history = []
                 st.session_state.session_loaded = True
+                st.session_state.current_session_title = new_session.get("title", "New Chat")
             else:
                 st.error("Failed to create chat session")
                 st.stop()
+        
+        # Record message time
+        st.session_state.last_message_time = datetime.now()
         
         # Add user message to history
         st.session_state.chat_history.append({
@@ -474,6 +551,18 @@ if page == "💬 Chat":
                     sources_html += f"[{i}] File: {source['file_id']}, Page: {source['page_number']}<br>"
                 sources_html += "</div>"
                 st.markdown(sources_html, unsafe_allow_html=True)
+        
+        # After response completes, check for title update
+        # Wait a moment for backend to process summary/checkpoint
+        time.sleep(0.5)
+        
+        # Fetch updated session details
+        session_details = get_session_details(st.session_state.current_session_id)
+        if session_details:
+            new_title = session_details.get("title", "New Chat")
+            if new_title != st.session_state.current_session_title:
+                st.session_state.current_session_title = new_title
+                st.session_state.force_sidebar_refresh += 1
         
         st.rerun()
 
@@ -663,16 +752,18 @@ elif page == "⚙️ System Info":
     - `POST /files/reingest` - Re-scan api/data folder
     - `GET /files` - List all files
     - `GET /files/status` - File processing status
-    - `GET /files/{id}` - Get file details
-    - `DELETE /files/{id}` - Delete file
+    - `GET /files/{file_id}` - Get file details
+    - `DELETE /files/{file_id}` - Delete file
     
     **Chat:**
     - `POST /sessions` - Create session
     - `GET /sessions` - List sessions
-    - `GET /sessions/{id}` - Get session
-    - `DELETE /sessions/{id}` - Delete session
-    - `GET /sessions/{id}/history` - Get chat history
+    - `GET /sessions/{session_id}` - Get session details
+    - `DELETE /sessions/{session_id}` - Delete session
+    - `GET /sessions/{session_id}/history` - Get chat history
     - `POST /chat` - Send message (streaming)
+    - `GET /sessions/{session_id}/events` - Retrieve raw event logs
+    - `POST /sessions/{session_id}/message` - Send message (non-streaming)
     """)
     
     st.divider()
