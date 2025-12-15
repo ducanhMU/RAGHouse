@@ -1,13 +1,18 @@
 """
 RAG Query Module
 Handles hybrid search, reranking, LLM generation, and 3-3 memory mechanism.
+
+FIXES:
+1. Properly implemented 3-3 memory: SUMMARY every 3 message pairs, CHECKPOINT every 3 summaries
+2. LLM-generated summaries and checkpoints using Gemini/Ollama
+3. Automatic session title updates on SUMMARY/CHECKPOINT creation
 """
 
 import os
 import json
 import logging
 from typing import List, Dict, Any, Optional, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 import torch
@@ -292,7 +297,47 @@ def get_conversation_context(session_id: str, max_messages: int = 6) -> str:
         db.close()
 
 
-async def generate_with_gemini(prompt: str) -> AsyncGenerator[str, None]:
+async def generate_with_gemini(prompt: str, max_tokens: int = 2048) -> str:
+    """Generate response using Gemini API (non-streaming for summaries)"""
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(max_output_tokens=max_tokens)
+        )
+        return response.text
+                
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return f"[Error generating with Gemini: {str(e)}]"
+
+
+async def generate_with_ollama(prompt: str, max_tokens: int = 2048) -> str:
+    """Fallback: Generate response using local Ollama (non-streaming)"""
+    import httpx
+    
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "http://ollama:11434/api/generate",
+                json={
+                    "model": "llama3.2:3b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"num_predict": max_tokens}
+                },
+                timeout=120.0
+            )
+            
+            data = response.json()
+            return data.get("response", "[No response generated]")
+                        
+    except Exception as e:
+        logger.error(f"Ollama error: {e}")
+        return f"[Error generating with Ollama: {str(e)}]"
+
+
+async def generate_with_gemini_streaming(prompt: str) -> AsyncGenerator[str, None]:
     """Generate response using Gemini API with streaming"""
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
@@ -303,12 +348,12 @@ async def generate_with_gemini(prompt: str) -> AsyncGenerator[str, None]:
                 yield chunk.text
                 
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini API streaming error: {e}")
         yield f"[Error: {str(e)}]"
 
 
-async def generate_with_ollama(prompt: str) -> AsyncGenerator[str, None]:
-    """Fallback: Generate response using local Ollama"""
+async def generate_with_ollama_streaming(prompt: str) -> AsyncGenerator[str, None]:
+    """Fallback: Generate response using local Ollama with streaming"""
     import httpx
     
     try:
@@ -330,8 +375,240 @@ async def generate_with_ollama(prompt: str) -> AsyncGenerator[str, None]:
                         yield data["response"]
                         
     except Exception as e:
-        logger.error(f"Ollama error: {e}")
+        logger.error(f"Ollama streaming error: {e}")
         yield f"[Error: {str(e)}]"
+
+
+async def generate_summary(messages: List[ChatEvent]) -> str:
+    """
+    Generate a concise summary of recent message pairs using LLM.
+    
+    Args:
+        messages: List of ChatEvent objects (should be 3 message pairs = 6 messages)
+    """
+    conversation_text = "\n".join([
+        f"{msg.role.value}: {msg.content}" for msg in messages
+    ])
+    
+    prompt = f"""Please create a concise summary (2-3 sentences) of the following conversation exchange:
+
+{conversation_text}
+
+Summary should capture:
+- Main topics discussed
+- Key questions asked
+- Important information provided
+
+Summary:"""
+    
+    if GEMINI_API_KEY:
+        summary = await generate_with_gemini(prompt, max_tokens=200)
+    else:
+        summary = await generate_with_ollama(prompt, max_tokens=200)
+    
+    return summary.strip()
+
+
+async def generate_checkpoint(summaries: List[ChatEvent], old_checkpoint: Optional[ChatEvent] = None) -> str:
+    """
+    Generate a master checkpoint by aggregating 3 summaries with optional old checkpoint.
+    
+    Args:
+        summaries: List of 3 recent SUMMARY events
+        old_checkpoint: Previous checkpoint to incorporate (if exists)
+    """
+    summaries_text = "\n".join([
+        f"Summary {i+1}: {summary.content}" 
+        for i, summary in enumerate(summaries)
+    ])
+    
+    checkpoint_context = ""
+    if old_checkpoint:
+        checkpoint_context = f"\n=== Previous Master Summary ===\n{old_checkpoint.content}\n"
+    
+    prompt = f"""You are creating a master summary (checkpoint) of a conversation. 
+{checkpoint_context}
+=== Recent Summaries ===
+{summaries_text}
+
+Create a comprehensive master summary (3-5 sentences) that:
+1. Integrates the recent summaries with the previous master summary (if provided)
+2. Captures the overall conversation trajectory
+3. Highlights key topics, decisions, and information discussed
+4. Maintains important context for future reference
+
+Master Summary:"""
+    
+    if GEMINI_API_KEY:
+        checkpoint = await generate_with_gemini(prompt, max_tokens=300)
+    else:
+        checkpoint = await generate_with_ollama(prompt, max_tokens=300)
+    
+    return checkpoint.strip()
+
+
+async def generate_session_title(content: str, is_checkpoint: bool = False) -> str:
+    """
+    Generate a concise session title based on summary or checkpoint content.
+    
+    Args:
+        content: Summary or checkpoint content
+        is_checkpoint: Whether this is from a checkpoint (more comprehensive) or summary
+    """
+    context_type = "master summary" if is_checkpoint else "conversation summary"
+    
+    prompt = f"""Based on this {context_type}, create a very concise title (3-7 words max) that captures the main topic:
+
+{content}
+
+Title should be:
+- Clear and specific
+- Professional
+- No quotes or punctuation at the end
+- Maximum 7 words
+
+Title:"""
+    
+    if GEMINI_API_KEY:
+        title = await generate_with_gemini(prompt, max_tokens=50)
+    else:
+        title = await generate_with_ollama(prompt, max_tokens=50)
+    
+    # Clean up the title
+    title = title.strip().strip('"').strip("'").strip()
+    
+    # Truncate if too long
+    words = title.split()
+    if len(words) > 7:
+        title = " ".join(words[:7]) + "..."
+    
+    return title
+
+
+async def check_and_create_memory_artifacts(session_id: uuid.UUID, db) -> None:
+    """
+    Implement 3-3 memory mechanism:
+    - Create SUMMARY every 3 message pairs (6 messages)
+    - Create CHECKPOINT every 3 summaries
+    - Update session title on SUMMARY/CHECKPOINT creation
+    """
+    
+    # Count normal messages since last summary
+    last_summary = db.query(ChatEvent).filter(
+        ChatEvent.session_id == session_id,
+        ChatEvent.event_type.in_([EventType.SUMMARY, EventType.CHECKPOINT])
+    ).order_by(ChatEvent.sequence_num.desc()).first()
+    
+    messages_query = db.query(ChatEvent).filter(
+        ChatEvent.session_id == session_id,
+        ChatEvent.event_type == EventType.NORMAL
+    )
+    
+    if last_summary:
+        messages_query = messages_query.filter(
+            ChatEvent.sequence_num > last_summary.sequence_num
+        )
+    
+    recent_messages = messages_query.order_by(ChatEvent.sequence_num).all()
+    
+    # Check if we need to create a SUMMARY (every 6 normal messages)
+    if len(recent_messages) >= 6 and len(recent_messages) % 6 == 0:
+        logger.info(f"Creating SUMMARY for session {session_id}")
+        
+        # Take the last 6 messages for summary
+        messages_to_summarize = recent_messages[-6:]
+        
+        # Generate summary using LLM
+        summary_content = await generate_summary(messages_to_summarize)
+        
+        # Get next sequence number
+        max_seq = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id
+        ).order_by(ChatEvent.sequence_num.desc()).first()
+        next_seq = (max_seq.sequence_num if max_seq else 0) + 1
+        
+        # Create SUMMARY event
+        summary_event = ChatEvent(
+            session_id=session_id,
+            sequence_num=next_seq,
+            role=MessageRole.SYSTEM,
+            content=summary_content,
+            event_type=EventType.SUMMARY,
+            visibility=Visibility.HIDDEN
+        )
+        db.add(summary_event)
+        db.commit()
+        
+        logger.info(f"SUMMARY created: {summary_content[:100]}...")
+        
+        # Update session title based on summary
+        new_title = await generate_session_title(summary_content, is_checkpoint=False)
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if session:
+            session.title = new_title
+            session.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            logger.info(f"Session title updated to: {new_title}")
+        
+        # Check if we need to create a CHECKPOINT (every 3 summaries)
+        summaries_since_checkpoint = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id,
+            ChatEvent.event_type == EventType.SUMMARY
+        )
+        
+        # Get last checkpoint
+        last_checkpoint = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_id,
+            ChatEvent.event_type == EventType.CHECKPOINT
+        ).order_by(ChatEvent.sequence_num.desc()).first()
+        
+        if last_checkpoint:
+            summaries_since_checkpoint = summaries_since_checkpoint.filter(
+                ChatEvent.sequence_num > last_checkpoint.sequence_num
+            )
+        
+        summaries_list = summaries_since_checkpoint.order_by(ChatEvent.sequence_num).all()
+        
+        if len(summaries_list) >= 3:
+            logger.info(f"Creating CHECKPOINT for session {session_id}")
+            
+            # Take the last 3 summaries
+            summaries_to_aggregate = summaries_list[-3:]
+            
+            # Generate checkpoint using LLM
+            checkpoint_content = await generate_checkpoint(
+                summaries_to_aggregate,
+                old_checkpoint=last_checkpoint
+            )
+            
+            # Get next sequence number
+            max_seq = db.query(ChatEvent).filter(
+                ChatEvent.session_id == session_id
+            ).order_by(ChatEvent.sequence_num.desc()).first()
+            next_seq = (max_seq.sequence_num if max_seq else 0) + 1
+            
+            # Create CHECKPOINT event (append as new row, don't update old one)
+            checkpoint_event = ChatEvent(
+                session_id=session_id,
+                sequence_num=next_seq,
+                role=MessageRole.SYSTEM,
+                content=checkpoint_content,
+                event_type=EventType.CHECKPOINT,
+                visibility=Visibility.HIDDEN
+            )
+            db.add(checkpoint_event)
+            db.commit()
+            
+            logger.info(f"CHECKPOINT created: {checkpoint_content[:100]}...")
+            
+            # Update session title based on checkpoint (more comprehensive)
+            new_title = await generate_session_title(checkpoint_content, is_checkpoint=True)
+            session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+            if session:
+                session.title = new_title
+                session.updated_at = datetime.now(timezone.utc)
+                db.commit()
+                logger.info(f"Session title updated to: {new_title}")
 
 
 async def hybrid_search_and_generate(
@@ -342,21 +619,25 @@ async def hybrid_search_and_generate(
     use_rag: bool = True
 ) -> AsyncGenerator[str, None]:
     """
-    Main RAG pipeline: search → rerank → generate
+    Main RAG pipeline: search → rerank → generate → memory management
     Yields streaming response chunks
     """
     db = SessionLocal()
     
     try:
+        session_uuid = uuid.UUID(session_id)
+        
         # Get next sequence number
-        max_seq = db.query(ChatEvent).filter(
-            ChatEvent.session_id == uuid.UUID(session_id)
-        ).count()
+        max_seq_result = db.query(ChatEvent).filter(
+            ChatEvent.session_id == session_uuid
+        ).order_by(ChatEvent.sequence_num.desc()).first()
+        
+        next_seq = (max_seq_result.sequence_num if max_seq_result else 0) + 1
         
         # Save user message
         user_event = ChatEvent(
-            session_id=uuid.UUID(session_id),
-            sequence_num=max_seq + 1,
+            session_id=session_uuid,
+            sequence_num=next_seq,
             role=MessageRole.USER,
             content=query_text,
             event_type=EventType.NORMAL,
@@ -380,23 +661,23 @@ async def hybrid_search_and_generate(
         # Build prompt
         prompt = build_rag_prompt(query_text, chunks, context)
         
-        # Generate response
+        # Generate response (streaming)
         full_response = ""
         
         # Try Gemini first, fallback to Ollama
         if GEMINI_API_KEY:
-            async for chunk in generate_with_gemini(prompt):
+            async for chunk in generate_with_gemini_streaming(prompt):
                 full_response += chunk
                 yield json.dumps({"type": "content", "content": chunk})
         else:
-            async for chunk in generate_with_ollama(prompt):
+            async for chunk in generate_with_ollama_streaming(prompt):
                 full_response += chunk
                 yield json.dumps({"type": "content", "content": chunk})
         
         # Save assistant response
         assistant_event = ChatEvent(
-            session_id=uuid.UUID(session_id),
-            sequence_num=max_seq + 2,
+            session_id=session_uuid,
+            sequence_num=next_seq + 1,
             role=MessageRole.ASSISTANT,
             content=full_response,
             event_type=EventType.NORMAL,
@@ -407,10 +688,10 @@ async def hybrid_search_and_generate(
         
         # Update session timestamp
         session = db.query(ChatSession).filter(
-            ChatSession.id == uuid.UUID(session_id)
+            ChatSession.id == session_uuid
         ).first()
         if session:
-            session.updated_at = datetime.utcnow()
+            session.updated_at = datetime.now(timezone.utc)
         
         db.commit()
         
@@ -426,25 +707,8 @@ async def hybrid_search_and_generate(
             ]
             yield json.dumps({"type": "sources", "sources": sources})
         
-        # Check if summary needed (every 3 message pairs = 6 messages)
-        message_count = db.query(ChatEvent).filter(
-            ChatEvent.session_id == uuid.UUID(session_id),
-            ChatEvent.event_type == EventType.NORMAL
-        ).count()
-        
-        if message_count % 6 == 0:
-            # Generate summary (simplified - should use LLM)
-            summary = f"Summary: Discussed {query_text[:50]}..."
-            summary_event = ChatEvent(
-                session_id=uuid.UUID(session_id),
-                sequence_num=max_seq + 3,
-                role=MessageRole.SYSTEM,
-                content=summary,
-                event_type=EventType.SUMMARY,
-                visibility=Visibility.HIDDEN
-            )
-            db.add(summary_event)
-            db.commit()
+        # Check and create memory artifacts (SUMMARY/CHECKPOINT) with title updates
+        await check_and_create_memory_artifacts(session_uuid, db)
         
     except Exception as e:
         logger.error(f"RAG pipeline error: {e}", exc_info=True)

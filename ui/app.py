@@ -1,6 +1,11 @@
 """
 Streamlit UI for RAG Financial Assistant
 Provides chat interface, file management, and system monitoring.
+
+FIXES:
+1. Added Reingest button to re-scan api/data folder
+2. Lazy session creation - only create session on first user message
+3. Fixed duplicate session creation when selecting historical chats
 """
 
 import streamlit as st
@@ -266,6 +271,17 @@ def delete_file(file_id: str) -> bool:
         return False
 
 
+def reingest_files() -> Optional[Dict[str, Any]]:
+    """Trigger re-ingestion of all files in api/data folder"""
+    try:
+        response = requests.post(f"{API_URL}/files/reingest", timeout=300)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        st.error(f"Error triggering reingest: {e}")
+    return None
+
+
 # ============================================
 # UI Helper Functions
 # ============================================
@@ -300,6 +316,9 @@ if "chat_history" not in st.session_state:
 if "files_refresh" not in st.session_state:
     st.session_state.files_refresh = 0
 
+if "session_loaded" not in st.session_state:
+    st.session_state.session_loaded = False
+
 
 # ============================================
 # Sidebar
@@ -333,26 +352,30 @@ with st.sidebar:
     if page == "💬 Chat":
         st.subheader("Chat Sessions")
         
+        # New Chat button - reset state for new conversation
         if st.button("➕ New Chat", use_container_width=True):
-            new_session = create_session()
-            if new_session:
-                st.session_state.current_session_id = new_session["id"]
-                st.session_state.chat_history = []
-                st.rerun()
+            st.session_state.current_session_id = None
+            st.session_state.chat_history = []
+            st.session_state.session_loaded = False
+            st.rerun()
         
         sessions = list_sessions()
         
         for session in sessions:
             col1, col2 = st.columns([4, 1])
             with col1:
+                # Load existing session
                 if st.button(
                     f"📝 {session['title'][:20]}...",
                     key=f"session_{session['id']}",
                     use_container_width=True
                 ):
-                    st.session_state.current_session_id = session['id']
-                    st.session_state.chat_history = get_session_history(session['id'])
-                    st.rerun()
+                    # Only load if it's a different session
+                    if st.session_state.current_session_id != session['id']:
+                        st.session_state.current_session_id = session['id']
+                        st.session_state.chat_history = get_session_history(session['id'])
+                        st.session_state.session_loaded = True
+                        st.rerun()
             with col2:
                 if st.button("🗑️", key=f"delete_{session['id']}"):
                     if delete_session(session['id']):
@@ -360,6 +383,7 @@ with st.sidebar:
                         if st.session_state.current_session_id == session['id']:
                             st.session_state.current_session_id = None
                             st.session_state.chat_history = []
+                            st.session_state.session_loaded = False
                         st.rerun()
 
 
@@ -370,84 +394,88 @@ with st.sidebar:
 if page == "💬 Chat":
     st.title("💬 Chat Interface")
     
-    # Create session if none exists
-    if st.session_state.current_session_id is None:
-        new_session = create_session()
-        if new_session:
-            st.session_state.current_session_id = new_session["id"]
-            st.session_state.chat_history = []
+    # Chat settings
+    with st.expander("⚙️ Chat Settings", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            use_rag = st.checkbox("Use RAG (Document Search)", value=True)
+        with col2:
+            top_k = st.slider("Documents to retrieve", 1, 20, 7)
     
-    if st.session_state.current_session_id:
-        # Chat settings
-        with st.expander("⚙️ Chat Settings", expanded=False):
-            col1, col2 = st.columns(2)
-            with col1:
-                use_rag = st.checkbox("Use RAG (Document Search)", value=True)
-            with col2:
-                top_k = st.slider("Documents to retrieve", 1, 20, 7)
-        
-        # Display chat history
-        chat_container = st.container()
-        with chat_container:
-            if not st.session_state.chat_history:
-                st.info("Start a conversation by typing a message below.")
+    # Display chat history
+    chat_container = st.container()
+    with chat_container:
+        if not st.session_state.chat_history:
+            if st.session_state.current_session_id:
+                st.info("Continue this conversation by typing a message below.")
             else:
-                for msg in st.session_state.chat_history:
-                    render_chat_message(msg["role"], msg["content"])
+                st.info("Start a new conversation by typing a message below.")
+        else:
+            for msg in st.session_state.chat_history:
+                render_chat_message(msg["role"], msg["content"])
+    
+    # Chat input
+    st.divider()
+    user_input = st.chat_input("Ask me anything about your documents...")
+    
+    if user_input:
+        # LAZY SESSION CREATION: Only create session on first message
+        if st.session_state.current_session_id is None:
+            new_session = create_session(title="New Chat")
+            if new_session:
+                st.session_state.current_session_id = new_session["id"]
+                st.session_state.chat_history = []
+                st.session_state.session_loaded = True
+            else:
+                st.error("Failed to create chat session")
+                st.stop()
         
-        # Chat input
-        st.divider()
-        user_input = st.chat_input("Ask me anything about your documents...")
+        # Add user message to history
+        st.session_state.chat_history.append({
+            "role": "USER",
+            "content": user_input
+        })
         
-        if user_input:
-            # Add user message to history
+        # Display user message
+        with chat_container:
+            render_chat_message("USER", user_input)
+        
+        # Stream assistant response
+        with chat_container:
+            response_placeholder = st.empty()
+            full_response = ""
+            sources = []
+            
+            for chunk in send_message_streaming(
+                st.session_state.current_session_id,
+                user_input,
+                use_rag,
+                top_k
+            ):
+                if chunk.get("type") == "content":
+                    full_response += chunk.get("content", "")
+                    response_placeholder.markdown(
+                        f'<div class="chat-message assistant-message"><strong>Assistant:</strong><br>{full_response}</div>',
+                        unsafe_allow_html=True
+                    )
+                elif chunk.get("type") == "sources":
+                    sources = chunk.get("sources", [])
+            
+            # Add assistant response to history
             st.session_state.chat_history.append({
-                "role": "USER",
-                "content": user_input
+                "role": "ASSISTANT",
+                "content": full_response
             })
             
-            # Display user message
-            with chat_container:
-                render_chat_message("USER", user_input)
-            
-            # Stream assistant response
-            with chat_container:
-                response_placeholder = st.empty()
-                full_response = ""
-                sources = []
-                
-                for chunk in send_message_streaming(
-                    st.session_state.current_session_id,
-                    user_input,
-                    use_rag,
-                    top_k
-                ):
-                    if chunk.get("type") == "content":
-                        full_response += chunk.get("content", "")
-                        response_placeholder.markdown(
-                            f'<div class="chat-message assistant-message"><strong>Assistant:</strong><br>{full_response}</div>',
-                            unsafe_allow_html=True
-                        )
-                    elif chunk.get("type") == "sources":
-                        sources = chunk.get("sources", [])
-                
-                # Add assistant response to history
-                st.session_state.chat_history.append({
-                    "role": "ASSISTANT",
-                    "content": full_response
-                })
-                
-                # Display sources if available
-                if sources:
-                    sources_html = "<div class='source-citation'><strong>Sources:</strong><br>"
-                    for i, source in enumerate(sources, 1):
-                        sources_html += f"[{i}] File: {source['file_id']}, Page: {source['page_number']}<br>"
-                    sources_html += "</div>"
-                    st.markdown(sources_html, unsafe_allow_html=True)
-            
-            st.rerun()
-    else:
-        st.warning("No active chat session. Click 'New Chat' in the sidebar to start.")
+            # Display sources if available
+            if sources:
+                sources_html = "<div class='source-citation'><strong>Sources:</strong><br>"
+                for i, source in enumerate(sources, 1):
+                    sources_html += f"[{i}] File: {source['file_id']}, Page: {source['page_number']}<br>"
+                sources_html += "</div>"
+                st.markdown(sources_html, unsafe_allow_html=True)
+        
+        st.rerun()
 
 
 elif page == "📁 File Manager":
@@ -470,6 +498,29 @@ elif page == "📁 File Manager":
                     st.session_state.files_refresh += 1
                     time.sleep(1)
                     st.rerun()
+    
+    st.divider()
+    
+    # Reingest button
+    st.subheader("Re-scan Knowledge Base")
+    st.markdown("""
+    Click the button below to re-scan the `api/data/` folder for new files.
+    This will process any files that were manually added to the folder.
+    """)
+    
+    if st.button("🔄 Reingest All Files", type="primary"):
+        with st.spinner("Re-scanning and processing files from api/data/..."):
+            result = reingest_files()
+            if result:
+                st.success(f"✅ {result.get('message', 'Reingest completed')}")
+                if result.get('processed_files'):
+                    st.info(f"Processed {len(result['processed_files'])} files")
+                    with st.expander("View processed files"):
+                        for file_info in result['processed_files']:
+                            st.write(f"- {file_info}")
+                st.session_state.files_refresh += 1
+                time.sleep(2)
+                st.rerun()
     
     st.divider()
     
@@ -609,6 +660,7 @@ elif page == "⚙️ System Info":
     
     **File Management:**
     - `POST /files/upload` - Upload document
+    - `POST /files/reingest` - Re-scan api/data folder
     - `GET /files` - List all files
     - `GET /files/status` - File processing status
     - `GET /files/{id}` - Get file details

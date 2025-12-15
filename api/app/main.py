@@ -8,7 +8,7 @@ import os
 import logging
 from pathlib import Path
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from sqlalchemy import text
 
@@ -527,7 +527,7 @@ async def upload_file(
             filename=file.filename,
             status=FileStatus.PENDING,
             meta_info={
-                "uploaded_at": datetime.utcnow().isoformat(),
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
                 "file_size": len(content)
             }
         )
