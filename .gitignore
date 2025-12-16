@@ -252,7 +252,7 @@ syslog
 *.db-journal
 
 # PostgreSQL
-*.sql
+# *.sql
 *.dump
 pg_dump/
 
