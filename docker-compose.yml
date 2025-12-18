@@ -141,8 +141,8 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/bash", "-c", "\
       ollama serve & \
-      until curl -s http://localhost:11434/api/tags > /dev/null; do sleep 1; done && \
-      ollama list | grep -q 'llama3.2:3b' || ollama pull llama3.2:3b && \
+      sleep 5 && \
+      ollama pull llama3:8b && \
       wait"]
 
   # ============================================

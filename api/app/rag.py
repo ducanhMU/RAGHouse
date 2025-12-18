@@ -297,19 +297,28 @@ def get_conversation_context(session_id: str, max_messages: int = 6) -> str:
         db.close()
 
 
-async def generate_with_gemini(prompt: str, max_tokens: int = 2048) -> str:
-    """Generate response using Gemini API (non-streaming for summaries)"""
+async def generate_with_gemini(prompt: str, max_tokens: int = 2048) -> tuple[str, bool]:
+    """
+    Generate response using Gemini API (non-streaming for summaries)
+    Returns: (response_text, success_flag)
+    """
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         response = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(max_output_tokens=max_tokens)
         )
-        return response.text
+        return response.text, True
                 
     except Exception as e:
+        error_str = str(e)
         logger.error(f"Gemini API error: {e}")
-        return f"[Error generating with Gemini: {str(e)}]"
+        
+        # Check if it's a quota/rate limit error
+        if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
+            logger.warning("Gemini API quota/rate limit exceeded, will fallback to Ollama")
+        
+        return None, False
 
 
 async def generate_with_ollama(prompt: str, max_tokens: int = 2048) -> str:
@@ -317,7 +326,7 @@ async def generate_with_ollama(prompt: str, max_tokens: int = 2048) -> str:
     import httpx
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=200.0) as client:
             response = await client.post(
                 "http://ollama:11434/api/generate",
                 json={
@@ -337,19 +346,29 @@ async def generate_with_ollama(prompt: str, max_tokens: int = 2048) -> str:
         return f"[Error generating with Ollama: {str(e)}]"
 
 
-async def generate_with_gemini_streaming(prompt: str) -> AsyncGenerator[str, None]:
-    """Generate response using Gemini API with streaming"""
+async def generate_with_gemini_streaming(prompt: str) -> AsyncGenerator[tuple[str, bool], None]:
+    """
+    Generate response using Gemini API with streaming
+    Yields: (chunk_text, success_flag)
+    """
     try:
         model = genai.GenerativeModel('gemini-2.0-flash')
         response = model.generate_content(prompt, stream=True)
         
         for chunk in response:
             if chunk.text:
-                yield chunk.text
+                yield chunk.text, True
                 
     except Exception as e:
+        error_str = str(e)
         logger.error(f"Gemini API streaming error: {e}")
-        yield f"[Error: {str(e)}]"
+        
+        # Check if it's a quota/rate limit error
+        if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
+            logger.warning("Gemini API quota/rate limit exceeded, signaling fallback")
+        
+        # Signal failure
+        yield None, False
 
 
 async def generate_with_ollama_streaming(prompt: str) -> AsyncGenerator[str, None]:
@@ -357,7 +376,7 @@ async def generate_with_ollama_streaming(prompt: str) -> AsyncGenerator[str, Non
     import httpx
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=200.0) as client:
             response = await client.post(
                 "http://ollama:11434/api/generate",
                 json={
@@ -382,6 +401,7 @@ async def generate_with_ollama_streaming(prompt: str) -> AsyncGenerator[str, Non
 async def generate_summary(messages: List[ChatEvent]) -> str:
     """
     Generate a concise summary of recent message pairs using LLM.
+    Auto-fallback from Gemini to Ollama on error.
     
     Args:
         messages: List of ChatEvent objects (should be 3 message pairs = 6 messages)
@@ -401,17 +421,25 @@ Summary should capture:
 
 Summary:"""
     
+    summary = None
+    
+    # Try Gemini first if API key is available
     if GEMINI_API_KEY:
-        summary = await generate_with_gemini(prompt, max_tokens=200)
+        summary, success = await generate_with_gemini(prompt, max_tokens=200)
+        if not success or not summary:
+            logger.warning("Gemini failed for summary generation, falling back to Ollama")
+            summary = await generate_with_ollama(prompt, max_tokens=200)
     else:
+        # No API key, use Ollama directly
         summary = await generate_with_ollama(prompt, max_tokens=200)
     
-    return summary.strip()
+    return summary.strip() if summary else "Summary generation failed"
 
 
 async def generate_checkpoint(summaries: List[ChatEvent], old_checkpoint: Optional[ChatEvent] = None) -> str:
     """
     Generate a master checkpoint by aggregating 3 summaries with optional old checkpoint.
+    Auto-fallback from Gemini to Ollama on error.
     
     Args:
         summaries: List of 3 recent SUMMARY events
@@ -439,17 +467,25 @@ Create a comprehensive master summary (3-5 sentences) that:
 
 Master Summary:"""
     
+    checkpoint = None
+    
+    # Try Gemini first if API key is available
     if GEMINI_API_KEY:
-        checkpoint = await generate_with_gemini(prompt, max_tokens=300)
+        checkpoint, success = await generate_with_gemini(prompt, max_tokens=300)
+        if not success or not checkpoint:
+            logger.warning("Gemini failed for checkpoint generation, falling back to Ollama")
+            checkpoint = await generate_with_ollama(prompt, max_tokens=300)
     else:
+        # No API key, use Ollama directly
         checkpoint = await generate_with_ollama(prompt, max_tokens=300)
     
-    return checkpoint.strip()
+    return checkpoint.strip() if checkpoint else "Checkpoint generation failed"
 
 
 async def generate_session_title(content: str, is_checkpoint: bool = False) -> str:
     """
     Generate a concise session title based on summary or checkpoint content.
+    Auto-fallback from Gemini to Ollama on error.
     
     Args:
         content: Summary or checkpoint content
@@ -469,10 +505,20 @@ Title should be:
 
 Title:"""
     
+    title = None
+    
+    # Try Gemini first if API key is available
     if GEMINI_API_KEY:
-        title = await generate_with_gemini(prompt, max_tokens=50)
+        title, success = await generate_with_gemini(prompt, max_tokens=50)
+        if not success or not title:
+            logger.warning("Gemini failed for title generation, falling back to Ollama")
+            title = await generate_with_ollama(prompt, max_tokens=50)
     else:
+        # No API key, use Ollama directly
         title = await generate_with_ollama(prompt, max_tokens=50)
+    
+    if not title:
+        return "Chat Session"
     
     # Clean up the title
     title = title.strip().strip('"').strip("'").strip()
@@ -621,6 +667,7 @@ async def hybrid_search_and_generate(
     """
     Main RAG pipeline: search → rerank → generate → memory management
     Yields streaming response chunks
+    Implements automatic fallback from Gemini to Ollama on API errors
     """
     db = SessionLocal()
     
@@ -661,18 +708,62 @@ async def hybrid_search_and_generate(
         # Build prompt
         prompt = build_rag_prompt(query_text, chunks, context)
         
-        # Generate response (streaming)
+        # Generate response (streaming) with fallback logic
         full_response = ""
+        model_used = "llama3.2:3b"  # Default fallback
+        gemini_failed = False
         
-        # Try Gemini first, fallback to Ollama
+        # Try Gemini first if API key is available
         if GEMINI_API_KEY:
-            async for chunk in generate_with_gemini_streaming(prompt):
-                full_response += chunk
-                yield json.dumps({"type": "content", "content": chunk})
+            logger.info("Attempting to generate response with Gemini API")
+            try:
+                chunk_count = 0
+                async for chunk, success in generate_with_gemini_streaming(prompt):
+                    if not success:
+                        # Gemini failed, need to fallback
+                        logger.warning("Gemini streaming failed, falling back to Ollama")
+                        gemini_failed = True
+                        break
+                    
+                    if chunk:
+                        full_response += chunk
+                        chunk_count += 1
+                        yield json.dumps({"type": "content", "content": chunk})
+                
+                # If we got at least some response, consider it successful
+                if chunk_count > 0 and not gemini_failed:
+                    model_used = "gemini-2.0-flash"
+                    logger.info("Successfully generated response with Gemini")
+                else:
+                    gemini_failed = True
+                    
+            except Exception as e:
+                logger.error(f"Exception during Gemini streaming: {e}")
+                gemini_failed = True
         else:
+            # No API key, use Ollama directly
+            gemini_failed = True
+        
+        # Fallback to Ollama if Gemini failed or no API key
+        if gemini_failed:
+            logger.info("Using Ollama for response generation")
+            # If we already have partial response from Gemini, clear it
+            if full_response:
+                logger.warning("Discarding partial Gemini response, regenerating with Ollama")
+                full_response = ""
+                # Send a signal to clear client-side display
+                yield json.dumps({"type": "clear", "message": "Switching to local model..."})
+            
             async for chunk in generate_with_ollama_streaming(prompt):
                 full_response += chunk
                 yield json.dumps({"type": "content", "content": chunk})
+            
+            model_used = "llama3.2:3b"
+        
+        # Ensure we have some response
+        if not full_response:
+            full_response = "I apologize, but I encountered an error generating a response. Please try again."
+            yield json.dumps({"type": "content", "content": full_response})
         
         # Save assistant response
         assistant_event = ChatEvent(
@@ -682,7 +773,7 @@ async def hybrid_search_and_generate(
             content=full_response,
             event_type=EventType.NORMAL,
             visibility=Visibility.VISIBLE,
-            model_used="gemini-2.0-flash" if GEMINI_API_KEY else "llama3.2:3b"
+            model_used=model_used
         )
         db.add(assistant_event)
         

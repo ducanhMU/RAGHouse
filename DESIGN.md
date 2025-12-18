@@ -28,14 +28,15 @@ graph TD
 
     subgraph "Storage Layer"
         API <-->|State & History| PG[(PostgreSQL)]
-        API <-->|Hybrid Search Dense+Sparse| Milvus[(Milvus 2.4+)]
         Worker -->|Insert Vectors| Milvus
+        API <-->|Hybrid Search Dense+Sparse| Milvus[(Milvus 2.4+)]
+        
     end
 
     subgraph "GPU Computation Layer"
         Worker -->|Generate Dense/Sparse| Embed_Model[BGE-M3 Model]
         API -->|Re-rank| Rerank_Model[BGE-M3 Reranker]
-        API -.->|Fallback Gen| Local_LLM[Llama 3.2 3B]
+        API -.->|Fallback Gen| Local_LLM[Llama 3 8B]
     end
 
     API -->|Primary Gen| Cloud_LLM[Google Gemini API]
@@ -97,7 +98,7 @@ To handle **high embedding load but low fallback LLM usage**, stack allocation p
 | Embedding    | BAAI/bge-m3              | ~1.5 GB | Core of the system. Generates both:<br>1. **Dense Vector** – Semantic search.<br>2. **Sparse Vector** – Keyword search (replaces BM25/FTS). |
 | Primary LLM  | Gemini 2.0 Flash         | API     | High speed, large context.                                                                                                                  |
 | Reranker     | BAAAI/bge-reranker-v2-m3 | ~1.5 GB | Fully compatible with BGE-M3 embeddings.                                                                                                    |
-| Fallback LLM | Llama 3.2:3b             | ~2.5 GB | Offline backup (Ollama).                                                                                                                    |
+| Fallback LLM | Llama 3:8b             | ~5 GB | Offline backup (Ollama).                                                                                                                    |
 
 **Enhancements:**
 
