@@ -799,7 +799,7 @@ sequenceDiagram
     participant API as FastAPI RAG Engine
     participant PG as PostgreSQL
     participant MV as Milvus
-    participant OL as Ollama LLM
+    participant OL as LLM
 
     UI->>API: POST /sessions/{id}/message
     API->>PG: Insert user message event

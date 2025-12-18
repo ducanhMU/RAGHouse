@@ -139,7 +139,11 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    command: serve
+    entrypoint: ["/bin/bash", "-c", "\
+      ollama serve & \
+      until curl -s http://localhost:11434/api/tags > /dev/null; do sleep 1; done && \
+      ollama list | grep -q 'llama3.2:3b' || ollama pull llama3.2:3b && \
+      wait"]
 
   # ============================================
   # FastAPI Backend (RAG Engine)
