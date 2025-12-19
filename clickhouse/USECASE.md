@@ -1,779 +1,820 @@
-# 📌 ENRICHED FINANCIAL ANALYSIS RAG USE CASE SPEC
+# 📌 FINAL REFINED FINANCIAL ANALYSIS RAG USE CASE SPEC
 
-Tài liệu này mô tả thiết kế các use case cho hệ thống RAG (Retrieval-Augmented Generation) và data pipeline hỗ trợ hỏi đáp phân tích tài chính doanh nghiệp. Hệ thống kết hợp dữ liệu OLAP (từ các mart như mart_master_analysis, fact_daily_market, fact_macro_timeseries), thuật toán tính toán KPI, và generation narrative dựa trên RAG để cung cấp insight sâu sắc, bao gồm tóm tắt, so sánh, định giá, và phân tích rủi ro. Các use case được phân loại theo persona người dùng (Analyst, Trader/Investor, CEO/CFO/Manager, General User), với tích hợp các mở rộng để hỗ trợ phân tích nâng cao như horizontal/vertical analysis, what-if scenarios, và narrative MD&A-style.
-
-Hệ thống không chỉ trả về dữ liệu thô mà còn diễn giải biến động KPI trong bối cảnh kinh tế/doanh nghiệp, tránh tư vấn tài chính pháp lý, và tập trung vào dữ liệu khách quan. Các prompt RAG được thiết kế để kết hợp retrieval từ OLAP với generation tự nhiên.
+Tài liệu này mô tả chi tiết thiết kế các use case cho hệ thống RAG (Retrieval-Augmented Generation) hỗ trợ phân tích tài chính doanh nghiệp. Hệ thống kết hợp dữ liệu OLAP từ ClickHouse (các bảng như `dim_company, dim_period, fact_income_statement, fact_balance_sheet, fact_cash_flow, fact_daily_market, dim_macro_indicator, fact_macro_timeseries, mart_master_analysis`, và các bảng bổ sung như `bond_data, forecast_table, budget_table`), thuật toán tính toán KPI (pre-calculated trong `mart_master_analysis` qua materialized view `mv_master_analysis`, hoặc on-fly qua `code_execution`), và generation narrative dựa trên RAG. Các use case được phân loại theo persona người dùng (`Analyst, Trader/Investor, CEO/CFO/Manager, General User`), với chi tiết input/output, logic tính toán dựa trên tables, edge cases, và RAG prompt. Hệ thống tránh tư vấn pháp lý, tập trung dữ liệu khách quan.
 
 ## 📊 Glossary (Chỉ số KPI)
-| KPI | Công thức | Mô tả |
-|-----|-----------|-------|
-| PE TTM | price / (eps*4) | Định giá dựa trên lợi nhuận trailing twelve months. |
-| PB | price / bvps | Định giá dựa trên giá trị sổ sách. |
-| ROE | NI*4 / equity*100 | Hiệu quả sinh lời trên vốn chủ sở hữu. |
-| FCF Yield | FCF*4 / market_cap*100 | Lợi suất dòng tiền tự do. |
-| Volatility | STDDEV(close) | Độ biến động giá cổ phiếu. |
-| ROA TTM | NI*4 / total_assets*100 | Hiệu quả sinh lời trên tài sản. |
-| ROIC | NOPAT / invested_capital | Hiệu quả sinh lời trên vốn đầu tư. |
-| EV/EBITDA | (market_cap + debt - cash) / EBITDA | Định giá doanh nghiệp. |
-| Dividend Yield | dividends / price * 100 | Lợi suất cổ tức. |
-| Growth YoY | (current - previous) / previous * 100 | Tăng trưởng năm trên năm. |
-| CFO/Revenue | Cash from Operations / Revenue | Chất lượng dòng tiền hoạt động. |
-| Accrual Ratio | (NI - CFO) / total_assets | Chất lượng lợi nhuận (thấp hơn tốt hơn). |
-| Current Ratio | Current Assets / Current Liabilities | Khả năng thanh toán ngắn hạn. |
-| D/E | Debt / Equity | Rủi ro nợ. |
-| Cash Conversion Cycle | DIO + DSO - DPO | Hiệu quả vốn lưu động (Days Inventory Outstanding + Days Sales Outstanding - Days Payable Outstanding). |
-| Altman Z-Score | 1.2*(WC/TA) + 1.4*(RE/TA) + 3.3*(EBIT/TA) + 0.6*(MV/BV) + 1.0*(Sales/TA) | Dự báo rủi ro phá sản. |
-| RSI | 100 - (100 / (1 + RS)), RS = Avg Gain / Avg Loss | Chỉ báo kỹ thuật quá mua/quá bán. |
-| MACD | EMA12 - EMA26 | Chỉ báo xu hướng động lượng. |
+| KPI | Công thức | Mô tả | Database Link & Logic |
+|-----|-----------|-------|-----------------------|
+| PE TTM | price / (eps*4) | Định giá dựa trên lợi nhuận trailing twelve months. | mart_master_analysis.pe_ttm; Logic: Join fact_daily_market.close và fact_income_statement.eps, sum 4 quarters cho TTM nếu cần. |
+| PB | price / bvps | Định giá dựa trên giá trị sổ sách. | mart_master_analysis.pb; Logic: fact_daily_market.close / fact_balance_sheet.bvps. |
+| ROE | NI*4 / equity*100 | Hiệu quả sinh lời trên vốn chủ sở hữu. | mart_master_analysis.roe_ttm; Logic: fact_income_statement.net_income *4 / fact_balance_sheet.total_equity. |
+| FCF Yield | FCF*4 / market_cap*100 | Lợi suất dòng tiền tự do. | mart_master_analysis.fcf_yield; Logic: fact_cash_flow.fcf *4 / fact_daily_market.market_cap. |
+| Volatility | STDDEV(close) | Độ biến động giá cổ phiếu. | On-fly từ fact_daily_market.close; Logic: STDDEV over window (e.g., 30 days). |
+| ROA TTM | NI*4 / total_assets*100 | Hiệu quả sinh lời trên tài sản. | mart_master_analysis.roa_ttm; Logic: fact_income_statement.net_income *4 / fact_balance_sheet.total_assets. |
+| ROIC | NOPAT / invested_capital | Hiệu quả sinh lời trên vốn đầu tư. | mart_master_analysis.roic; Logic: (fact_income_statement.operating_profit * (1 - tax_rate)) / (fact_balance_sheet.total_assets - total_current_liab). |
+| EV/EBITDA | (market_cap + debt - cash) / EBITDA | Định giá doanh nghiệp. | mart_master_analysis.ev_ebitda; Logic: (fact_daily_market.market_cap + fact_balance_sheet.short_term_debt + long_term_debt - cash) / fact_income_statement.ebitda. |
+| Dividend Yield | dividends / price * 100 | Lợi suất cổ tức. | mart_master_analysis.dividend_yield; Logic: fact_cash_flow.dividends_paid / fact_daily_market.close *100. |
+| Growth YoY | (current - previous) / previous * 100 | Tăng trưởng năm trên năm. | mart_master_analysis.revenue_growth_yoy etc.; Logic: LAG(revenue) over ORDER BY year, quarter từ mart_master_analysis. |
+| CFO/Revenue | Cash from Operations / Revenue | Chất lượng dòng tiền hoạt động. | mart_master_analysis.cfo_to_revenue; Logic: fact_cash_flow.cfo / fact_income_statement.revenue. |
+| Accrual Ratio | (NI - CFO) / total_assets | Chất lượng lợi nhuận. | mart_master_analysis.accrual_ratio; Logic: (fact_income_statement.net_income - fact_cash_flow.cfo) / fact_balance_sheet.total_assets. |
+| Current Ratio | Current Assets / Current Liabilities | Khả năng thanh toán ngắn hạn. | mart_master_analysis.current_ratio; Logic: fact_balance_sheet.total_current_assets / total_current_liab. |
+| D/E | Debt / Equity | Rủi ro nợ. | mart_master_analysis.debt_to_equity; Logic: (fact_balance_sheet.short_term_debt + long_term_debt) / total_equity. |
+| Cash Conversion Cycle | DIO + DSO - DPO | Hiệu quả vốn lưu động. | mart_master_analysis.cash_conversion_cycle; Logic: mart_master_analysis.days_inventory + days_sales - days_payables. |
+| Altman Z-Score | 1.2*(WC/TA) + 1.4*(RE/TA) + 3.3*(EBIT/TA) + 0.6*(MV/BV) + 1.0*(Sales/TA) | Dự báo rủi ro phá sản. | mart_master_analysis.altman_z_score; Logic: Tính từ fact_balance_sheet (WC=total_current_assets - liab, RE=retained_earnings, TA=total_assets) + fact_income_statement (EBIT, Sales=revenue) + fact_daily_market (MV=market_cap, BV=total_equity). |
+| RSI | 100 - (100 / (1 + RS)), RS = Avg Gain / Avg Loss | Chỉ báo kỹ thuật. | On-fly code_execution từ fact_daily_market.close (over 14 days). |
+| MACD | EMA12 - EMA26 | Chỉ báo động lượng. | On-fly code_execution (numpy.ema) từ fact_daily_market.close. |
+| YTM | Solve NPV=0 for r | Lợi suất đến hạn trái phiếu. | On-fly code_execution (scipy.optimize) từ bond_data (cash_flows Array, coupon_rate, maturity_date). |
+| IRR | Rate where NPV=0 | Tỷ suất hoàn vốn nội bộ. | On-fly code_execution (numpy.irr) từ bond_data cash_flows. |
+| NPV | Sum(CF_t / (1+r)^t) - Initial | Giá trị hiện tại ròng. | On-fly code_execution (numpy.npv) từ bond_data. |
+| Kd | Interest Expense / Total Debt * (1 - Tax Rate) | Chi phí nợ. | On-fly từ fact_income_statement.interest_expense / (fact_balance_sheet.short_term_debt + long_term_debt) * (1 - tax từ extra_items hoặc default 0.2). |
+| Ke | Rf + Beta * (Rm - Rf) | Chi phí vốn chủ. | On-fly từ fact_macro_timeseries (Rf=SBV_RATE, Rm=market return), mart_master_analysis.beta. |
+| WACC | (E/V * Ke) + (D/V * Kd * (1 - Tax)) | Chi phí vốn trung bình. | On-fly từ Kd, Ke, fact_balance_sheet (E=total_equity, D=debt, V=E+D). |
+| Interest Coverage | EBIT / Interest Expense | Khả năng trả lãi. | mart_master_analysis.interest_coverage; Logic: fact_income_statement.ebit / interest_expense. |
+| Short-Term Debt Ratio | Short-Term Debt / Total Debt | Tỷ trọng nợ ngắn hạn. | On-fly fact_balance_sheet.short_term_debt / (short_term_debt + long_term_debt). |
+| Long-Term Debt Ratio | Long-Term Debt / Total Debt | Tỷ trọng nợ dài hạn. | Tương tự trên. |
+| Beneish M-Score | Complex (DSRI + GMI + AQI + SGI + DEPI + SGAI + TATA + LVGI) | Phát hiện gian lận. | On-fly code_execution từ mart_master_analysis (tăng trưởng assets, margins, etc.). |
+
+**Cash Flow Phân loại:** CFO (fact_cash_flow.cfo), CFI (cfi), CFF (cff); Logic: Phân tích sign (dương/âm) và tỷ trọng.
 
 ## ===========================
 ## A. Người phân tích / Chuyên gia tài chính (Analyst)
 ## ===========================
-Các use case tập trung vào phân tích sâu, sử dụng OLAP để tổng hợp KPI, trend, và insight narrative. Bao gồm các kỹ thuật căn bản như horizontal/vertical analysis, DuPont, và MD&A-style generation.
+### **Use Case A1 — Tóm tắt tình hình tài chính doanh nghiệp**
+**Mục tiêu nghiệp vụ:** Cung cấp dashboard summary toàn diện về IS/BS/CF/market, với narrative. Edge: Kỳ không tồn tại → fallback latest; multi-ticker → aggregate.
 
-### **Use Case 1 — Tóm tắt tình hình tài chính doanh nghiệp**
-**Mục tiêu nghiệp vụ**  
-Cung cấp summary dashboard toàn diện về tình hình tài chính hiện tại của một công ty theo kỳ, kết hợp số liệu IS/BS/CF & market.  
+**Input:** Ticker (dim_company.symbol, e.g., 'VCB'), Kỳ (dim_period: year=2024, quarter=4, period_type='Q'/'YTD'/'TTM'/'Y').
 
-**Input**  
-Ticker (ví dụ: VCB), Kỳ tài chính (Q4-2024, YTD, TTM).  
+**Output:** Bảng Markdown/JSON: revenue (fact_income_statement), net_income, eps, roe_ttm (mart_master_analysis), roa_ttm, cfo_to_revenue, gross_margin, market_cap_b (mart_master_analysis); CFO/CFI/CFF (fact_cash_flow); short/long debt ratio; narrative (e.g., "Revenue tăng, debt cao rủi ro").
 
-**Output**  
-Bảng chỉ số tóm tắt: revenue, net income, EPS, ROE ttm, ROA ttm, cash flow chất lượng, margin, market cap.  
+**OLAP/Data Source:** mart_master_analysis (core KPIs), join dim_period cho filter, fact_daily_market cho price update, fact_cash_flow cho phân loại, fact_balance_sheet cho debt.
 
-**Data OLAP**  
-mart_master_analysis (core KPIs), fact_daily_market (giá & volume).  
+**Logic/Tính Toán:** Pre-calc từ mart; TTM: SUM(revenue) over last 4 quarters (WINDOW function in SQL); Debt ratios: short_term_debt / total_debt. Edge: Null → 0 hoặc note; code_execution nếu sum custom.
 
-**Thuật toán/Tính toán**  
-Tổng hợp KPI từ mart_master_analysis, lấy giá và volume gần nhất.  
-
-**Example queries**  
+**Example SQL:** 
 ```sql
-SELECT * FROM mart_master_analysis WHERE symbol='VCB' AND year=2024 AND quarter=4;
-```  
+SELECT revenue, net_income, eps, roe_ttm, roa_ttm, cfo_to_revenue, gross_margin, market_cap_b, 
+c.cfo, c.cfi, c.cff, b.short_term_debt / (b.short_term_debt + b.long_term_debt) AS short_ratio
+FROM mart_master_analysis m 
+JOIN fact_cash_flow c ON m.symbol=c.symbol AND m.report_date=c.report_date
+JOIN fact_balance_sheet b ON m.symbol=b.symbol AND m.report_date=b.report_date
+WHERE m.symbol='VCB' AND m.year=2024 AND m.quarter=4;
+-- TTM: SUM over subtractQuarters(now(),4).
+```
+**RAG Prompt:** “Tóm tắt tình hình tài chính VCB Q4-2024, bao gồm KPIs, cash flow phân loại, cấu trúc nợ.”
 
-**Example RAG Prompt**  
-> “Tóm tắt tình hình tài chính VCB đến Q4 2024 với các chỉ số chính.”
+### **Use Case A2 — So sánh chỉ số tài chính giữa các kỳ**
+**Mục tiêu nghiệp vụ:** Trend YoY/QoQ, detect anomalies (>20% change). Edge: Missing periods → interpolate/note; custom type (YoY/QoQ).
 
-### **Use Case 2 — So sánh chỉ số tài chính giữa các kỳ**
-**Mục tiêu nghiệp vụ**  
-Trend analysis: phân tích tăng/giảm YoY/TTM, pattern thay đổi across các chỉ số quan trọng.  
+**Input:** Ticker, List periods (array dim_period: e.g., [(2023,3),(2023,4),(2024,1)]), Comparison_type ('YoY'/'QoQ').
 
-**Input**  
-Ticker, list periods (ví dụ Q3-2023, Q4-2023, Q1-2024, Q2-2024).  
+**Output:** Bảng: period_label (year-Qquarter), revenue, growth_yoy (%), net_margin; chart data JSON; alerts (spike/drop); narrative.
 
-**Output**  
-Growth % cho revenue, net_income, eps, margin.  
+**OLAP/Data Source:** mart_master_analysis (growth pre-calc), join dim_period.
 
-**OLAP**  
-mart_master_analysis.  
+**Logic/Tính Toán:** Growth = (cur - LAG(value)) / LAG(value) *100; Anomaly: WHERE abs(growth)>20. Edge: Previous null → 0%.
 
-**Công thức**  
-growth_yoy = (current - previous) / previous * 100.  
-
-**Example**  
+**Example SQL:** 
 ```sql
-SELECT period_label, revenue_growth_yoy, net_margin FROM mart_master_analysis WHERE symbol='HPG' ORDER BY year, quarter;
-```  
+SELECT year || '-Q' || quarter AS label, revenue, revenue_growth_yoy, net_margin
+FROM mart_master_analysis WHERE symbol='HPG' AND (year,quarter) IN ((2023,3),(2023,4),(2024,1),(2024,2)) ORDER BY year,quarter;
+-- QoQ: LAG over sequential quarters.
+```
+**RAG Prompt:** “So sánh doanh thu, biên lợi nhuận HPG qua 4 quý gần nhất, detect bất thường.”
 
-**Example RAG Prompt**  
-> “So sánh doanh thu và biên lợi nhuận của HPG qua 4 quý gần nhất.”
+### **Use Case A3 — Phân tích hiệu quả hoạt động**
+**Mục tiêu nghiệp vụ:** ROE/ROA/ROIC với drivers (DuPont). Edge: Negative → inefficiency alert.
 
-### **Use Case 3 — Phân tích hiệu quả hoạt động**
-**Mục tiêu nghiệp vụ**  
-Đánh giá hiệu quả sinh lời (ROE, ROA, ROIC), nhận diện điểm mạnh/điểm yếu hoạt động.  
+**Input:** Ticker, Period (dim_period: year=2024, quarter=0 for yearly).
 
-**Input**  
-Ticker, target period.  
+**Output:** roe_ttm, roa_ttm, roic; breakdown (net_margin * asset_turnover * equity_multiplier); narrative drivers.
 
-**Output**  
-Giá trị ROE_ttm, ROA_ttm, ROIC + phân tích yếu tố driver.  
+**OLAP/Data Source:** mart_master_analysis (dupont_roe pre-calc).
 
-**OLAP**  
-mart_master_analysis.  
+**Logic/Tính Toán:** ROE = net_margin * asset_turnover * equity_multiplier từ mart.
 
-**Example**  
+**Example SQL:** 
 ```sql
-SELECT roe_ttm, roa_ttm, roic FROM mart_master_analysis WHERE symbol='VCB' AND year=2024 AND quarter=4;
-```  
+SELECT roe_ttm, roa_ttm, roic, dupont_roe, net_margin, asset_turnover, equity_multiplier
+FROM mart_master_analysis WHERE symbol='VCB' AND year=2024 AND quarter=0;
+```
+**RAG Prompt:** “Phân tích ROE, ROA, ROIC VCB 2024 với DuPont.”
 
-**Example RAG Prompt**  
-> “Phân tích hiệu quả hoạt động của VCB dựa trên ROE, ROA và ROIC trong năm 2024.”
+### **Use Case A4 — Định giá doanh nghiệp (Valuation)**
+**Mục tiêu nghiệp vụ:** Multiples vs benchmark, WACC cho DCF. Edge: No peers → market avg.
 
-### **Use Case 4 — Định giá doanh nghiệp (Valuation)**
-**Mục tiêu nghiệp vụ**  
-Giá trị định giá: PE, PB, EV/EBITDA, dividend yield; so sánh với mức industry benchmark.  
+**Input:** Ticker, Sector (dim_company.sector), Period.
 
-**Input**  
-Ticker & peer_sector, Period.  
+**Output:** pe_ttm, pb, ev_ebitda, wacc; deviation vs sector median (%); narrative (undervalued if < median).
 
-**Output**  
-Valuation multiples, deviation +/- so với trung vị ngành.  
+**OLAP/Data Source:** mart_master_analysis, aggregate GROUP BY sector từ dim_company.
 
-**OLAP**  
-mart_master_analysis, xây thêm bảng sector benchmark.  
+**Logic/Tính Toán:** Deviation = (company - median) / median *100; WACC on-fly (Kd from interest_expense / debt, Ke CAPM từ beta + macro Rf).
 
-**Công thức**  
-pe_ttm = price / (eps*4), pb = price / bvps.  
-
-**Example**  
+**Example SQL:** 
 ```sql
-SELECT pe_ttm, pb, ev_ebitda FROM mart_master_analysis WHERE symbol='HPG';
-```  
+WITH sector_med AS (SELECT median(pe_ttm) AS med_pe FROM mart_master_analysis JOIN dim_company ON symbol=symbol WHERE sector='Steel' AND year=2024)
+SELECT m.pe_ttm, m.pb, m.ev_ebitda, (b.total_equity / (total_equity + debt) * ke) + (debt / v * kd * (1-0.2)) AS wacc, (m.pe_ttm - s.med_pe)/s.med_pe*100 AS dev
+FROM mart_master_analysis m JOIN fact_balance_sheet b ON ... CROSS JOIN sector_med s WHERE m.symbol='HPG' AND m.year=2024;
+-- Ke: fact_macro_timeseries.value (Rf) + m.beta * (Rm - Rf).
+```
+**RAG Prompt:** “Định giá HPG so trung vị ngành thép, dùng WACC từ Kd/Ke.”
 
-**RAG Prompt**  
-> “Định giá HPG hiện tại so với trung vị ngành thép.”
+### **Use Case A5 — Benchmark so với ngành/sector**
+**Mục tiêu nghiệp vụ:** KPI vs sector avg/median, rank. Edge: Multi-KPI custom.
 
-### **Use Case 5 — Benchmark so với ngành/sector**
-**Mục tiêu nghiệp vụ**  
-So sánh KPI của một công ty với trung vị ngành/framework peer, đánh giá strengths/weaknesses.  
+**Input:** Ticker, Sector, Period.
 
-**Input**  
-Ticker, sector, Period.  
+**Output:** Bảng: company_value, sector_avg, deviation (%); rank (1/N); narrative strengths/weaknesses.
 
-**Output**  
-Sector average PE/PB/ROE/Growth.  
+**OLAP/Data Source:** mart_master_analysis GROUP BY dim_company.sector.
 
-**OLAP**  
-mart_master_analysis aggregated by sector.  
+**Logic/Tính Toán:** Avg/median per sector; Rank: ROW_NUMBER() over ORDER BY pe_ttm ASC.
 
-**SQL pattern**  
+**Example SQL:** 
 ```sql
-SELECT avg(pe_ttm) as avg_pe, avg(roe_ttm) as avg_roe FROM mart_master_analysis WHERE sector='Banking';
-```  
+WITH sector_stats AS (SELECT avg(pe_ttm) AS avg_pe, avg(roe_ttm) AS avg_roe FROM mart_master_analysis JOIN dim_company ON ... WHERE sector='Banking' AND year=2024)
+SELECT m.pe_ttm, s.avg_pe, (m.pe_ttm - s.avg_pe)/s.avg_pe*100 AS dev FROM mart_master_analysis m CROSS JOIN sector_stats s WHERE m.symbol='VCB';
+-- Rank: SELECT symbol, pe_ttm, ROW_NUMBER() OVER (PARTITION BY sector ORDER BY pe_ttm) AS rank FROM ...
+```
+**RAG Prompt:** “Benchmark ROE, PE VCB so ngân hàng cùng ngành.”
 
-**RAG Prompt**  
-> “Benchmark ROE và PE của VCB so với các ngân hàng cùng ngành.”
+### **Use Case A6 — Phân tích dòng tiền & chất lượng lợi nhuận**
+**Mục tiêu nghiệp vụ:** Quality metrics, CFO/CFI/CFF breakdown, lãi suất nợ. Edge: Negative flow → alert.
 
-### **Use Case 6 — Phân tích dòng tiền & chất lượng lợi nhuận**
-**Mục tiêu nghiệp vụ**  
-Đánh giá cash flow quality, FCF yield, CFO/Revenue, accrual ratio.  
+**Input:** Ticker, Period.
 
-**Input**  
-Ticker, period.  
+**Output:** cfo_to_revenue, fcf_yield, accrual_ratio; CFO/CFI/CFF values & %; interest_coverage; narrative.
 
-**Output**  
-CFO/Revenue, FCF/Revenue, accrual ratios.  
+**OLAP/Data Source:** mart_master_analysis + fact_cash_flow.
 
-**OLAP**  
-mart_master_analysis.  
+**Logic/Tính Toán:** % = cfo / (cfo + cfi + cff) *100; Kd on-fly.
 
-**RAG Prompt**  
-> “Phân tích dòng tiền và chất lượng lợi nhuận của VCB trong 2024.”
-
-### **Use Case A16 — Phân tích hoạt động theo phương pháp ngang (Horizontal Analysis)**
-**Mục tiêu nghiệp vụ**  
-So sánh các chỉ tiêu tài chính qua nhiều kỳ để xác định trend & bất thường.  
-
-**Input**  
-Ticker, multi-periods (ví dụ: Q1-2023 to Q4-2024).  
-
-**Output**  
-Biểu đồ biến động và % thay đổi YoY cho revenue, expenses, NI; nhận diện bất thường (e.g., spike/drop >20%).  
-
-**OLAP**  
-mart_master_analysis theo multi-period và biểu đồ biến động.  
-
-**Công thức**  
-% change = (current - base) / base * 100 (base là kỳ đầu tiên).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT year, quarter, revenue, (revenue - LAG(revenue) OVER (ORDER BY year, quarter)) / LAG(revenue) OVER (ORDER BY year, quarter) * 100 AS revenue_change FROM mart_master_analysis WHERE symbol='VCB';
-```  
+SELECT cfo_to_revenue, fcf_yield, accrual_ratio, c.cfo, c.cfi, c.cff, interest_coverage
+FROM mart_master_analysis m JOIN fact_cash_flow c ON m.symbol=c.symbol AND m.report_date=c.report_date WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “Phân tích dòng tiền CFO/CFI/CFF, chất lượng lợi nhuận VCB 2024, bao lãi suất nợ.”
 
-**RAG Prompt**  
-> “Phân tích horizontal analysis cho IS của VCB từ 2023 đến 2024.”
+### **Use Case A7 — Phân tích hoạt động theo phương pháp ngang (Horizontal Analysis)**
+**Mục tiêu nghiệp vụ:** % change over periods, anomalies. Edge: Base missing → earliest.
 
-### **Use Case A17 — Phân tích cơ cấu (Vertical/Common-Size)**
-**Mục tiêu nghiệp vụ**  
-Phân tích tỉ trọng các khoản mục IS/BS trong cùng một kỳ.  
+**Input:** Ticker, Multi-periods (array dim_period).
 
-**Input**  
-Ticker, period.  
+**Output:** Bảng: period, revenue, %change (YoY), expenses, %change; alerts (>20%); narrative.
 
-**Output**  
-% từng line item so với tổng (e.g., COGS/revenue, assets/liabilities).  
+**OLAP/Data Source:** mart_master_analysis with LAG.
 
-**OLAP**  
-Thống kê % từng line item so với tổng (common-size IS/BS) từ mart_master_analysis.  
+**Logic/Tính Toán:** %change = (cur - lag) / lag *100; Anomaly filter abs>20.
 
-**Công thức**  
-% = item / total * 100.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT item_name, (value / total_revenue) * 100 AS percentage FROM mart_master_analysis WHERE symbol='HPG' AND period='Q4-2024' AND report_type='IS';
-```  
+SELECT year, quarter, revenue, (revenue - LAG(revenue) OVER (PARTITION BY symbol ORDER BY year,quarter)) / LAG(revenue)*100 AS change
+FROM mart_master_analysis WHERE symbol='VCB' AND year BETWEEN 2023 AND 2024;
+```
+**RAG Prompt:** “Horizontal analysis IS VCB 2023-2024.”
 
-**RAG Prompt**  
-> “Phân tích vertical analysis cho BS của HPG trong Q4 2024.”
+### **Use Case A8 — Phân tích cơ cấu (Vertical/Common-Size)**
+**Mục tiêu nghiệp vụ:** % cấu trúc trong kỳ. Edge: Total=0 → null.
 
-### **Use Case A18 — Phân tích khả năng thanh toán & rủi ro nợ**
-**Mục tiêu nghiệp vụ**  
-Đánh giá năng lực trả nợ ngắn hạn/dài hạn.  
+**Input:** Ticker, Period, Report_type ('IS'/'BS').
 
-**Input**  
-Ticker, period.  
+**Output:** Bảng: item, value, % (e.g., cogs/revenue).
 
-**Output**  
-D/E, current ratio, cash ratio; insight về rủi ro (e.g., nếu D/E >2 thì cao rủi ro).  
+**OLAP/Data Source:** fact_income_statement or fact_balance_sheet.
 
-**OLAP**  
-D/E, current ratio, cash ratio từ mart_master_analysis.  
+**Logic/Tính Toán:** % = item / total *100 (e.g., revenue=100%, cogs/cogs*100).
 
-**Công thức**  
-Current Ratio = Current Assets / Current Liabilities.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT debt_to_equity, current_ratio FROM mart_master_analysis WHERE symbol='VCB' AND year=2024;
-```  
+SELECT 'revenue' AS item, revenue, 100 AS pct UNION SELECT 'cogs', cogs, cogs/revenue*100 FROM fact_income_statement WHERE symbol='HPG' AND year=2024 AND quarter=4;
+```
+**RAG Prompt:** “Vertical analysis BS HPG Q4-2024.”
 
-**RAG Prompt**  
-> “Đánh giá rủi ro nợ và khả năng thanh toán của VCB năm 2024.”
+### **Use Case A9 — Phân tích khả năng thanh toán & rủi ro nợ**
+**Mục tiêu nghiệp vụ:** Ratios, alerts (D/E>2 high). Edge: Overdraft từ extra_items Map.
 
-### **Use Case A19 — Xác định Break-Even / Điểm hòa vốn**
-**Mục tiêu nghiệp vụ**  
-Tính điểm doanh thu tối thiểu để hòa vốn.  
+**Input:** Ticker, Period.
 
-**Input**  
-Ticker, period; chi phí cố định/biến đổi (từ OLAP hoặc external).  
+**Output:** d/e, current_ratio, interest_coverage, kd, short/long ratio; narrative risk.
 
-**Output**  
-Break-even revenue = fixed_costs / (1 - variable_costs/revenue).  
+**OLAP/Data Source:** mart_master_analysis + fact_balance_sheet.
 
-**OLAP**  
-Dữ liệu chi phí cố định/biến đổi từ mart_master_analysis hoặc external nhập.  
+**Logic/Tính Toán:** Kd = interest_expense / total_debt * (1-tax); Ratios pre-calc.
 
-**Công thức**  
-Break-even = Fixed Costs / Contribution Margin Ratio.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT fixed_costs / (1 - variable_costs / revenue) AS break_even FROM mart_master_analysis WHERE symbol='HPG';
-```  
+SELECT debt_to_equity, current_ratio, interest_coverage, (i.interest_expense / (b.short_term_debt + b.long_term_debt)) * (1 - 0.2) AS kd
+FROM mart_master_analysis m JOIN fact_income_statement i ON ... JOIN fact_balance_sheet b ON ... WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “Đánh giá rủi ro nợ, thanh toán VCB 2024, bao Kd, overdraft.”
 
-**RAG Prompt**  
-> “Điểm hòa vốn của HPG trong Q4 2024 là bao nhiêu?”
+### **Use Case A10 — Xác định Break-Even / Điểm hòa vốn**
+**Mục tiêu nghiệp vụ:** Revenue hòa vốn, sensitivity. Edge: Costs estimate nếu missing.
 
-### **Use Case A20 — Tạo báo cáo MD&A-style tự động**
-**Mục tiêu nghiệp vụ**  
-Giải thích narrative & lý do đằng sau biến động KPI.  
+**Input:** Ticker, Period; fixed/variable costs (input hoặc estimate từ OLAP).
 
-**Input**  
-Ticker, period.  
+**Output:** break_even = fixed / (1 - variable/revenue); sensitivity (+10% costs).
 
-**Output**  
-Narrative text (e.g., "Revenue tăng 15% do mở rộng thị trường, nhưng margin giảm vì chi phí nguyên liệu cao.").  
+**OLAP/Data Source:** fact_income_statement (fixed~sgna+interest, variable~cogs).
 
-**OLAP**  
-Kết hợp dữ liệu trend từ mart_master_analysis + NLP generation.  
+**Logic/Tính Toán:** Code_execution cho sensitivity; Edge: revenue=0 → null.
 
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT revenue_growth_yoy, net_margin_change FROM mart_master_analysis WHERE symbol='VCB';
-```  
+SELECT (sgna + interest_expense) / (1 - cogs / revenue) AS break_even FROM fact_income_statement WHERE symbol='HPG' AND year=2024;
+```
+**RAG Prompt:** “Điểm hòa vốn HPG Q4-2024, sensitivity costs tăng 10%.”
 
-**RAG Prompt**  
-> “Tạo báo cáo MD&A cho VCB năm 2024, giải thích biến động KPI.”
+### **Use Case A11 — Tạo báo cáo MD&A-style tự động**
+**Mục tiêu nghiệp vụ:** Narrative biến động KPI, link macro. Edge: Multi-KPI.
 
-### **Use Case A21 — Phân tích DuPont**
-**Mục tiêu nghiệp vụ**  
-Giải thích sâu nguyên nhân biến động ROE qua các driver (margin, turnover, leverage).  
+**Input:** Ticker, Period.
 
-**Input**  
-Ticker, period (IS, BS).  
+**Output:** Text narrative (e.g., "Revenue +15% do mở rộng, margin - do CPI cao").
 
-**Output**  
-ROE = Net Margin * Asset Turnover * Equity Multiplier; phân tích thay đổi từng yếu tố.  
+**OLAP/Data Source:** mart_master_analysis + fact_macro_timeseries (join on year).
 
-**OLAP**  
-mart_master_analysis (NI, revenue, assets, equity).  
+**Logic/Tính Toán:** Growth from mart; Corr KPI-macro on-fly.
 
-**Công thức**  
-ROE = (NI/Revenue) * (Revenue/Assets) * (Assets/Equity).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT (net_income/revenue) * (revenue/total_assets) * (total_assets/equity) AS roe_dupont FROM mart_master_analysis WHERE symbol='VCB';
-```  
+SELECT revenue_growth_yoy, net_margin, (SELECT value FROM fact_macro_timeseries WHERE indicator_code='VN_CPI_YOY' AND toYear(date)=year) AS cpi
+FROM mart_master_analysis WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “MD&A VCB 2024, giải thích biến động với macro.”
 
-**RAG Prompt**  
-> “Phân tích DuPont cho ROE của VCB năm 2024.”
+### **Use Case A12 — Phân tích DuPont**
+**Mục tiêu nghiệp vụ:** Breakdown ROE, delta over periods.
 
-### **Use Case A22 — Altman Z-Score**
-**Mục tiêu nghiệp vụ**  
-Đánh giá nguy cơ phá sản / kiệt quệ tài chính.  
+**Input:** Ticker, Period.
 
-**Input**  
-Ticker, period (BS, Market Data).  
+**Output:** roe, margin, turnover, multiplier; YoY changes; narrative.
 
-**Output**  
-Z-Score value; interpretation (e.g., >3: an toàn, <1.8: rủi ro cao).  
+**OLAP/Data Source:** mart_master_analysis.dupont_roe.
 
-**OLAP**  
-mart_master_analysis + fact_daily_market.  
+**Logic/Tính Toán:** roe = margin * turnover * multiplier; Delta = cur - lag.
 
-**Công thức**  
-Z = 1.2*(WC/TA) + 1.4*(RE/TA) + 3.3*(EBIT/TA) + 0.6*(MV/BV) + 1.0*(Sales/TA).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT 1.2*(working_capital/total_assets) + ... FROM mart_master_analysis WHERE symbol='HPG';
-```  
+SELECT dupont_roe, net_margin, asset_turnover, equity_multiplier FROM mart_master_analysis WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “DuPont ROE VCB 2024, với changes YoY.”
 
-**RAG Prompt**  
-> “Tính Altman Z-Score cho HPG và đánh giá rủi ro phá sản.”
+### **Use Case A13 — Altman Z-Score**
+**Mục tiêu nghiệp vụ:** Bankruptcy risk, interpretation. Edge: <1.8 high risk.
+
+**Input:** Ticker, Period.
+
+**Output:** z_score, risk_level (safe/gray/distress), factors breakdown.
+
+**OLAP/Data Source:** mart_master_analysis.altman_z_score.
+
+**Logic/Tính Toán:** Pre-calc; Level: if(z>3,'safe',if(z<1.8,'distress','gray')).
+
+**Example SQL:** 
+```sql
+SELECT altman_z_score, if(altman_z_score>3,'Safe',if(<1.8,'Distress','Gray')) AS level FROM mart_master_analysis WHERE symbol='HPG' AND year=2024;
+```
+**RAG Prompt:** “Altman Z-Score HPG, đánh giá rủi ro phá sản.”
+
+### **Use Case A14 — Phân tích Trái phiếu (Bond Analysis)**
+**Mục tiêu nghiệp vụ:** YTM/IRR/NPV, risk vs benchmark. Edge: No bonds → note; multiple → list.
+
+**Input:** Ticker, Bond_id (bond_data.bond_id, or all).
+
+**Output:** issuance_date, maturity, coupon, ytm, irr, npv (at r=benchmark); narrative (high YTM → risk).
+
+**OLAP/Data Source:** bond_data (issuance_date, maturity_date, coupon_rate, cash_flows Array), join fact_macro (benchmark=Rf).
+
+**Logic/Tính Toán:** YTM/IRR/NPV code_execution (scipy.optimize.root, numpy.irr/npv); Benchmark = Rf + spread (default 2%).
+
+**Example SQL:** 
+```sql
+SELECT issuance_date, maturity_date, coupon_rate FROM bond_data WHERE symbol='VCB';
+-- Calc: code_execution with def ytm_func(r): npv = sum(cf / (1+r)**t) - price; solve r.
+```
+**RAG Prompt:** “Phân tích YTM/IRR/NPV trái phiếu VCB 2024, so benchmark.”
+
+### **Use Case A15 — Tính WACC từ Kd/Ke**
+**Mục tiêu nghiệp vụ:** Cost of capital, sensitivity. Edge: Forecast via forecast_table.
+
+**Input:** Ticker, Period (forecast_year from forecast_table).
+
+**Output:** wacc, kd, ke; sensitivity (beta ±0.1); narrative.
+
+**OLAP/Data Source:** mart_master_analysis (beta), fact_balance_sheet (E/D), forecast_table (Rm, Rf), fact_macro_timeseries fallback.
+
+**Logic/Tính Toán:** Ke = Rf + beta*(Rm-Rf); WACC as glossary; Sensitivity code_execution loop.
+
+**Example SQL:** 
+```sql
+SELECT (total_equity / v * ke) + (debt / v * kd * (1-0.2)) AS wacc FROM fact_balance_sheet b JOIN forecast_table f ON b.symbol=f.symbol WHERE b.symbol='HPG';
+-- Ke: (SELECT value FROM fact_macro_timeseries WHERE indicator_code='SBV_RATE') + beta * (Rm - Rf).
+```
+**RAG Prompt:** “WACC HPG từ Kd/Ke forecast, sensitivity.”
+
+### **Use Case A16 — Fraud Detection Analysis**
+**Mục tiêu nghiệp vụ:** Detect manipulation via Beneish M-Score. Edge: Score > -2.22 suspicious.
+
+**Input:** Ticker, Period.
+
+**Output:** m_score, components (DSRI etc.); flags; narrative.
+
+**OLAP/Data Source:** mart_master_analysis (growth, margins, assets).
+
+**Logic/Tính Toán:** M-Score = -4.84 + 0.92*DSRI + 0.528*GMI + ... (code_execution full formula); DSRI = (receivables cur / revenue cur) / (prev / prev).
+
+**Example SQL:** 
+```sql
+SELECT receivables_turnover, asset_growth_yoy FROM mart_master_analysis WHERE symbol='VCB';
+-- Calc: code_execution with formula.
+```
+**RAG Prompt:** “Phân tích gian lận VCB dùng Beneish M-Score.”
 
 ## ===========================
 ## B. Nhà đầu tư / Trader
 ## ===========================
-Tập trung vào phân tích thị trường, tín hiệu, và so sánh để hỗ trợ quyết định đầu tư/trading, với tích hợp TTM và technical indicators.
+### **Use Case B1 — Phân tích biến động giá & thị trường**
+**Mục tiêu nghiệp vụ:** Volatility, volume, beta. Edge: Custom timeframe.
 
-### **Use Case 7 — Phân tích biến động giá & thị trường**
-**Mục tiêu nghiệp vụ**  
-Tính volatility 30/60/90 days, market beta nếu có benchmark.  
+**Input:** Ticker, Timeframe (e.g., '30d' from fact_daily_market.date).
 
-**Input**  
-Ticker, timeframe.  
+**Output:** vol_30d, avg_volume, beta; distribution JSON; narrative.
 
-**Output**  
-Volatility, avg volume, return distribution.  
+**OLAP/Data Source:** fact_daily_market.
 
-**OLAP**  
-fact_daily_market.  
+**Logic/Tính Toán:** Vol = stddevPop(close); Beta = cov(stock_ret, index_ret)/var(index_ret) (index từ fact_macro_timeseries 'VN_INDEX').
 
-**SQL**  
+**Example SQL:** 
 ```sql
-SELECT STDDEV(close) AS vol_30d, AVG(volume) AS avg_volume FROM fact_daily_market WHERE symbol='HPG' AND date>= today()-30;
-```  
+SELECT stddevPop(close) AS vol, avg(volume) AS avg_vol FROM fact_daily_market WHERE symbol='HPG' AND date >= subtractDays(now(),30);
+-- Beta: WITH ret AS (...) SELECT covariancePop(stock_ret, index_ret)/variancePop(index_ret) FROM ret JOIN fact_macro_timeseries ON date=date.
+```
+**RAG Prompt:** “Biến động giá 30d HPG.”
 
-**RAG Prompt**  
-> “Tính độ biến động giá 30 ngày gần nhất của HPG.”
+### **Use Case B2 — Dự báo & cảnh báo tín hiệu**
+**Mục tiêu nghiệp vụ:** Alerts on KPI/price drops. Edge: Custom rules.
 
-### **Use Case 8 — Dự báo & cảnh báo tín hiệu**
-**Mục tiêu nghiệp vụ**  
-Cảnh báo giảm mạnh KPI/price trend, phát hiện bất thường.  
+**Input:** Ticker, Rules (e.g., 'eps_drop>10%', 'kd_increase>5%').
 
-**Input**  
-Ticker, alert rules.  
+**Output:** Alerts list with reasons, periods.
 
-**Output**  
-Alert signals: price crash, margin drop > X%.  
+**OLAP/Data Source:** mart_master_analysis + bond_data.
 
-**OLAP**  
-mart_master_analysis + fact_daily_market series.  
+**Logic/Tính Toán:** WHERE conditions on growth/lag; Kd on-fly.
 
-**RAG Prompt**  
-> “Cảnh báo nếu EPS giảm liên tục 2 kỳ.”
-
-### **Use Case 9 — So sánh cổ phiếu với nhóm peer**
-**Mục tiêu nghiệp vụ**  
-Ranking theo PE/PB/Growth trong ngành.  
-
-**Input**  
-Sector.  
-
-**Output**  
-Ranked list.  
-
-**SQL**  
+**Example SQL:** 
 ```sql
-SELECT symbol, pe_ttm, revenue_growth_yoy FROM mart_master_analysis WHERE sector='Steel' ORDER BY pe_ttm ASC;
-```  
+SELECT * FROM mart_master_analysis WHERE symbol='VCB' AND eps_growth_yoy < -10;
+```
+**RAG Prompt:** “Cảnh báo EPS giảm 2 kỳ hoặc Kd tăng >5%.”
 
-**RAG Prompt**  
-> “Xếp hạng cổ phiếu ngành thép theo PE.”
+### **Use Case B3 — So sánh cổ phiếu với nhóm peer**
+**Mục tiêu nghiệp vụ:** Ranking by KPI. Edge: Top N.
 
-### **Use Case B10 — Phân tích hiệu ứng mùa vụ & TTM chuẩn xác**
-**Mục tiêu nghiệp vụ**  
-Đánh giá performance liên tục 12 tháng gần nhất, loại bỏ mùa vụ.  
+**Input:** Sector (dim_company), KPI ('pe_ttm'), Top_n (10).
 
-**Input**  
-Ticker, timeframe.  
+**Output:** Ranked table: symbol, value; narrative.
 
-**Output**  
-TTM KPIs (e.g., revenue_ttm, eps_ttm); so sánh với annual.  
+**OLAP/Data Source:** mart_master_analysis join dim_company.
 
-**OLAP**  
-Thống kê TTM từ fact IS / mart layer.  
+**Logic/Tính Toán:** ORDER BY kpi ASC/DESC LIMIT n.
 
-**Công thức**  
-TTM = sum(last 4 quarters).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT SUM(revenue) AS revenue_ttm FROM mart_master_analysis WHERE symbol='VCB' AND period IN (last_4_quarters);
-```  
+SELECT symbol, pe_ttm FROM mart_master_analysis JOIN dim_company ON symbol=symbol WHERE sector='Steel' ORDER BY pe_ttm ASC LIMIT 10;
+```
+**RAG Prompt:** “Ranking ngành thép theo PE.”
 
-**RAG Prompt**  
-> “Phân tích TTM revenue của VCB để loại bỏ mùa vụ.”
+### **Use Case B4 — Phân tích hiệu ứng mùa vụ & TTM chuẩn xác**
+**Mục tiêu nghiệp vụ:** TTM KPIs vs annual. Edge: Incomplete → pro-rate.
 
-### **Use Case B11 — So sánh hiệu quả giữa cổ phiếu & benchmark thị trường**
-**Mục tiêu nghiệp vụ**  
-So sánh return, volatility vs VN-Index.  
+**Input:** Ticker, Timeframe.
 
-**Input**  
-Ticker, timeframe.  
+**Output:** revenue_ttm, eps_ttm; comparison; narrative.
 
-**Output**  
-Beta, alpha, relative return.  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-fact_daily_market + index data.  
+**Logic/Tính Toán:** SUM over last 4 quarters.
 
-**Công thức**  
-Beta = COV(stock_return, index_return) / VAR(index_return).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT COVARIANCE(stock_close, index_close) / VARIANCE(index_close) AS beta FROM fact_daily_market WHERE symbol='HPG';
-```  
+SELECT sum(revenue) AS ttm FROM mart_master_analysis WHERE symbol='VCB' AND report_date >= subtractQuarters(now(),4);
+```
+**RAG Prompt:** “TTM revenue VCB loại mùa vụ.”
 
-**RAG Prompt**  
-> “So sánh return của HPG với VN-Index trong 1 năm.”
+### **Use Case B5 — So sánh hiệu quả giữa cổ phiếu & benchmark thị trường**
+**Mục tiêu nghiệp vụ:** Relative return. Edge: Custom index.
 
-### **Use Case B12 — Alerts based on financial triggers**
-**Mục tiêu nghiệp vụ**  
-Tự động cảnh báo khi KPI vượt threshold.  
+**Input:** Ticker, Timeframe.
 
-**Input**  
-Ticker, rules (e.g., margin drop >10%).  
+**Output:** beta, alpha, relative_return.
 
-**Output**  
-List alerts với lý do.  
+**OLAP/Data Source:** fact_daily_market + fact_macro_timeseries (index).
 
-**OLAP**  
-mart_master_analysis trend + rules engine.  
+**Logic/Tính Toán:** Beta cov/var; Alpha = stock_ret - (Rf + beta*(index_ret - Rf)).
 
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT * FROM mart_master_analysis WHERE symbol='VCB' AND net_margin_change < -10;
-```  
+WITH ret AS (SELECT (close - lag(close))/lag(close) AS stock_ret FROM fact_daily_market WHERE symbol='HPG') 
+SELECT covariancePop(stock_ret, index_ret)/variancePop(index_ret) AS beta FROM ret JOIN fact_macro_timeseries ON date=date WHERE indicator_code='VN_INDEX';
+```
+**RAG Prompt:** “So sánh return HPG vs VN-Index 1 năm.”
 
-**RAG Prompt**  
-> “Cảnh báo các trigger tài chính cho VCB dựa trên rules.”
+### **Use Case B6 — Alerts based on financial triggers**
+**Mục tiêu nghiệp vụ:** Threshold alerts. Edge: Historical.
 
-### **Use Case B13 — RSI / MACD Signal**
-**Mục tiêu nghiệp vụ**  
-Tín hiệu quá mua / quá bán (Technical).  
+**Input:** Ticker, Rules.
 
-**Input**  
-Ticker, daily price.  
+**Output:** Triggers list.
 
-**Output**  
-RSI value, MACD line; signals (e.g., RSI>70: overbought).  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-fact_daily_market.  
+**Logic/Tính Toán:** WHERE net_margin < lag -10 etc.
 
-**Công thức**  
-RSI = 100 - (100 / (1 + RS)); MACD = EMA12 - EMA26.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
--- Sử dụng code execution để tính EMA/RSI nếu cần.
+SELECT period, 'Margin drop' FROM mart_master_analysis WHERE symbol='VCB' AND net_margin < lag(net_margin) -10;
+```
+**RAG Prompt:** “Alerts trigger VCB, bao YTM high.”
+
+### **Use Case B7 — RSI / MACD Signal**
+**Mục tiêu nghiệp vụ:** Technical signals. Edge: Custom periods.
+
+**Input:** Ticker, Days (14).
+
+**Output:** rsi, macd; signals (>70 overbought).
+
+**OLAP/Data Source:** fact_daily_market.
+
+**Logic/Tính Toán:** Code_execution (numpy for EMA, gains/losses avg).
+
+**Example SQL:** 
+```sql
 SELECT close FROM fact_daily_market WHERE symbol='HPG' ORDER BY date DESC LIMIT 30;
-```  
+-- Code: RS = avg_gain / avg_loss; RSI=100-100/(1+RS).
+```
+**RAG Prompt:** “RSI, MACD HPG, signals.”
 
-**RAG Prompt**  
-> “Tính RSI và MACD cho HPG, phát hiện signals.”
+### **Use Case B8 — Đánh giá Trái phiếu cho Đầu tư**
+**Mục tiêu nghiệp vụ:** Attractiveness vs benchmark. Edge: Multi-bonds.
+
+**Input:** Ticker, Bond_id.
+
+**Output:** ytm vs benchmark, irr; signals (ytm > benchmark attractive).
+
+**OLAP/Data Source:** bond_data + fact_macro (benchmark).
+
+**Logic/Tính Toán:** YTM code_execution; Compare ytm > Rf +2%.
+
+**Example SQL:** 
+```sql
+SELECT coupon_rate, current_price FROM bond_data WHERE symbol='HPG';
+-- Code for ytm.
+```
+**RAG Prompt:** “Đánh giá YTM, IRR trái phiếu HPG so lãi suất thị trường.”
 
 ## ===========================
 ## C. CEO / CFO / Quản lý
 ## ===========================
-Tập trung vào kiểm soát nội bộ, planning, và scenario analysis để hỗ trợ quản lý rủi ro và chiến lược.
+### **Use Case C1 — Kiểm soát rủi ro tài chính nội bộ**
+**Mục tiêu nghiệp vụ:** Anomaly detection. Edge: Threshold custom.
 
-### **Use Case 10 — Kiểm soát rủi ro tài chính nội bộ**
-**Mục tiêu nghiệp vụ**  
-Detect KPI anomalies (e.g. net income % drop > threshold, margin compression).  
+**Input:** Thresholds (e.g., margin_drop>20%).
 
-**Input**  
-Threshold rules.  
+**Output:** Anomalies list (KPI, period).
 
-**Output**  
-Anomaly list.  
+**OLAP/Data Source:** mart_master_analysis.
 
-**Data**  
-mart_master_analysis.  
+**Logic/Tính Toán:** WHERE net_margin < lag -20 OR short_term_debt >0.5*total_debt.
 
-**RAG Prompt**  
-> “Liệt kê các công ty có net margin giảm > 20% năm qua.”
-
-### **Use Case 11 — So sánh kế hoạch vs thực tế**
-**Mục tiêu nghiệp vụ**  
-Plan vs actual KPI comparison.  
-
-**Input**  
-Plan data source (external table).  
-
-**Output**  
-Gap analysis, % attainment.  
-
-**Data**  
-mart_master_analysis + plan table.  
-
-**RAG Prompt**  
-> “So sánh doanh thu thực tế và kế hoạch Q4 2024.”
-
-### **Use Case 12 — Phân tích tác động vĩ mô**
-**Mục tiêu nghiệp vụ**  
-Hiệu ứng CPI, lãi suất xuống EPS, margin.  
-
-**Input**  
-Macro timeline.  
-
-**Output**  
-Correlation/trend.  
-
-**Data**  
-fact_macro_timeseries + mart_master_analysis.  
-
-**SQL**  
+**Example SQL:** 
 ```sql
-SELECT m.value AS CPI, avg(kpi.net_margin) AS avg_margin FROM fact_macro_timeseries m JOIN mart_master_analysis kpi ON year(m.date)=kpi.year WHERE m.indicator_code='VN_CPI_YOY' GROUP BY year(m.date);
-```  
+SELECT symbol, year, quarter FROM mart_master_analysis WHERE net_margin < lag(net_margin) -20;
+```
+**RAG Prompt:** “Anomalies margin giảm >20% hoặc overdraft tăng.”
 
-**RAG Prompt**  
-> “Ảnh hưởng CPI YoY đến net margin ngành ngân hàng.”
+### **Use Case C2 — So sánh kế hoạch vs thực tế**
+**Mục tiêu nghiệp vụ:** Gap analysis. Edge: No budget → note.
 
-### **Use Case C13 — Budget vs Actual trend analysis**
-**Mục tiêu nghiệp vụ**  
-So sánh ngân sách kế hoạch với thực tế theo time series.  
+**Input:** Ticker, Period (budget_table).
 
-**Input**  
-Ticker, periods.  
+**Output:** actual, plan, %attainment.
 
-**Output**  
-Trend gap % over time.  
+**OLAP/Data Source:** mart_master_analysis + budget_table (join period_id).
 
-**OLAP**  
-Budget table + mart_master_analysis.  
+**Logic/Tính Toán:** % = actual / plan *100.
 
-**Công thức**  
-% Attainment = actual / budget * 100.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT period, actual_revenue, budget_revenue, (actual_revenue / budget_revenue * 100) AS attainment FROM mart_master_analysis JOIN budget_table ON period=budget_period WHERE symbol='VCB';
-```  
+SELECT m.revenue AS actual, bt.revenue AS plan, (actual/plan)*100 FROM mart_master_analysis m JOIN budget_table bt ON m.period_id=bt.period_id WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “Budget vs actual revenue Q4-2024.”
 
-**RAG Prompt**  
-> “Phân tích trend budget vs actual cho revenue của VCB.”
+### **Use Case C3 — Phân tích tác động vĩ mô**
+**Mục tiêu nghiệp vụ:** Correlation macro-KPI. Edge: Custom indicators.
 
-### **Use Case C14 — Liquidity stress testing**
-**Mục tiêu nghiệp vụ**  
-Đánh giá hoạt động trong stress scenarios (e.g., cash drop 20%).  
+**Input:** Macro_codes ('VN_CPI_YOY' từ dim_macro_indicator).
 
-**Input**  
-Ticker, scenarios.  
+**Output:** corr value, trend; narrative.
 
-**Output**  
-Projected ratios under stress; survival time.  
+**OLAP/Data Source:** fact_macro_timeseries join mart_master_analysis on year.
 
-**OLAP**  
-Liquidity ratios + variance scenarios từ mart_master_analysis.  
+**Logic/Tính Toán:** corr(value, net_margin).
 
-**Công thức**  
-Stressed Current Ratio = (current_assets * (1 - stress_factor)) / current_liabilities.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT current_ratio * (1 - 0.2) AS stressed_ratio FROM mart_master_analysis WHERE symbol='HPG';
-```  
+SELECT corr(m.value, k.net_margin) FROM fact_macro_timeseries m JOIN mart_master_analysis k ON toYear(m.date)=k.year WHERE m.indicator_code='VN_CPI_YOY';
+```
+**RAG Prompt:** “Ảnh hưởng CPI đến net margin ngân hàng.”
 
-**RAG Prompt**  
-> “Stress test liquidity cho HPG nếu cash giảm 20%.”
+### **Use Case C4 — Budget vs Actual trend analysis**
+**Mục tiêu nghiệp vụ:** Time series gaps.
 
-### **Use Case C15 — Phân tích what-if & kịch bản chiến lược**
-**Mục tiêu nghiệp vụ**  
-Mô phỏng tác động thay đổi biến đầu vào (e.g., lãi suất tăng).  
+**Input:** Ticker, Periods.
 
-**Input**  
-Ticker, scenario variables.  
+**Output:** Trend: period, actual, budget, %.
 
-**Output**  
-Projected KPIs (e.g., new EPS).  
+**OLAP/Data Source:** mart_master_analysis + budget_table.
 
-**OLAP**  
-Scenario data + OLAP results từ mart_master_analysis.  
+**Logic/Tính Toán:** %attainment per period.
 
-**Công thức**  
-What-if EPS = base_eps * (1 + impact_factor).  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
--- Sử dụng code execution cho simulation nếu cần.
-SELECT eps * (1 + 0.1) AS projected_eps FROM mart_master_analysis WHERE symbol='VCB';
-```  
+SELECT period, actual_revenue, budget_revenue, (actual/budget)*100 FROM mart_master_analysis JOIN budget_table ON period_id=period_id WHERE symbol='VCB' ORDER BY period;
+```
+**RAG Prompt:** “Trend budget vs actual revenue VCB.”
 
-**RAG Prompt**  
-> “What-if analysis: Nếu lãi suất tăng 1%, tác động đến EPS của VCB.”
+### **Use Case C5 — Liquidity stress testing**
+**Mục tiêu nghiệp vụ:** Scenarios (cash -20%). Edge: Multi-scenarios.
 
-### **Use Case C16 — Cash Conversion Cycle**
-**Mục tiêu nghiệp vụ**  
-Hiệu quả quản trị vốn lưu động.  
+**Input:** Ticker, Scenarios (factors list).
 
-**Input**  
-Ticker, period (IS, BS).  
+**Output:** Stressed ratios, survival_time (cash / burn_rate).
 
-**Output**  
-CCC value; optimization suggestions.  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-mart_master_analysis.  
+**Logic/Tính Toán:** Stressed = ratio * (1 - factor); Code_execution loop.
 
-**Công thức**  
-CCC = DIO + DSO - DPO.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT days_inventory + days_sales - days_payable AS ccc FROM mart_master_analysis WHERE symbol='HPG';
-```  
+SELECT current_ratio * (1 - 0.2) AS stressed FROM mart_master_analysis WHERE symbol='HPG';
+```
+**RAG Prompt:** “Stress liquidity HPG cash giảm 20%, lãi suất +10%.”
 
-**RAG Prompt**  
-> “Tính Cash Conversion Cycle cho HPG và đánh giá hiệu quả.”
+### **Use Case C6 — Phân tích what-if & kịch bản chiến lược**
+**Mục tiêu nghiệp vụ:** Simulate variables. Edge: Probabilistic (monte carlo).
+
+**Input:** Ticker, Variables (e.g., interest +1%).
+
+**Output:** Projected eps, wacc; distributions nếu monte.
+
+**OLAP/Data Source:** mart_master_analysis + forecast_table.
+
+**Logic/Tính Toán:** Projected = base * (1 + impact); Code_execution monte carlo (numpy.random).
+
+**Example SQL:** 
+```sql
+SELECT eps * (1 + 0.1) AS proj FROM mart_master_analysis WHERE symbol='VCB';
+```
+**RAG Prompt:** “What-if lãi suất +1% tác động EPS, WACC VCB.”
+
+### **Use Case C7 — Cash Conversion Cycle**
+**Mục tiêu nghiệp vụ:** Efficiency, suggestions.
+
+**Input:** Ticker, Period.
+
+**Output:** ccc, DIO/DSO/DPO; optimizations.
+
+**OLAP/Data Source:** mart_master_analysis.
+
+**Logic/Tính Toán:** ccc = days_inventory + days_sales - days_payables.
+
+**Example SQL:** 
+```sql
+SELECT cash_conversion_cycle FROM mart_master_analysis WHERE symbol='HPG' AND year=2024;
+```
+**RAG Prompt:** “CCC HPG, đánh giá hiệu quả.”
+
+### **Use Case C8 — Quản lý Cấu trúc Nợ & Lãi suất**
+**Mục tiêu nghiệp vụ:** Debt mix, refinance. Edge: Overdraft from extra_items.
+
+**Input:** Ticker, Period.
+
+**Output:** short/long ratio, interest_expense, kd; suggestions.
+
+**OLAP/Data Source:** fact_balance_sheet + fact_income_statement.
+
+**Logic/Tính Toán:** Ratio = short / total_debt.
+
+**Example SQL:** 
+```sql
+SELECT short_term_debt / (short_term_debt + long_term_debt) AS ratio, interest_expense FROM fact_balance_sheet WHERE symbol='HPG' AND year=2024;
+```
+**RAG Prompt:** “Cấu trúc nợ ngắn/dài, overdraft, lãi suất HPG.”
+
+### **Use Case C9 — Đánh giá Trái phiếu Nội bộ**
+**Mục tiêu nghiệp vụ:** Review issuance, refinancing NPV.
+
+**Input:** Ticker, Bond_id.
+
+**Output:** Metrics, npv refinance; rủi ro.
+
+**OLAP/Data Source:** bond_data.
+
+**Logic/Tính Toán:** NPV at new_rate code_execution.
+
+**Example SQL:** 
+```sql
+SELECT issuance_date, ytm FROM bond_data WHERE symbol='VCB';
+```
+**RAG Prompt:** “Đánh giá trái phiếu VCB, NPV refinancing.”
+
+### **Use Case C10 — Compliance and Regulatory Reporting**
+**Mục tiêu nghiệp vụ:** Check standards (IFRS). Edge: Custom rules.
+
+**Input:** Ticker, Standard ('IFRS').
+
+**Output:** Compliance score, issues; report narrative.
+
+**OLAP/Data Source:** mart_master_analysis + new compliance_table (rules).
+
+**Logic/Tính Toán:** Score = sum(if(compliant,1,0)) / rules_count.
+
+**Example SQL:** 
+```sql
+SELECT if(debt_to_equity <2,'Compliant','Non') FROM mart_master_analysis WHERE symbol='VCB';
+```
+**RAG Prompt:** “Compliance IFRS VCB, generate report.”
+
+### **Use Case C11 — Risk Forecasting with Macro Integration**
+**Mục tiêu nghiệp vụ:** Predict under scenarios.
+
+**Input:** Scenario variables (macro changes).
+
+**Output:** Forecasted KPIs; charts JSON.
+
+**OLAP/Data Source:** fact_macro_timeseries + forecast_table.
+
+**Logic/Tính Toán:** Regression code_execution (statsmodels); Forecast = base + corr * delta_macro.
+
+**Example SQL:** 
+```sql
+SELECT value, net_margin FROM fact_macro_timeseries JOIN mart_master_analysis ON year=year WHERE indicator_code='VN_CPI_YOY';
+-- Code for linregress.
+```
+**RAG Prompt:** “Forecast EPS VCB nếu CPI +5%, dựa corr lịch sử.”
 
 ## ===========================
 ## D. Người dùng cuối / Phổ thông (General User)
 ## ===========================
-Cung cấp giải thích đơn giản, không kỹ thuật, dựa trên dữ liệu nhưng dễ hiểu.
+### **Use Case D1 — Hỏi tài chính cơ bản**
+**Mục tiêu nghiệp vụ:** Định nghĩa đơn giản, ví dụ. Edge: No OLAP.
 
-### **Use Case 13 — Hỏi tài chính cơ bản**
-**Mục tiêu nghiệp vụ**  
-Giải thích khái niệm: ví dụ “Lãi là gì?” Không cần dữ liệu OLAP, chỉ định nghĩa.  
+**Input:** Question (e.g., "Lãi là gì?").
 
-**Input**  
-Plain question.  
+**Output:** Text explanation.
 
-**Output**  
-Natural language explanation.  
+**OLAP/Data Source:** None (static knowledge).
 
-**RAG Prompt**  
-> “Lãi là gì? Giải thích đơn giản.”
+**Logic/Tính Toán:** N/A.
 
-### **Use Case 14 — “Công ty này có tốt không?”**
-**Mục tiêu nghiệp vụ**  
-Simple quality score, tổng hợp ROE, ROA, margin.  
+**RAG Prompt:** “Giải thích lãi suất đơn giản.”
 
-**OLAP**  
-mart_master_analysis.  
+### **Use Case D2 — “Công ty này có tốt không?”**
+**Mục tiêu nghiệp vụ:** Score dựa data. Edge: Threshold ROE>15 good.
 
-**Example RAG Prompt**  
-> “Cho tôi biết HPG có phải công ty tốt không.”
+**Input:** Ticker.
 
-### **Use Case 15 — “Có nên đầu tư cổ phiếu X không?”**
-**Mục tiêu nghiệp vụ**  
-Synthesis data + opinion (không tư vấn pháp lý, chỉ dựa dữ liệu).  
+**Output:** Score 0-10, reasons (ROE high good, debt high bad).
 
-**OLAP**  
-mart_master_analysis + benchmarks.  
+**OLAP/Data Source:** mart_master_analysis.
 
-**RAG Prompt**  
-> “Dựa trên dữ liệu, liệu HPG có hấp dẫn để đầu tư?”
+**Logic/Tính Toán:** Score = avg(roe/20, 1-debt_to_equity, etc.) *10.
 
-### **Use Case D16 — Giải thích KPI tài chính theo ngôn ngữ đơn giản**
-**Mục tiêu nghiệp vụ**  
-Convert KPI ra lời giải thích dễ hiểu.  
+**Example SQL:** 
+```sql
+SELECT roe_ttm, debt_to_equity FROM mart_master_analysis WHERE symbol='HPG' LIMIT 1;
+```
+**RAG Prompt:** “HPG có tốt không, dựa data.”
 
-**Input**  
-Ticker, KPI (e.g., ROE).  
+### **Use Case D3 — “Có nên đầu tư cổ phiếu X không?”**
+**Mục tiêu nghiệp vụ:** Pros/cons data-based, no advice.
 
-**Output**  
-Explanation + value (e.g., "ROE 15% nghĩa là công ty kiếm 15 đồng lợi nhuận từ mỗi 100 đồng vốn.").  
+**Input:** Ticker.
 
-**OLAP**  
-mart_master_analysis + template explanations.  
+**Output:** Pros (growth cao), cons (vol high); narrative.
 
-**Example SQL**  
+**OLAP/Data Source:** mart_master_analysis + benchmarks.
+
+**Logic/Tính Toán:** Compare vs sector_avg.
+
+**Example SQL:** 
+```sql
+SELECT revenue_growth_yoy, volatility_30d FROM mart_master_analysis WHERE symbol='HPG';
+```
+**RAG Prompt:** “Dựa data, HPG hấp dẫn đầu tư? Pros/cons.”
+
+### **Use Case D4 — Giải thích KPI tài chính theo ngôn ngữ đơn giản**
+**Mục tiêu nghiệp vụ:** Layman explain + value. Edge: With example.
+
+**Input:** Ticker, KPI ('ROE').
+
+**Output:** "ROE 15% nghĩa là kiếm 15đ từ 100đ vốn"; value.
+
+**OLAP/Data Source:** mart_master_analysis.
+
+**Logic/Tính Toán:** Fetch value.
+
+**Example SQL:** 
 ```sql
 SELECT roe_ttm FROM mart_master_analysis WHERE symbol='VCB';
-```  
+```
+**RAG Prompt:** “Giải thích ROE VCB đơn giản.”
 
-**RAG Prompt**  
-> “Giải thích ROE của VCB một cách đơn giản.”
+### **Use Case D5 — So sánh hiệu quả kinh doanh giữa hai công ty bất kỳ**
+**Mục tiêu nghiệp vụ:** Quick compare. Edge: >2 tickers.
 
-### **Use Case D17 — So sánh hiệu quả kinh doanh giữa hai công ty bất kỳ**
-**Mục tiêu nghiệp vụ**  
-Cung cấp công cụ so sánh nhanh.  
+**Input:** Tickers list, Period.
 
-**Input**  
-Hai tickers, period.  
+**Output:** Table: symbol, revenue, margin, roe.
 
-**Output**  
-Bảng so sánh KPIs (revenue, margin, ROE).  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-mart_master_analysis hai ticker.  
+**Logic/Tính Toán:** UNION or IN.
 
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT symbol, revenue, net_margin FROM mart_master_analysis WHERE symbol IN ('VCB', 'HPG') AND year=2024;
-```  
+SELECT symbol, revenue, net_margin, roe_ttm FROM mart_master_analysis WHERE symbol IN ('VCB','HPG') AND year=2024;
+```
+**RAG Prompt:** “So sánh VCB vs HPG.”
 
-**RAG Prompt**  
-> “So sánh hiệu quả kinh doanh giữa VCB và HPG.”
+### **Use Case D6 — Hỏi về rủi ro tài chính tổng quát**
+**Mục tiêu nghiệp vụ:** Explain ratios. Edge: Type-specific.
 
-### **Use Case D18 — Hỏi về rủi ro tài chính tổng quát**
-**Mục tiêu nghiệp vụ**  
-Trả lời câu hỏi rủi ro (liquidity, leverage).  
+**Input:** Ticker, Risk_type ('debt').
 
-**Input**  
-Ticker, rủi ro type.  
+**Output:** Ratios, why (D/E cao → rủi ro lớn).
 
-**Output**  
-Explanation + ratios (e.g., "D/E cao cho thấy rủi ro nợ lớn.").  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-mart_master_analysis ratios.  
+**Logic/Tính Toán:** Fetch + threshold check.
 
-**Example SQL**  
+**Example SQL:** 
 ```sql
 SELECT debt_to_equity FROM mart_master_analysis WHERE symbol='HPG';
-```  
+```
+**RAG Prompt:** “Rủi ro tài chính HPG cao không? Tại sao, bao overdraft.”
 
-**RAG Prompt**  
-> “Công ty HPG có rủi ro tài chính cao không? Tại sao?”
+### **Use Case D7 — Peer Comparison (Radar Chart)**
+**Mục tiêu nghiệp vụ:** Visual strengths. Edge: Normalize 0-100.
 
-### **Use Case D19 — Peer Comparison (Radar Chart)**
-**Mục tiêu nghiệp vụ**  
-So sánh sức mạnh tương quan trên nhiều trục (Sinh lời, Định giá, Tăng trưởng).  
+**Input:** Sector or tickers.
 
-**Input**  
-Sector hoặc list tickers.  
+**Output:** JSON scores (roe, pe, growth); narrative.
 
-**Output**  
-Radar chart data (scores trên axes); narrative comparison.  
+**OLAP/Data Source:** mart_master_analysis.
 
-**OLAP**  
-Sector Data từ mart_master_analysis.  
+**Logic/Tính Toán:** Score = (value - min)/(max - min)*100 per KPI, GROUP BY sector.
 
-**Công thức**  
-Normalize scores 0-100 cho từng KPI.  
-
-**Example SQL**  
+**Example SQL:** 
 ```sql
-SELECT symbol, roe_ttm, pe_ttm, growth_yoy FROM mart_master_analysis WHERE sector='Banking';
-```  
+SELECT symbol, roe_ttm, pe_ttm, revenue_growth_yoy FROM mart_master_analysis WHERE sector='Banking';
+-- Code normalize.
+```
+**RAG Prompt:** “Peer comparison VCB ngân hàng với radar.”
 
-**RAG Prompt**  
-> “So sánh peer comparison cho VCB trong ngành ngân hàng với radar chart.”
+### **Use Case D8 — Giải thích Cash Flow Phân loại**
+**Mục tiêu nghiệp vụ:** Simple breakdown.
 
-## 🧠 Tích hợp vào hệ thống RAG: Analyst-style Narrative Generation
-Hệ thống RAG không chỉ retrieval dữ liệu mà còn generate narrative mô phỏng MD&A (Management Discussion & Analysis), giải thích biến động KPI với lý do kinh tế/doanh nghiệp. Sử dụng prompt chaining: retrieval OLAP → analyze trends → generate explanation.  
+**Input:** Ticker, Period.
 
-**Ví dụ câu hỏi RAG của người dùng:**  
-- “Tại sao lợi nhuận gộp của VCB tăng nhưng ROE lại giảm?” (Phân tích driver như leverage giảm.)  
-- “Điểm hòa vốn của công ty A trong Q1-Q3 2025 là bao nhiêu?” (Tính toán + giải thích.)  
-- “Tôi muốn xem dự báo EPS cho 2 quý tiếp theo dựa trên trend lịch sử.” (Sử dụng linear regression từ data.)  
+**Output:** CFO/CFI/CFF values, explain (CFO dương → hoạt động tốt).
 
-Data pipeline hỗ trợ: ETL từ nguồn tài chính (BCTC, market data) vào OLAP marts, với rules engine cho alerts/scenarios.
+**OLAP/Data Source:** fact_cash_flow.
 
-## 🚀 Summary: Nhóm Use Case Bổ Sung Quan Trọng
-| Nhóm | Tính năng bổ sung | Lợi ích chính |
-|------|-------------------|---------------|
-| Analyst | Horizontal analysis, Common-size, Break-Even, Narrative MD&A, DuPont, Altman Z-Score | Insight sâu hơn về trend, cấu trúc, và rủi ro phá sản. |
-| Trader/Investor | TTM & benchmark vs index, Alerts, RSI/MACD | Loại bỏ mùa vụ, tín hiệu trading, so sánh thị trường. |
-| CEO/CFO/Manager | Budget vs Actual, Stress testing, What-if modelling, Cash Conversion Cycle | Hỗ trợ planning, rủi ro nội bộ, và tối ưu vốn. |
-| General User | Explanation in layman terms, Comparative analysis, Radar Chart | Dễ tiếp cận, so sánh trực quan cho người mới. |
+**Logic/Tính Toán:** Fetch + sign analysis.
+
+**Example SQL:** 
+```sql
+SELECT cfo, cfi, cff FROM fact_cash_flow WHERE symbol='VCB' AND year=2024;
+```
+**RAG Prompt:** “Giải thích cash flow CFO/CFI/CFF VCB dễ hiểu.”
+
+### **Use Case D9 — Interactive Q&A with Visuals**
+**Mục tiêu nghiệp vụ:** Explain with images/charts. Edge: Visualizable queries.
+
+**Input:** Question.
+
+**Output:** Text + rendered images (via search_images tool in RAG chain).
+
+**OLAP/Data Source:** Optional mart cho data, images từ tool.
+
+**Logic/Tính Toán:** N/A, tool-based.
+
+**RAG Prompt:** “Giải thích ROE đơn giản, với image minh họa.”
+
+## 🧠 Tích hợp vào hệ thống RAG
+- Retrieval: SQL từ OLAP → code_execution calc → narrative.
+- Pipeline: ETL → mart → RAG chain.
