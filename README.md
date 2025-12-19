@@ -8,7 +8,7 @@ A production-ready Retrieval-Augmented Generation (RAG) system designed for fina
 - **Cross-Encoder Reranking**: BGE-reranker-v2-m3 for fine-grained relevance scoring
 - **Infinite Context**: 3-3 memory mechanism (summaries + checkpoints) for unlimited conversation history
 - **GPU Acceleration**: CUDA-optimized embedding and reranking
-- **Dual LLM Support**: Gemini 2.0 Flash (primary) + Llama 3.2 3B (fallback)
+- **Dual LLM Support**: Gemini 2.0 Flash (primary) + Llama 3 8B (fallback)
 - **Real-Time Streaming**: Server-Sent Events (SSE) for responsive chat
 - **Production-Ready**: Docker Compose orchestration with health checks and monitoring
 
@@ -89,7 +89,7 @@ make quickstart
 # Or step by step:
 make build
 make up
-make pull-models  # Download Llama 3.2 3B
+make pull-models  # Download Llama 3 8B
 ```
 
 ### 4. Access UI
@@ -101,7 +101,7 @@ Open browser to: **http://localhost:8501**
 ## 📁 Project Structure
 
 ```
-rag/
+RAGHouse/
 ├── api/                      # FastAPI Backend
 │   ├── app/
 │   │   ├── database.py       # PostgreSQL ORM models
@@ -112,14 +112,16 @@ rag/
 │   ├── data/                 # Preloaded documents (auto-ingest)
 │   ├── Dockerfile
 │   └── requirements.txt
+├── clickhouse/               # OLAP datastore
+│   ├── init.sql              # initialize tables in OLAP
+│   └── USECASE.md            # use-case design for OLAP
 ├── ui/                       # Streamlit Frontend
 │   ├── app.py
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── docker-compose.yml        # Service orchestration
 ├── Makefile                  # Utility commands
-├── .env.example              # Environment template
-├── .gitignore
+├── DESIGN.md                 # design for RAG
 └── README.md
 ```
 
@@ -179,8 +181,8 @@ make restore-db     # Restore database (FILE=path/to/backup.sql)
 |-----------|-------|------|
 | Embedding | BGE-M3 | ~1.5 GB |
 | Reranker | BGE-reranker-v2-m3 | ~1.5 GB |
-| LLM (Fallback) | Llama 3.2 3B | ~2.5 GB |
-| **Total** | | **~5.5 GB** |
+| LLM (Fallback) | Llama 3 8B | ~5 GB |
+| **Total** | | **~8 GB** |
 
 ---
 
