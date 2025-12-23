@@ -328,9 +328,9 @@ async def generate_with_ollama(prompt: str, max_tokens: int = 2048) -> str:
     try:
         async with httpx.AsyncClient(timeout=200.0) as client:
             response = await client.post(
-                "http://ollama:11434/api/generate",
+                "http://rag_ollama:11434/api/generate",
                 json={
-                    "model": "llama3.2:3b",
+                    "model": "llama3:8b",
                     "prompt": prompt,
                     "stream": False,
                     "options": {"num_predict": max_tokens}
@@ -378,13 +378,13 @@ async def generate_with_ollama_streaming(prompt: str) -> AsyncGenerator[str, Non
     try:
         async with httpx.AsyncClient(timeout=200.0) as client:
             response = await client.post(
-                "http://ollama:11434/api/generate",
+                "http://rag_ollama:11434/api/generate",
                 json={
-                    "model": "llama3.2:3b",
+                    "model": "llama3:8b",
                     "prompt": prompt,
                     "stream": True
                 },
-                timeout=60.0
+                timeout=100.0
             )
             
             async for line in response.aiter_lines():
