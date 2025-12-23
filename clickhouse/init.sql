@@ -81,25 +81,28 @@ CREATE TABLE IF NOT EXISTS fact_income_statement (
     report_date         Date,
     
     -- Core P&L
-    revenue             Float64 DEFAULT 0,
-    cogs                Float64 DEFAULT 0,
-    gross_profit        Float64 DEFAULT 0,
-    sgna                Float64 DEFAULT 0,           -- Selling, General & Admin
-    operating_profit    Float64 DEFAULT 0,
-    financial_income    Float64 DEFAULT 0,
-    financial_expense   Float64 DEFAULT 0,
-    interest_expense    Float64 DEFAULT 0,
-    profit_before_tax   Float64 DEFAULT 0,
-    tax                 Float64 DEFAULT 0,
-    net_income          Float64 DEFAULT 0,           -- LNST công ty mẹ
+    revenue                  Float64 DEFAULT 0,
+    cogs                     Float64 DEFAULT 0,
+    gross_profit             Float64 DEFAULT 0,
+    sgna                     Float64 DEFAULT 0,           -- Selling, General & Admin
+    operating_profit         Float64 DEFAULT 0,
+    financial_income         Float64 DEFAULT 0,
+    financial_expense        Float64 DEFAULT 0,
+    interest_expense         Float64 DEFAULT 0,
+    lease_interest_expense   Float64 DEFAULT 0,
+    profit_before_tax        Float64 DEFAULT 0,
+    tax                      Float64 DEFAULT 0,
+    effective_tax_rate       Float32 DEFAULT 0,
+    net_income               Float64 DEFAULT 0,           -- LNST công ty mẹ
     
     -- Per Share
     eps                 Float32 DEFAULT 0,
     eps_diluted         Float32 DEFAULT 0,
     
     -- Derived
-    ebitda              Float64 DEFAULT 0,
-    ebit                Float64 DEFAULT 0,
+    ebitda                              Float64 DEFAULT 0,
+    depreciation_amortization_total     Float64 DEFAULT 0,
+    ebit                                Float64 DEFAULT 0,
     
     -- Flexible storage
     extra_items         Map(LowCardinality(String), Float64),
@@ -124,21 +127,24 @@ CREATE TABLE IF NOT EXISTS fact_balance_sheet (
     report_date         Date,
     
     -- Assets
-    cash                Float64 DEFAULT 0,
-    short_term_invest   Float64 DEFAULT 0,
-    receivables         Float64 DEFAULT 0,
-    inventory           Float64 DEFAULT 0,
-    total_current_assets Float64 DEFAULT 0,
-    fixed_assets        Float64 DEFAULT 0,
-    intangible_assets   Float64 DEFAULT 0,
-    total_assets        Float64 DEFAULT 0,
+    cash                    Float64 DEFAULT 0,
+    short_term_invest       Float64 DEFAULT 0,
+    receivables             Float64 DEFAULT 0,
+    inventory               Float64 DEFAULT 0,
+    total_current_assets    Float64 DEFAULT 0,
+    fixed_assets            Float64 DEFAULT 0,
+    lease_assets            Float64 DEFAULT 0,
+    intangible_assets       Float64 DEFAULT 0,
+    total_assets            Float64 DEFAULT 0,
     
     -- Liabilities
-    payables            Float64 DEFAULT 0,
-    short_term_debt     Float64 DEFAULT 0,
-    long_term_debt      Float64 DEFAULT 0,
-    total_current_liab  Float64 DEFAULT 0,
-    total_liabilities   Float64 DEFAULT 0,
+    payables                    Float64 DEFAULT 0,
+    short_term_debt             Float64 DEFAULT 0,
+    lease_liabilities_current   Float64 DEFAULT 0,
+    long_term_debt              Float64 DEFAULT 0,
+    lease_liabilities_long      Float64 DEFAULT 0,
+    total_current_liab          Float64 DEFAULT 0,
+    total_liabilities           Float64 DEFAULT 0,
     
     -- Equity
     share_capital       Float64 DEFAULT 0,
@@ -177,11 +183,13 @@ CREATE TABLE IF NOT EXISTS fact_cash_flow (
     acquisitions        Float64 DEFAULT 0,
     
     -- Financing
-    cff                 Float64 DEFAULT 0,           -- Cash from financing
-    dividends_paid      Float64 DEFAULT 0,
-    debt_issued         Float64 DEFAULT 0,
-    debt_repaid         Float64 DEFAULT 0,
-    equity_issued       Float64 DEFAULT 0,
+    cff                        Float64 DEFAULT 0,           -- Cash from financing
+    dividends_paid             Float64 DEFAULT 0,
+    debt_issued                Float64 DEFAULT 0,
+    debt_repaid                Float64 DEFAULT 0,
+    lease_payment_interest     Float64 DEFAULT 0,
+    lease_payment_principal    Float64 DEFAULT 0,
+    equity_issued              Float64 DEFAULT 0,
     
     -- Derived
     fcf                 Float64 DEFAULT 0,           -- Free cash flow = CFO - Capex
@@ -317,8 +325,11 @@ CREATE TABLE IF NOT EXISTS fact_bond_data (
     issuance_date       Date,
     maturity_date       Date,
     coupon_rate         Float32 DEFAULT 0,
+    market_rate         Float32 DEFAULT 0,
     face_value          Float64 DEFAULT 0,
     current_price       Float64 DEFAULT 0,
+    fair_value          Float64 DEFAULT 0,
+    accrued_interest    Float64 DEFAULT 0,
     coupon_frequency    Enum8('Annual'=1,'SemiAnnual'=2,'Quarterly'=3),
     
     -- Calculated metrics
@@ -488,6 +499,9 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     pe_vs_sector        Float32 DEFAULT 0,
     growth_vs_sector    Float32 DEFAULT 0,
     sector_rank         UInt16 DEFAULT 0,
+
+    lease_adjusted_net_debt Float64 DEFAULT 0,
+    tax_shield Float64 DEFAULT 0,
     
     -- Metadata
     created_at          DateTime DEFAULT now(),
