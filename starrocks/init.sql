@@ -670,7 +670,7 @@ INSERT INTO dim_period (year, quarter, period_type, start_date, end_date, is_lat
 (2023, 3, 'Q', '2023-07-01', '2023-09-30', 0),
 (2023, 4, 'Q', '2023-10-01', '2023-12-31', 0),
 (2024, 1, 'Q', '2024-01-01', '2024-03-31', 0),
-(2024, 2, 'Q', '2024-04-01', '2024-06-30', 0),
+(2024, 2, 'Q', '2024-04-01', '2024-06-30', 1),
 (2024, 3, 'Q', '2024-07-01', '2024-09-30', 1),
 (2024, 4, 'Q', '2024-10-01', '2024-12-31', 0);
 
@@ -693,7 +693,7 @@ INSERT INTO dim_macro_indicator (indicator_code, name_vn, name_en, unit, country
 ('INTEREST_RATE', 'Lãi suất cơ bản', 'Base Interest Rate', '%', 'VN', 'Monthly', 'SBV', 'Monetary', 1),
 ('USD_VND', 'Tỷ giá USD/VND', 'USD/VND Exchange Rate', 'VND', 'VN', 'Daily', 'SBV', 'FX', 1),
 ('PMI', 'Chỉ số PMI', 'Purchasing Managers Index', 'Index', 'VN', 'Monthly', 'IHS', 'Economic', 1),
-('FDI', 'Vốn FDI đăng ký', 'Registered FDI', 'USD M', 'VN', 'Monthly', 'MPI', 'Investment', 1),
+('FDI', 'Vốn FDI đăng ký', 'Registered FDI', 'USD M', 'VN' , 'Monthly', 'MPI', 'Investment', 1),
 ('EXPORT', 'Kim ngạch xuất khẩu', 'Export Value', 'USD B', 'VN', 'Monthly', 'GSO', 'Trade', 1),
 ('IMPORT', 'Kim ngạch nhập khẩu', 'Import Value', 'USD B', 'VN', 'Monthly', 'GSO', 'Trade', 1);
 
@@ -997,7 +997,6 @@ CREATE INDEX idx_macro_indicator_date ON fact_macro_timeseries (indicator_key, d
 -- GRANT SELECT ON analytics.* TO 'analyst'@'%';
 -- GRANT SELECT, INSERT, UPDATE ON analytics.* TO 'etl_user'@'%';
 -- GRANT ALL PRIVILEGES ON analytics.* TO 'admin'@'%';
-
 -- ========================================
 -- SECURITY SETUP (Optional but Recommended)
 -- ========================================
