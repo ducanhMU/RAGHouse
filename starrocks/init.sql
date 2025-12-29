@@ -1,6 +1,6 @@
-CREATE DATABASE IF NOT EXISTS analytics;
+DROP DATABASE IF EXISTS analytics;
+CREATE DATABASE analytics;
 USE analytics;
-
 -- ========================================
 -- 1. DIMENSION: Companies
 -- ========================================
