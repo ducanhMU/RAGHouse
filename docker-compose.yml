@@ -13,7 +13,7 @@ services:
       POSTGRES_DB: rag_db
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${DATA_ROOT}/postgres:/var/lib/postgresql/data
     ports:
       - "5433:5432"
     healthcheck:
@@ -37,7 +37,7 @@ services:
       ETCD_QUOTA_BACKEND_BYTES: '4294967296'
       ETCD_SNAPSHOT_COUNT: '50000'
     volumes:
-      - etcd_data:/etcd
+      - ${DATA_ROOT}/etcd:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
@@ -58,7 +58,7 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     volumes:
-      - minio_data:/minio_data
+      - ${DATA_ROOT}/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     ports:
       - "9001:9001"  # MinIO Console
@@ -84,7 +84,7 @@ services:
       MINIO_ACCESS_KEY_ID: minioadmin
       MINIO_SECRET_ACCESS_KEY: minioadmin
     volumes:
-      - milvus_data:/var/lib/milvus
+      - ${DATA_ROOT}/milvus:/var/lib/milvus
     ports:
       - "19530:19530"
       - "9091:9091"
@@ -126,7 +126,7 @@ services:
     image: ollama/ollama:latest
     container_name: rag_ollama
     volumes:
-      - ollama_data:/root/.ollama
+      - ${DATA_ROOT}/ollama:/root/.ollama
     ports:
       - "11435:11434"
     deploy:
@@ -146,21 +146,23 @@ services:
       wait"]
 
   # ============================================
-  # StarRocks All-in-One (OLAP DB)
+  # StarRocks Frontend (FE) - Quản lý Metadata & Client
   # ============================================
-  starrocks:
-    image: starrocks/allin1-ubuntu:latest
-    container_name: rag_starrocks
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:latest
+    container_name: rag_starrocks_fe
+    hostname: starrocks-fe
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
     volumes:
-      - starrocks_fe_meta:/root/StarRocks/fe/meta
-      - starrocks_be_storage:/root/StarRocks/be/storage
+      # Lưu Metadata của FE
+      - ${DATA_ROOT}/starrocks_fe:/opt/starrocks/fe/meta
     ports:
-      - "9030:9030"  # SQL Interface (MySQL protocol)
       - "8030:8030"  # FE Web UI
-      - "8040:8040"  # BE Web UI
+      - "9020:9020"  # RPC Port
+      - "9030:9030"  # MySQL Protocol Port (API kết nối vào đây)
     healthcheck:
-      # Healthcheck via internal localhost
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "9030", "-u", "root"]
+      test: ["CMD", "curl", "-f", "http://localhost:8030/api/health"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -169,32 +171,58 @@ services:
     restart: unless-stopped
 
   # ============================================
-  # StarRocks Init Job (Runs once then exits)
+  # StarRocks Backend (BE) - Lưu trữ & Tính toán
+  # ============================================
+  starrocks-be:
+    image: starrocks/be-ubuntu:latest
+    container_name: rag_starrocks_be
+    hostname: starrocks-be
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+    volumes:
+      # Lưu trữ dữ liệu thực (Data Storage)
+      - ${DATA_ROOT}/starrocks_be:/opt/starrocks/be/storage
+    ports:
+      - "8040:8040"  # BE Web UI
+      - "9060:9060"  # BE RPC
+      - "9050:9050"  # BE Heartbeat
+    depends_on:
+      - starrocks-fe
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+  # ============================================
+  # StarRocks Init Job (Kết nối BE với FE & Init DB)
   # ============================================
   starrocks-init:
-    image: mysql:latest
+    image: mysql:8.0-debian
     container_name: rag_starrocks_init
     volumes:
       - ./starrocks/init.sql:/init.sql
     networks:
       - rag_network
     depends_on:
-      starrocks:
+      starrocks-fe:
         condition: service_healthy
+      starrocks-be:
+        condition: service_started
     entrypoint: [ "bash", "-c" ]
-    # Wait loop logic to ensure StarRocks is truly ready to accept queries
     command: 
       - |
-        echo "Waiting for StarRocks..."
-        # Thêm --connect-timeout=2 để retry nhanh hơn
-        until mysql -h starrocks -P 9030 -u root --connect-timeout=2 -e 'SELECT 1'; do
-          echo "StarRocks unavailable - sleeping"
+        echo "Waiting for StarRocks FE..."
+        until mysql -h starrocks-fe -P 9030 -u root --connect-timeout=2 -e 'SELECT 1'; do
+          echo "FE unavailable - sleeping"
           sleep 3
         done
         
-        echo "StarRocks is up. Executing init.sql..."
-        # Chạy file init
-        mysql -h starrocks -P 9030 -u root < /init.sql
+        echo "FE is up. Registering Backend (BE)..."
+        # Lệnh quan trọng: Đăng ký BE vào cluster (9050 là heartbeat port)
+        # Dùng "|| true" để không báo lỗi nếu đã đăng ký rồi
+        mysql -h starrocks-fe -P 9030 -u root -e "ALTER SYSTEM ADD BACKEND 'starrocks-be:9050'" || true
+        
+        echo "Executing init.sql..."
+        mysql -h starrocks-fe -P 9030 -u root < /init.sql
         
         echo "Initialization completed."
 
@@ -227,17 +255,16 @@ services:
       LOG_LEVEL: INFO
 
       # StarRocks (Async connection for Pydantic AI)
-      STARROCKS_HOST: starrocks
+      STARROCKS_HOST: starrocks-fe
       STARROCKS_PORT: 9030
       STARROCKS_USER: rag_user
       STARROCKS_PASSWORD: rag_password
-      STARROCKS_URI: mysql+aiomysql://rag_user:rag_password@starrocks:9030/analytics
-
+      STARROCKS_URI: mysql+aiomysql://rag_user:rag_password@starrocks-fe:9030/analytics
     volumes:
       - ./api/app:/app/app
       - ./api/data:/app/data
-      - api_uploads:/app/data/uploads
-      - hf_cache:/app/.cache/huggingface
+      - ${DATA_ROOT}/uploads:/app/data/uploads
+      - ${DATA_ROOT}/hf_cache:/app/.cache/huggingface
     ports:
       - "8000:8000"
     depends_on:
