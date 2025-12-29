@@ -5,7 +5,7 @@ USE analytics;
 -- 1. DIMENSION: Companies
 -- ========================================
 CREATE TABLE IF NOT EXISTS dim_company (
-    company_key         INT NOT NULL AUTO_INCREMENT,           -- Surrogate key for fast joins
+    company_key         BIGINT NOT NULL AUTO_INCREMENT,           -- Surrogate key for fast joins
     symbol              VARCHAR(20) NOT NULL,
     company_id          VARCHAR(36),                           -- External ID (optional)
     company_name_vn     VARCHAR(255),
@@ -37,7 +37,7 @@ CREATE INDEX idx_company_symbol ON dim_company (symbol) USING BITMAP;
 -- 2. DIMENSION: Reporting Periods
 -- ========================================
 CREATE TABLE IF NOT EXISTS dim_period (
-    period_key          INT NOT NULL AUTO_INCREMENT,           -- Surrogate key
+    period_key          BIGINT NOT NULL AUTO_INCREMENT,           -- Surrogate key
     year                SMALLINT NOT NULL,
     quarter             TINYINT NOT NULL,
     period_type         VARCHAR(10),
@@ -325,7 +325,7 @@ PROPERTIES (
 -- 7. DIMENSION: Macro Indicators
 -- ========================================
 CREATE TABLE IF NOT EXISTS dim_macro_indicator (
-    indicator_key       INT NOT NULL AUTO_INCREMENT,
+    indicator_key       BIGINT NOT NULL AUTO_INCREMENT,
     indicator_code      VARCHAR(50) NOT NULL,
     name_vn             VARCHAR(255),
     name_en             VARCHAR(255),
@@ -375,7 +375,7 @@ PROPERTIES (
 -- 9. FACT: Bond Data
 -- ========================================
 CREATE TABLE IF NOT EXISTS fact_bond_data (
-    bond_key            INT NOT NULL AUTO_INCREMENT,
+    bond_key            BIGINT NOT NULL AUTO_INCREMENT,
     company_key         INT NOT NULL,
     bond_code           VARCHAR(50),
     issuance_date       DATE,

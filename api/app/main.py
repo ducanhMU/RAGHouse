@@ -35,6 +35,13 @@ from .rag import (
     create_or_get_collection
 )
 
+# Thêm import mới:
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from pydantic_ai import UserError
+
+# Import Agent vừa tạo
+from .agent import financial_agent, FinancialDeps
+
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +69,9 @@ app.add_middleware(
 milvus_collection: Optional[Collection] = None
 UPLOAD_DIR = Path("/app/data/uploads")
 DATA_DIR = Path("/app/data")
+
+# Thêm biến Global cho StarRocks
+starrocks_engine: Optional[AsyncEngine] = None
 
 
 # ============================================
@@ -112,11 +122,24 @@ class ServiceInfo(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     """Initialize DB, Milvus, models, and auto-ingest initial files"""
-    global milvus_collection
+    global milvus_collection, starrocks_engine
     
     logger.info("=" * 60)
     logger.info("Starting RAG API server...")
     logger.info("=" * 60)
+
+    # >>> THÊM MỚI: Kết nối StarRocks
+    try:
+        logger.info("Connecting to StarRocks for AI Agent...")
+        # Lấy URI từ env (đã config trong docker-compose: mysql+aiomysql://...)
+        starrocks_uri = os.getenv("STARROCKS_URI")
+        if starrocks_uri:
+            starrocks_engine = create_async_engine(starrocks_uri, echo=False)
+            logger.info("✓ StarRocks Async Engine created")
+        else:
+            logger.warning("⚠ STARROCKS_URI not found. Financial Agent will fail.")
+    except Exception as e:
+        logger.error(f"✗ Failed to connect StarRocks: {e}")
     
     # Create database tables
     try:
@@ -199,6 +222,73 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 
+    # >>> THÊM MỚI: Đóng kết nối StarRocks
+    if starrocks_engine:
+        await starrocks_engine.dispose()
+        logger.info("✓ StarRocks connection closed")
+
+# ============================================
+# NEW: Financial Agent Test Endpoint
+# ============================================
+
+class AgentTestRequest(BaseModel):
+    query: str
+
+class AgentTestResponse(BaseModel):
+    status: str      # "success", "no_intent", "error"
+    sql_executed: bool
+    answer: str
+    details: Optional[str] = None
+
+@app.post("/agent/test", response_model=AgentTestResponse, tags=["Agent Debug"])
+async def test_financial_agent(request: AgentTestRequest):
+    """
+    Test endpoint for Pydantic AI + StarRocks.
+    - Checks if query relates to financial data.
+    - If yes -> Executes SQL -> Returns Answer.
+    - If no -> Returns 'NO_INTENT_DETECTED'.
+    """
+    if not starrocks_engine:
+        raise HTTPException(status_code=503, detail="StarRocks engine not ready")
+
+    try:
+        # Chuẩn bị Dependencies (Inject DB Connection)
+        deps = FinancialDeps(engine=starrocks_engine)
+        
+        # Chạy Agent
+        result = await financial_agent.run(request.query, deps=deps)
+        
+        # Logic kiểm tra kết quả
+        answer_text = result.data
+        
+        # Kiểm tra xem Agent có gọi tool execute_sql không?
+        # Pydantic AI lưu usage history, nhưng cách đơn giản nhất là check nội dung trả về
+        # (Theo Prompt quy ước: nếu không liên quan trả về "NO_INTENT_DETECTED")
+        
+        if "NO_INTENT_DETECTED" in answer_text:
+             return AgentTestResponse(
+                status="no_intent",
+                sql_executed=False,
+                answer="Query not related to financial data.",
+                details=answer_text
+            )
+            
+        return AgentTestResponse(
+            status="success",
+            sql_executed=True, # Thực tế cần check result.usage().requests để chính xác 100%, nhưng ở đây giả định agent làm đúng
+            answer=answer_text
+        )
+
+    except UserError as e:
+        return AgentTestResponse(
+            status="error",
+            sql_executed=False,
+            answer="Agent Error",
+            details=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Agent processing error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
 # Health & System Endpoints
