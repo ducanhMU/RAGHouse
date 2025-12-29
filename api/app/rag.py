@@ -1,3 +1,4 @@
+# file api/app/rag.py
 """
 RAG Query Module
 Handles hybrid search, reranking, LLM generation, and 3-3 memory mechanism.

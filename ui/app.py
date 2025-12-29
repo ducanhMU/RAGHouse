@@ -1,3 +1,4 @@
+# file ui/app.py
 """
 Streamlit UI for RAG Financial Assistant
 Provides chat interface, file management, and system monitoring.

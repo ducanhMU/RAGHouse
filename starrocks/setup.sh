@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# file starrocks/setup.sh
 # =================================================================
 # RAGHOUSE MIGRATION & SETUP SCRIPT
 # Tác dụng:

@@ -61,8 +61,8 @@ services:
       - ${DATA_ROOT}/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     ports:
-      - "9001:9001"  # MinIO Console
-      - "9003:9000"  # MinIO API
+      - "9001:9001"
+      - "9003:9000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -146,7 +146,7 @@ services:
       wait"]
 
   # ============================================
-  # StarRocks Frontend (FE) - Quản lý Metadata & Client
+  # StarRocks Frontend (FE)
   # ============================================
   starrocks-fe:
     image: starrocks/fe-ubuntu:latest
@@ -155,12 +155,11 @@ services:
     environment:
       - TZ=Asia/Ho_Chi_Minh
     volumes:
-      # Lưu Metadata của FE
       - ${DATA_ROOT}/starrocks_fe:/opt/starrocks/fe/meta
     ports:
-      - "8030:8030"  # FE Web UI
-      - "9020:9020"  # RPC Port
-      - "9030:9030"  # MySQL Protocol Port (API kết nối vào đây)
+      - "8030:8030"
+      - "9020:9020"
+      - "9030:9030"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8030/api/health"]
       interval: 10s
@@ -171,7 +170,7 @@ services:
     restart: unless-stopped
 
   # ============================================
-  # StarRocks Backend (BE) - Lưu trữ & Tính toán
+  # StarRocks Backend (BE)
   # ============================================
   starrocks-be:
     image: starrocks/be-ubuntu:latest
@@ -180,12 +179,11 @@ services:
     environment:
       - TZ=Asia/Ho_Chi_Minh
     volumes:
-      # Lưu trữ dữ liệu thực (Data Storage)
       - ${DATA_ROOT}/starrocks_be:/opt/starrocks/be/storage
     ports:
-      - "8040:8040"  # BE Web UI
-      - "9060:9060"  # BE RPC
-      - "9050:9050"  # BE Heartbeat
+      - "8040:8040"
+      - "9060:9060"
+      - "9050:9050"
     depends_on:
       - starrocks-fe
     networks:
@@ -193,10 +191,10 @@ services:
     restart: unless-stopped
 
   # ============================================
-  # StarRocks Init Job (Kết nối BE với FE & Init DB)
+  # StarRocks Init Job
   # ============================================
   starrocks-init:
-    image: mysql:8.0-debian
+    image: mysql:latest
     container_name: rag_starrocks_init
     volumes:
       - ./starrocks/init.sql:/init.sql
@@ -217,8 +215,7 @@ services:
         done
         
         echo "FE is up. Registering Backend (BE)..."
-        # Lệnh quan trọng: Đăng ký BE vào cluster (9050 là heartbeat port)
-        # Dùng "|| true" để không báo lỗi nếu đã đăng ký rồi
+        # Đăng ký BE vào cluster
         mysql -h starrocks-fe -P 9030 -u root -e "ALTER SYSTEM ADD BACKEND 'starrocks-be:9050'" || true
         
         echo "Executing init.sql..."
@@ -227,7 +224,7 @@ services:
         echo "Initialization completed."
 
   # ============================================
-  # FastAPI Backend (RAG Engine)
+  # FastAPI Backend
   # ============================================
   api:
     build:
@@ -235,26 +232,15 @@ services:
       dockerfile: Dockerfile
     container_name: rag_api
     environment:
-      # Database
       DATABASE_URL: postgresql://rag_user:rag_password@postgres:5432/rag_db
-      
-      # Milvus
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: rag_hybrid_collection
-      
-      # Models
       DEVICE: cuda
       HF_HOME: /app/.cache/huggingface
-      
-      # LLM
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OLLAMA_URL: http://ollama:11434
-      
-      # Logging
       LOG_LEVEL: INFO
-
-      # StarRocks (Async connection for Pydantic AI)
       STARROCKS_HOST: starrocks-fe
       STARROCKS_PORT: 9030
       STARROCKS_USER: rag_user
@@ -276,7 +262,6 @@ services:
         condition: service_started
       starrocks-fe:
         condition: service_healthy
-      # IMPORTANT: Wait for init job to finish
       starrocks-init:
         condition: service_completed_successfully
     deploy:
@@ -289,7 +274,6 @@ services:
     networks:
       - rag_network
     restart: unless-stopped
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   # ============================================
   # Streamlit UI
@@ -319,52 +303,3 @@ networks:
   rag_network:
     driver: bridge
     name: rag_network
-
-# ============================================
-# Volumes (CẤU HÌNH THÔNG MINH: REUSE OR CREATE)
-# ============================================
-volumes:
-  # 1. PostgreSQL (Đã có -> Docker sẽ tự tìm thấy 'rag_postgres_data' và dùng lại)
-  postgres_data:
-    name: rag_postgres_data
-    driver: local
-
-  # 2. Etcd (Đã có -> Dùng lại)
-  etcd_data:
-    name: rag_etcd_data
-    driver: local
-
-  # 3. MinIO (Đã có -> Dùng lại)
-  minio_data:
-    name: rag_minio_data
-    driver: local
-
-  # 4. Milvus (Đã có -> Dùng lại)
-  milvus_data:
-    name: rag_milvus_data
-    driver: local
-
-  # 5. Ollama (Đã có -> Dùng lại)
-  ollama_data:
-    name: rag_ollama_data
-    driver: local
-
-  # 6. API Uploads (Đã có -> Dùng lại)
-  api_uploads:
-    name: rag_api_uploads
-    driver: local
-
-  # 7. HF Cache (Đã có -> Dùng lại)
-  hf_cache:
-    name: rag_hf_cache
-    driver: local
-
-  # 8. StarRocks Meta (CHƯA CÓ -> Docker sẽ tự tạo mới với tên này)
-  starrocks_fe_meta:
-    name: rag_starrocks_fe_meta
-    driver: local
-  
-  # 9. StarRocks Storage (CHƯA CÓ -> Docker sẽ tự tạo mới với tên này)
-  starrocks_be_storage:
-    name: rag_starrocks_be_storage
-    driver: local

@@ -1,3 +1,4 @@
+# file api/app/main.py
 """
 FastAPI Gateway - Main Application Entry Point
 Handles startup, health checks, file management, and chat endpoints.
@@ -7,7 +8,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 import uuid
 from sqlalchemy import text
@@ -240,6 +241,211 @@ class AgentTestResponse(BaseModel):
     answer: str
     details: Optional[str] = None
 
+class StarRocksDiagnosticResponse(BaseModel):
+    overall_status: str
+    checks: Dict[str, Any]
+    test_results: List[Dict[str, Any]]
+    recommendations: List[str]
+
+@app.get("/agent/diagnostics", response_model=StarRocksDiagnosticResponse, tags=["Agent Debug"])
+async def diagnose_starrocks_agent():
+    """
+    Comprehensive diagnostic endpoint for StarRocks + Pydantic AI Agent.
+    
+    Tests:
+    1. StarRocks connection
+    2. Database schema accessibility
+    3. Simple SQL execution
+    4. LLM agent with various query types
+    5. Tool calling functionality
+    
+    Returns detailed status and recommendations for troubleshooting.
+    """
+    checks = {}
+    test_results = []
+    recommendations = []
+    overall_healthy = True
+    
+    # ===== CHECK 1: StarRocks Engine Status =====
+    if not starrocks_engine:
+        checks["starrocks_engine"] = {
+            "status": "error",
+            "message": "StarRocks engine not initialized",
+            "details": "STARROCKS_URI environment variable may be missing"
+        }
+        overall_healthy = False
+        recommendations.append("Set STARROCKS_URI environment variable in docker-compose.yml")
+    else:
+        checks["starrocks_engine"] = {
+            "status": "ok",
+            "message": "StarRocks async engine initialized"
+        }
+    
+    # ===== CHECK 2: Database Connection =====
+    if starrocks_engine:
+        try:
+            async with starrocks_engine.connect() as conn:
+                result = await conn.execute(text("SELECT 1 as test"))
+                row = result.fetchone()
+                checks["database_connection"] = {
+                    "status": "ok",
+                    "message": "Successfully connected to StarRocks",
+                    "test_query_result": row[0] if row else None
+                }
+        except Exception as e:
+            checks["database_connection"] = {
+                "status": "error",
+                "message": f"Failed to connect: {str(e)}",
+                "error_type": type(e).__name__
+            }
+            overall_healthy = False
+            recommendations.append("Verify StarRocks container is running: docker ps | grep starrocks")
+            recommendations.append("Check connection string format: mysql+aiomysql://user:pass@host:port/db")
+    
+    # ===== CHECK 3: Schema Accessibility =====
+    if starrocks_engine and checks.get("database_connection", {}).get("status") == "ok":
+        try:
+            async with starrocks_engine.connect() as conn:
+                # Check if key tables exist
+                tables_query = """
+                    SELECT TABLE_NAME 
+                    FROM information_schema.TABLES 
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME IN ('dim_company', 'mart_master_analysis', 'fact_income_statement')
+                """
+                result = await conn.execute(text(tables_query))
+                found_tables = [row[0] for row in result.fetchall()]
+                
+                checks["schema_access"] = {
+                    "status": "ok" if len(found_tables) >= 2 else "warning",
+                    "message": f"Found {len(found_tables)}/3 key tables",
+                    "tables_found": found_tables,
+                    "tables_expected": ["dim_company", "mart_master_analysis", "fact_income_statement"]
+                }
+                
+                if len(found_tables) < 2:
+                    recommendations.append("Some expected tables are missing. Verify StarRocks data ingestion.")
+                    
+        except Exception as e:
+            checks["schema_access"] = {
+                "status": "error",
+                "message": f"Cannot access schema: {str(e)}"
+            }
+            overall_healthy = False
+    
+    # ===== CHECK 4: LLM Model Availability =====
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    
+    if gemini_key:
+        checks["llm_model"] = {
+            "status": "ok",
+            "message": "Using Google Gemini 2.0 Flash",
+            "model": "gemini-2.0-flash",
+            "api_key_configured": True
+        }
+    else:
+        checks["llm_model"] = {
+            "status": "warning",
+            "message": f"Fallback to Ollama at {ollama_url}",
+            "model": "llama3:8b",
+            "api_key_configured": False
+        }
+        recommendations.append("Consider setting GEMINI_API_KEY for better performance")
+    
+    # ===== CHECK 5: Agent Functionality Tests =====
+    if starrocks_engine and checks.get("database_connection", {}).get("status") == "ok":
+        deps = FinancialDeps(engine=starrocks_engine)
+        
+        # Test 1: Non-financial query (should detect NO_INTENT)
+        try:
+            result = await financial_agent.run("What is the weather today?", deps=deps)
+            test_results.append({
+                "test_name": "Non-financial Query Detection",
+                "query": "What is the weather today?",
+                "status": "pass" if "NO_INTENT_DETECTED" in result.data else "fail",
+                "response_preview": result.data[:200],
+                "expected": "Should return NO_INTENT_DETECTED"
+            })
+        except Exception as e:
+            test_results.append({
+                "test_name": "Non-financial Query Detection",
+                "status": "error",
+                "error": str(e)
+            })
+            overall_healthy = False
+        
+        # Test 2: Simple financial query
+        try:
+            result = await financial_agent.run(
+                "Show me the top 5 companies by market cap", 
+                deps=deps
+            )
+            test_results.append({
+                "test_name": "Simple Financial Query",
+                "query": "Show me the top 5 companies by market cap",
+                "status": "pass" if "NO_INTENT_DETECTED" not in result.data else "fail",
+                "response_preview": result.data[:300],
+                "expected": "Should execute SQL and return results"
+            })
+        except Exception as e:
+            test_results.append({
+                "test_name": "Simple Financial Query",
+                "status": "error",
+                "error": str(e)
+            })
+            overall_healthy = False
+        
+        # Test 3: Query with specific ticker
+        try:
+            result = await financial_agent.run(
+                "What is the P/E ratio of HPG?", 
+                deps=deps
+            )
+            test_results.append({
+                "test_name": "Ticker-specific Query",
+                "query": "What is the P/E ratio of HPG?",
+                "status": "pass" if "NO_INTENT_DETECTED" not in result.data else "fail",
+                "response_preview": result.data[:300],
+                "expected": "Should query mart_master_analysis table"
+            })
+        except Exception as e:
+            test_results.append({
+                "test_name": "Ticker-specific Query",
+                "status": "error",
+                "error": str(e)
+            })
+    else:
+        test_results.append({
+            "test_name": "Agent Tests",
+            "status": "skipped",
+            "reason": "Database connection not available"
+        })
+    
+    # ===== DETERMINE OVERALL STATUS =====
+    error_count = sum(1 for c in checks.values() if c.get("status") == "error")
+    warning_count = sum(1 for c in checks.values() if c.get("status") == "warning")
+    failed_tests = sum(1 for t in test_results if t.get("status") in ["fail", "error"])
+    
+    if error_count > 0 or failed_tests > 0:
+        overall_status = "unhealthy"
+    elif warning_count > 0:
+        overall_status = "degraded"
+    else:
+        overall_status = "healthy"
+    
+    # ===== FINAL RECOMMENDATIONS =====
+    if not recommendations:
+        recommendations.append("All systems operational!")
+    
+    return StarRocksDiagnosticResponse(
+        overall_status=overall_status,
+        checks=checks,
+        test_results=test_results,
+        recommendations=recommendations
+    )
+
+
 @app.post("/agent/test", response_model=AgentTestResponse, tags=["Agent Debug"])
 async def test_financial_agent(request: AgentTestRequest):
     """
@@ -289,7 +495,7 @@ async def test_financial_agent(request: AgentTestRequest):
     except Exception as e:
         logger.error(f"Agent processing error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # ============================================
 # Health & System Endpoints
 # ============================================
