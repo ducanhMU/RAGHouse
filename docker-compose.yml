@@ -294,24 +294,50 @@ networks:
     name: rag_network
 
 # ============================================
-# Volumes
+# Volumes (CẤU HÌNH THÔNG MINH: REUSE OR CREATE)
 # ============================================
 volumes:
+  # 1. PostgreSQL (Đã có -> Docker sẽ tự tìm thấy 'rag_postgres_data' và dùng lại)
   postgres_data:
+    name: rag_postgres_data
     driver: local
+
+  # 2. Etcd (Đã có -> Dùng lại)
   etcd_data:
+    name: rag_etcd_data
     driver: local
+
+  # 3. MinIO (Đã có -> Dùng lại)
   minio_data:
+    name: rag_minio_data
     driver: local
+
+  # 4. Milvus (Đã có -> Dùng lại)
   milvus_data:
+    name: rag_milvus_data
     driver: local
+
+  # 5. Ollama (Đã có -> Dùng lại)
   ollama_data:
+    name: rag_ollama_data
     driver: local
+
+  # 6. API Uploads (Đã có -> Dùng lại)
   api_uploads:
+    name: rag_api_uploads
     driver: local
+
+  # 7. HF Cache (Đã có -> Dùng lại)
   hf_cache:
+    name: rag_hf_cache
     driver: local
+
+  # 8. StarRocks Meta (CHƯA CÓ -> Docker sẽ tự tạo mới với tên này)
   starrocks_fe_meta:
+    name: rag_starrocks_fe_meta
     driver: local
+  
+  # 9. StarRocks Storage (CHƯA CÓ -> Docker sẽ tự tạo mới với tên này)
   starrocks_be_storage:
+    name: rag_starrocks_be_storage
     driver: local

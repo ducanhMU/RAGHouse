@@ -27,7 +27,7 @@ cryptography      # Cần thiết cho một số kiểu xác thực MySQL
 # AI Agents & LLM (Pydantic AI Core)
 # ============================================
 # >>> QUAN TRỌNG: Thư viện chính cho Agent <<<
-pydantic-ai
+pydantic-ai[google,ollama]
 
 # Hỗ trợ debug/tracing cho Pydantic AI (rất hữu ích khi dev)
 logfire
