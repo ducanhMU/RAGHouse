@@ -146,6 +146,59 @@ services:
       wait"]
 
   # ============================================
+  # StarRocks All-in-One (OLAP DB)
+  # ============================================
+  starrocks:
+    image: starrocks/allin1-ubuntu:latest
+    container_name: rag_starrocks
+    volumes:
+      - starrocks_fe_meta:/root/StarRocks/fe/meta
+      - starrocks_be_storage:/root/StarRocks/be/storage
+    ports:
+      - "9030:9030"  # SQL Interface (MySQL protocol)
+      - "8030:8030"  # FE Web UI
+      - "8040:8040"  # BE Web UI
+    healthcheck:
+      # Healthcheck via internal localhost
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "9030", "-u", "root"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - rag_network
+    restart: unless-stopped
+
+  # ============================================
+  # StarRocks Init Job (Runs once then exits)
+  # ============================================
+  starrocks-init:
+    image: mysql:latest
+    container_name: rag_starrocks_init
+    volumes:
+      - ./starrocks/init.sql:/init.sql
+    networks:
+      - rag_network
+    depends_on:
+      starrocks:
+        condition: service_healthy
+    entrypoint: [ "bash", "-c" ]
+    # Wait loop logic to ensure StarRocks is truly ready to accept queries
+    command: 
+      - |
+        echo "Waiting for StarRocks..."
+        # Thêm --connect-timeout=2 để retry nhanh hơn
+        until mysql -h starrocks -P 9030 -u root --connect-timeout=2 -e 'SELECT 1'; do
+          echo "StarRocks unavailable - sleeping"
+          sleep 3
+        done
+        
+        echo "StarRocks is up. Executing init.sql..."
+        # Chạy file init
+        mysql -h starrocks -P 9030 -u root < /init.sql
+        
+        echo "Initialization completed."
+
+  # ============================================
   # FastAPI Backend (RAG Engine)
   # ============================================
   api:
@@ -172,6 +225,14 @@ services:
       
       # Logging
       LOG_LEVEL: INFO
+
+      # StarRocks (Async connection for Pydantic AI)
+      STARROCKS_HOST: starrocks
+      STARROCKS_PORT: 9030
+      STARROCKS_USER: rag_user
+      STARROCKS_PASSWORD: rag_password
+      STARROCKS_URI: mysql+aiomysql://rag_user:rag_password@starrocks:9030/analytics
+
     volumes:
       - ./api/app:/app/app
       - ./api/data:/app/data
@@ -186,6 +247,11 @@ services:
         condition: service_healthy
       ollama:
         condition: service_started
+      starrocks:
+        condition: service_healthy
+      # IMPORTANT: Wait for init job to finish
+      starrocks-init:
+        condition: service_completed_successfully
     deploy:
       resources:
         reservations:
@@ -233,28 +299,19 @@ networks:
 volumes:
   postgres_data:
     driver: local
-    name: rag_postgres_data
-  
   etcd_data:
     driver: local
-    name: rag_etcd_data
-  
   minio_data:
     driver: local
-    name: rag_minio_data
-  
   milvus_data:
     driver: local
-    name: rag_milvus_data
-  
   ollama_data:
     driver: local
-    name: rag_ollama_data
-  
   api_uploads:
     driver: local
-    name: rag_api_uploads
-  
   hf_cache:
     driver: local
-    name: rag_hf_cache
+  starrocks_fe_meta:
+    driver: local
+  starrocks_be_storage:
+    driver: local

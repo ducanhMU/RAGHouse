@@ -997,3 +997,19 @@ CREATE INDEX idx_macro_indicator_date ON fact_macro_timeseries (indicator_key, d
 -- GRANT SELECT ON analytics.* TO 'analyst'@'%';
 -- GRANT SELECT, INSERT, UPDATE ON analytics.* TO 'etl_user'@'%';
 -- GRANT ALL PRIVILEGES ON analytics.* TO 'admin'@'%';
+
+-- ========================================
+-- SECURITY SETUP (Optional but Recommended)
+-- ========================================
+
+-- 1. Tạo user riêng cho ứng dụng RAG (pass là 'rag_password')
+CREATE USER IF NOT EXISTS 'rag_user'@'%' IDENTIFIED BY 'rag_password';
+
+-- 2. Cấp quyền SELECT, INSERT, UPDATE, DELETE cho user này trên DB analytics
+GRANT SELECT, INSERT, UPDATE, DELETE ON analytics.* TO 'rag_user'@'%';
+
+-- 3. Cấp quyền READ cho user này (nếu cần query metadata)
+GRANT SELECT ON information_schema.* TO 'rag_user'@'%';
+
+-- Flush không bắt buộc ở các bản mới nhưng cứ thêm cho chắc
+FLUSH PRIVILEGES;

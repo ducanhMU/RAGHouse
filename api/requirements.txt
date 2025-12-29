@@ -16,6 +16,27 @@ alembic
 asyncpg
 
 # ============================================
+# Database - StarRocks (MySQL Protocol)
+# ============================================
+# Pydantic AI / SQLAlchemy cần driver để nói chuyện với StarRocks
+pymysql           # Driver đồng bộ (cơ bản)
+aiomysql          # Driver bất đồng bộ (NÊN DÙNG cho FastAPI)
+cryptography      # Cần thiết cho một số kiểu xác thực MySQL
+
+# ============================================
+# AI Agents & LLM (Pydantic AI Core)
+# ============================================
+# >>> QUAN TRỌNG: Thư viện chính cho Agent <<<
+pydantic-ai
+
+# Hỗ trợ debug/tracing cho Pydantic AI (rất hữu ích khi dev)
+logfire
+devtools
+
+# HTTP Client (Pydantic AI dùng cái này để gọi API)
+httpx>=0.27.0
+
+# ============================================
 # Vector Database - Milvus
 # ============================================
 pymilvus>=2.3.6
