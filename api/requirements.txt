@@ -98,7 +98,7 @@ python-dotenv
 # onnxruntime-gpu==1.17.0
 
 # google-ai-generativelanguage==0.4.0
-# openai
+openai
 # anthropic==0.8.1
 # cohere==4.47
 # langchain>=0.1.6

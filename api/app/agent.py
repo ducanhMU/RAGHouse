@@ -11,7 +11,7 @@ from sqlalchemy import text
 from pydantic_ai import Agent, RunContext, ModelRetry
 from pydantic_ai.models.gemini import GeminiModel
 from pydantic_ai.models.openai import OpenAIModel
-
+from openai import AsyncOpenAI  # <--- ADD THIS IMPORT
 # =============================================================================
 # Logging Configuration
 # =============================================================================
@@ -383,34 +383,29 @@ Response: "NO_INTENT_DETECTED"
 # 3. Model Selection Logic (Gemini -> Fallback Ollama)
 # =============================================================================
 def get_model():
-    """
-    Initialize the LLM model with fallback logic.
-    Priority: Gemini (if API key exists) -> Ollama (local)
-    """
     gemini_key = os.getenv("GEMINI_API_KEY")
     
     if gemini_key:
-        logger.info("Agent Strategy: Using Google Gemini 2.0 Flash")
+        logger.info("🤖 Agent Strategy: Using Google Gemini 2.0 Flash")
         return GeminiModel(
             'gemini-2.0-flash', 
             api_key=gemini_key
         )
     else:
-        logger.warning("Agent Strategy: Fallback to Local Ollama")
-        ollama_base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        logger.warning("🤖 Agent Strategy: Fallback to Local Ollama (Llama 3)")
         
-        # Ensure the URL ends with /v1 for OpenAI compatibility
+        ollama_base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
         if not ollama_base_url.endswith("/v1"):
             ollama_base_url = f"{ollama_base_url}/v1"
+            
+        # 1. Force set environment variables for OpenAI
+        # This tricks the underlying client into looking at localhost
+        os.environ["OPENAI_API_KEY"] = "ollama"
+        os.environ["OPENAI_BASE_URL"] = ollama_base_url
         
-        logger.info(f"Ollama endpoint: {ollama_base_url}")
-        
-        return OpenAIModel(
-            'llama3:8b',  # Ensure this model is pulled in Ollama
-            base_url=ollama_base_url,
-            api_key='ollama'  # Dummy key required by OpenAI client
-        )
-
+        # 2. Initialize with just the model name
+        return OpenAIModel('llama3:8b')
+    
 # Initialize Agent
 financial_agent = Agent(
     model=get_model(),
