@@ -1,14 +1,7 @@
--- ========================================
--- StarRocks Financial Analytics Schema
--- Version: 2.0 (Refined for Consistency)
--- ========================================
 
 CREATE DATABASE IF NOT EXISTS analytics;
 USE analytics;
 
--- ========================================
--- 1. DIMENSION: Companies
--- ========================================
 CREATE TABLE IF NOT EXISTS dim_company (
     company_key         BIGINT NOT NULL,
     symbol              VARCHAR(20) NOT NULL,
@@ -37,9 +30,6 @@ PROPERTIES (
 
 CREATE INDEX idx_company_symbol ON dim_company (symbol) USING BITMAP;
 
--- ========================================
--- 2. DIMENSION: Reporting Periods
--- ========================================
 CREATE TABLE IF NOT EXISTS dim_period (
     period_key          BIGINT NOT NULL,
     year                SMALLINT NOT NULL,
@@ -60,9 +50,6 @@ PROPERTIES (
 CREATE INDEX idx_period_year ON dim_period (year) USING BITMAP;
 CREATE INDEX idx_period_quarter ON dim_period (quarter) USING BITMAP;
 
--- ========================================
--- 2.1 HELPER: Period Mapping for YoY
--- ========================================
 CREATE TABLE IF NOT EXISTS dim_period_mapping (
     current_period_key  BIGINT NOT NULL,
     prev_period_key     BIGINT,
@@ -75,9 +62,6 @@ PROPERTIES (
     "replication_num" = "1"
 );
 
--- ========================================
--- 3. FACT: Income Statement
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_income_statement (
     company_key                     BIGINT NOT NULL,
     period_key                      BIGINT NOT NULL,
@@ -122,9 +106,6 @@ PROPERTIES (
 CREATE INDEX idx_is_company ON fact_income_statement (company_key) USING BITMAP;
 CREATE INDEX idx_is_period ON fact_income_statement (period_key) USING BITMAP;
 
--- ========================================
--- 4. FACT: Balance Sheet
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_balance_sheet (
     company_key                 BIGINT NOT NULL,
     period_key                  BIGINT NOT NULL,
@@ -174,9 +155,6 @@ PROPERTIES (
 CREATE INDEX idx_bs_company ON fact_balance_sheet (company_key) USING BITMAP;
 CREATE INDEX idx_bs_period ON fact_balance_sheet (period_key) USING BITMAP;
 
--- ========================================
--- 5. FACT: Cash Flow
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_cash_flow (
     company_key                 BIGINT NOT NULL,
     period_key                  BIGINT NOT NULL,
@@ -219,9 +197,6 @@ PROPERTIES (
 CREATE INDEX idx_cf_company ON fact_cash_flow (company_key) USING BITMAP;
 CREATE INDEX idx_cf_period ON fact_cash_flow (period_key) USING BITMAP;
 
--- ========================================
--- 6. FACT: Daily Market Data
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_daily_market (
     company_key             BIGINT NOT NULL,
     date                    DATE NOT NULL,
@@ -261,9 +236,6 @@ PROPERTIES (
 CREATE INDEX idx_market_company ON fact_daily_market (company_key) USING BITMAP;
 CREATE INDEX idx_market_date ON fact_daily_market (date) USING BITMAP;
 
--- ========================================
--- 6.1 FACT: Risk Metrics
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_risk_metrics (
     company_key             BIGINT NOT NULL,
     date                    DATE NOT NULL,
@@ -299,9 +271,6 @@ PROPERTIES (
 CREATE INDEX idx_risk_company ON fact_risk_metrics (company_key) USING BITMAP;
 CREATE INDEX idx_risk_date ON fact_risk_metrics (date) USING BITMAP;
 
--- ========================================
--- 7. DIMENSION: Macro Indicators
--- ========================================
 CREATE TABLE IF NOT EXISTS dim_macro_indicator (
     indicator_key       BIGINT NOT NULL,
     indicator_code      VARCHAR(50) NOT NULL,
@@ -324,9 +293,6 @@ PROPERTIES (
 
 CREATE INDEX idx_indicator_code ON dim_macro_indicator (indicator_code) USING BITMAP;
 
--- ========================================
--- 8. FACT: Macro Time Series
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_macro_timeseries (
     indicator_key       BIGINT NOT NULL,
     date                DATE NOT NULL,
@@ -356,9 +322,6 @@ PROPERTIES (
 CREATE INDEX idx_macro_indicator ON fact_macro_timeseries (indicator_key) USING BITMAP;
 CREATE INDEX idx_macro_date ON fact_macro_timeseries (date) USING BITMAP;
 
--- ========================================
--- 9. FACT: Bond Data
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_bond_data (
     bond_key            BIGINT NOT NULL,
     company_key         BIGINT NOT NULL,
@@ -387,9 +350,6 @@ PROPERTIES (
 
 CREATE INDEX idx_bond_company ON fact_bond_data (company_key) USING BITMAP;
 
--- ========================================
--- 10. FACT: Forecast
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_forecast (
     company_key         BIGINT NOT NULL,
     year                SMALLINT NOT NULL,
@@ -413,9 +373,6 @@ PROPERTIES (
 
 CREATE INDEX idx_forecast_company ON fact_forecast (company_key) USING BITMAP;
 
--- ========================================
--- 11. FACT: Budget
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_budget (
     company_key         BIGINT NOT NULL,
     period_key          BIGINT NOT NULL,
@@ -433,9 +390,6 @@ PROPERTIES (
     "storage_format" = "DEFAULT"
 );
 
--- ========================================
--- 12. FACT: Sector Benchmarks
--- ========================================
 CREATE TABLE IF NOT EXISTS fact_sector_benchmark (
     sector              VARCHAR(100) NOT NULL,
     year                SMALLINT NOT NULL,
@@ -457,9 +411,6 @@ PROPERTIES (
     "storage_format" = "DEFAULT"
 );
 
--- ========================================
--- 13. MASTER ANALYSIS MART
--- ========================================
 CREATE TABLE IF NOT EXISTS mart_master_analysis (
     company_key             BIGINT NOT NULL,
     year                    SMALLINT NOT NULL,
@@ -467,7 +418,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     report_date             DATE NOT NULL,
     price                   DECIMAL(18, 2) DEFAULT "0",
     
-    -- VALUATION
     pe_ttm                  DECIMAL(10, 4) DEFAULT "0",
     pb                      DECIMAL(10, 4) DEFAULT "0",
     ps                      DECIMAL(10, 4) DEFAULT "0",
@@ -479,7 +429,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     enterprise_value        DECIMAL(26, 2) DEFAULT "0",
     dividend_yield          DECIMAL(8, 4) DEFAULT "0",
     
-    -- PROFITABILITY
     roe_ttm                 DECIMAL(10, 4) DEFAULT "0",
     roa_ttm                 DECIMAL(10, 4) DEFAULT "0",
     roic                    DECIMAL(10, 4) DEFAULT "0",
@@ -491,7 +440,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     equity_multiplier       DECIMAL(10, 4) DEFAULT "0",
     dupont_roe              DECIMAL(10, 4) DEFAULT "0",
     
-    -- GROWTH
     revenue_growth_yoy      DECIMAL(10, 4) DEFAULT "0",
     profit_growth_yoy       DECIMAL(10, 4) DEFAULT "0",
     eps_growth_yoy          DECIMAL(10, 4) DEFAULT "0",
@@ -501,7 +449,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     profit_cagr_3y          DECIMAL(10, 4) DEFAULT "0",
     eps_cagr_3y             DECIMAL(10, 4) DEFAULT "0",
     
-    -- LEVERAGE & LIQUIDITY
     debt_to_equity          DECIMAL(10, 4) DEFAULT "0",
     debt_to_assets          DECIMAL(10, 4) DEFAULT "0",
     interest_coverage       DECIMAL(10, 4) DEFAULT "0",
@@ -512,7 +459,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     net_debt                DECIMAL(24, 2) DEFAULT "0",
     net_debt_to_ebitda      DECIMAL(10, 4) DEFAULT "0",
     
-    -- CASH FLOW QUALITY
     fcf_ttm                 DECIMAL(24, 2) DEFAULT "0",
     fcf_yield               DECIMAL(10, 4) DEFAULT "0",
     fcf_conversion          DECIMAL(10, 4) DEFAULT "0",
@@ -520,7 +466,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     capex_to_revenue        DECIMAL(10, 4) DEFAULT "0",
     accrual_ratio           DECIMAL(10, 4) DEFAULT "0",
     
-    -- EFFICIENCY
     receivables_turnover    DECIMAL(10, 4) DEFAULT "0",
     inventory_turnover      DECIMAL(10, 4) DEFAULT "0",
     payables_turnover       DECIMAL(10, 4) DEFAULT "0",
@@ -529,30 +474,25 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     days_payables           DECIMAL(10, 2) DEFAULT "0",
     cash_conversion_cycle   DECIMAL(10, 2) DEFAULT "0",
     
-    -- QUALITY SCORES
     piotroski_f_score       TINYINT DEFAULT "0",
     altman_z_score          DECIMAL(10, 4) DEFAULT "0",
     beneish_m_score         DECIMAL(10, 4) DEFAULT "0",
     sloan_ratio             DECIMAL(10, 4) DEFAULT "0",
     
-    -- MARKET DATA
     beta                    DECIMAL(8, 4) DEFAULT "0",
     volatility_30d          DECIMAL(8, 4) DEFAULT "0",
     volume_avg_30d          DECIMAL(20, 2) DEFAULT "0",
     
-    -- FOREIGN DATA
     foreign_ownership       DECIMAL(8, 4) DEFAULT "0",
     foreign_net_buy_ttm     DECIMAL(24, 2) DEFAULT "0",
     room_left               DECIMAL(8, 4) DEFAULT "0",
     
-    -- SECTOR COMPARISON
     roe_vs_sector           DECIMAL(10, 4) DEFAULT "0",
     margin_vs_sector        DECIMAL(10, 4) DEFAULT "0",
     pe_vs_sector            DECIMAL(10, 4) DEFAULT "0",
     growth_vs_sector        DECIMAL(10, 4) DEFAULT "0",
     sector_rank             SMALLINT DEFAULT "0",
     
-    -- LEASE ADJUSTMENTS
     lease_adjusted_net_debt DECIMAL(24, 2) DEFAULT "0",
     tax_shield              DECIMAL(24, 2) DEFAULT "0",
     
@@ -578,9 +518,6 @@ CREATE INDEX idx_mart_company ON mart_master_analysis (company_key) USING BITMAP
 CREATE INDEX idx_mart_pe ON mart_master_analysis (pe_ttm) USING BITMAP;
 CREATE INDEX idx_mart_roe ON mart_master_analysis (roe_ttm) USING BITMAP;
 
--- ========================================
--- 14. AUDIT LOG
--- ========================================
 CREATE TABLE IF NOT EXISTS audit_log (
     log_id              BIGINT NOT NULL,
     user_id             VARCHAR(100),
@@ -593,7 +530,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip_address          VARCHAR(50),
     timestamp           DATETIME DEFAULT CURRENT_TIMESTAMP
 ) ENGINE = OLAP
-DUPLICATE KEY (log_id, user_id) -- <<< CHANGED: Using Duplicate Key (Sort Keys)
+DUPLICATE KEY (log_id, user_id) 
 PARTITION BY RANGE(timestamp) ()
 DISTRIBUTED BY HASH(log_id) BUCKETS 4
 PROPERTIES (
@@ -607,9 +544,6 @@ PROPERTIES (
     "dynamic_partition.buckets" = "4"
 );
 
--- ========================================
--- 15. ROLLUP: Monthly Market
--- ========================================
 CREATE TABLE IF NOT EXISTS rollup_monthly_market (
     company_key         BIGINT NOT NULL,
     year_month          DATE NOT NULL,
@@ -625,10 +559,6 @@ PROPERTIES (
     "replication_num" = "1",
     "storage_format" = "DEFAULT"
 );
-
--- ========================================
--- 16. MATERIALIZED VIEWS
--- ========================================
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_market_summary
 DISTRIBUTED BY HASH(date) BUCKETS 8
@@ -660,14 +590,6 @@ JOIN fact_daily_market m ON m.company_key = c.company_key
 WHERE c.is_active = 1
 GROUP BY c.sector, m.date;
 
--- ========================================
--- SECURITY SETUP
--- ========================================
-
 CREATE USER IF NOT EXISTS 'rag_user'@'%' IDENTIFIED BY 'rag_password';
 GRANT SELECT, INSERT, UPDATE, DELETE ON analytics.* TO 'rag_user'@'%';
 GRANT SELECT ON information_schema.* TO 'rag_user'@'%';
-
--- ========================================
--- END OF FIXED SCHEMA
--- ========================================
