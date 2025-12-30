@@ -1,37 +1,45 @@
-# API Dockerfile
-FROM nvidia/cuda:12.1.0-base-ubuntu22.04
+# ============================================
+# OPTIMIZED DOCKERFILE
+# ============================================
+# Thay vì dùng nvidia/cuda (phải tự cài python & torch rất lâu), 
+# ta dùng image chính chủ của PyTorch đã có sẵn mọi thứ.
+# Image này dựa trên Ubuntu, có sẵn Python 3.10+, CUDA 12.1 và PyTorch 2.2+
+FROM pytorch/pytorch:2.2.1-cuda12.1-cudnn8-runtime
 
 # Set working directory
 WORKDIR /app
 
-# Install Python and system dependencies
+# Install system dependencies
+# build-essential & git: cần thiết để pip build một số thư viện python extensions
 RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    python3-dev \
     build-essential \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+# Upgrade pip (đã có sẵn nhưng nên update)
+RUN pip install --no-cache-dir --upgrade pip
 
-# Copy requirements
+# Copy requirements TRƯỚC (để tận dụng Docker Cache)
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Lưu ý: requirements.txt đã bỏ 'torch' để dùng bản có sẵn của image
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Download BGE-M3 and reranker models (cached in volume)
-RUN python3 -c "from FlagEmbedding import BGEM3FlagModel, FlagReranker; \
+# Download AI Models (BGE-M3 & Reranker)
+# Bước này sẽ được cache lại, không phải tải lại trừ khi bạn sửa dòng này
+RUN python -c "from FlagEmbedding import BGEM3FlagModel, FlagReranker; \
+    print('Downloading BGE-M3...'); \
     BGEM3FlagModel('BAAI/bge-m3', use_fp16=True); \
+    print('Downloading Reranker...'); \
     FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True)"
 
 # Create directories
 RUN mkdir -p /app/data /app/data/uploads /app/.cache/huggingface
 
-# Copy application code
+# Copy application code SAU CÙNG
+# (Để khi bạn sửa code, Docker không phải chạy lại các bước cài thư viện ở trên)
 COPY ./app /app/app
 
 # Expose port

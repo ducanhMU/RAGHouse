@@ -1,0 +1,18 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+venv
+.venv
+pip-log.txt
+.git
+.gitignore
+.DS_Store
+# Bỏ qua data để không copy nhầm file upload lớn vào image
+data/
+uploads/
+# Bỏ qua cache cục bộ
+.cache
+hf_cache
