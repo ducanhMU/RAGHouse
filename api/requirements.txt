@@ -59,6 +59,8 @@ chardet==5.2.0
 FlagEmbedding
 # torch>=2.1.2
 # numpy
+transformers>=4.37.2
+tokenizers>=0.15.1
 
 # ============================================
 # LLM Integration

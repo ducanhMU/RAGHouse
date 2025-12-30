@@ -378,7 +378,7 @@ def get_model():
     if gemini_key:
         logger.info("🤖 Agent Strategy: Using Google Gemini 2.0 Flash")
         return GeminiModel(
-            'gemini-2.0-flash-exp', 
+            'gemini-2.0-flash', 
             api_key=gemini_key
         )
     else:
