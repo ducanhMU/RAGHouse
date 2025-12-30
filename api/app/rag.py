@@ -46,8 +46,29 @@ def load_reranker_model(model_name: str = "BAAI/bge-reranker-v2-m3", device: str
     """Load BGE reranker model"""
     global bge_reranker
     logger.info(f"Loading reranker model: {model_name} on {device}")
-    bge_reranker = FlagReranker(model_name, use_fp16=True, device=device)
-    logger.info("Reranker model loaded successfully")
+    # Local model path
+    local_path = Path("/app/models/bge-reranker-v2-m3")
+    if local_path.exists():
+        logger.info(f"Loading reranker from local path: {local_path} on {device}")
+        try:
+            bge_reranker = FlagReranker(
+                str(local_path),
+                use_fp16=True,
+                device=device
+            )
+            logger.info("Reranker model loaded (local) successfully")
+            return
+        except Exception as e:
+            logger.error(f"Failed loading local reranker model: {e}. Trying HF Hub...")
+
+    # Fallback to HF Hub if local not found
+    logger.info(f"Loading reranker model from Hub: {model_name} on {device}")
+    bge_reranker = FlagReranker(
+        model_name,
+        use_fp16=True,
+        device=device
+    )
+    logger.info("Reranker model loaded (hub) successfully")
 
 
 def create_or_get_collection(collection_name: str) -> Collection:

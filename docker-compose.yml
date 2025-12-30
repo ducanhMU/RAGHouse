@@ -245,22 +245,44 @@ services:
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: rag_hybrid_collection
       DEVICE: cuda
-      HF_HOME: /app/.cache/huggingface
+
+      # -------------------------------------------------
+      # Hugging Face cache (để transformers / huggingface_hub)
+      # -------------------------------------------------
+      HF_HOME: /app/cache/huggingface
+      HF_HUB_CACHE: /app/cache/huggingface/hub
+      TRANSFORMERS_CACHE: /app/cache/huggingface/transformers
+      HF_DATASETS_CACHE: /app/cache/huggingface/datasets
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      # Nếu bạn có token để tăng tốc download (nếu cần)
+      HF_TOKEN: ${HF_TOKEN:-}
+
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OLLAMA_URL: http://ollama:11434
+
       LOG_LEVEL: INFO
+
       STARROCKS_HOST: starrocks-fe
       STARROCKS_PORT: 9030
       STARROCKS_USER: rag_user
       STARROCKS_PASSWORD: rag_password
       STARROCKS_URI: mysql+aiomysql://rag_user:rag_password@starrocks-fe:9030/analytics
+
     volumes:
       - ./api/app:/app/app
       - ./api/data:/app/data
       - ${DATA_ROOT}/uploads:/app/data/uploads
-      - ${DATA_ROOT}/hf_cache:/app/.cache/huggingface
+
+      # Mount HF cache để tránh lỗi permission
+      - ${DATA_ROOT}/hf_cache:/app/cache/huggingface
+
+      # Mount LOCAL MODELS bạn đã download
+      - ${DATA_ROOT}/models/bge-m3:/app/models/bge-m3
+      - ${DATA_ROOT}/models/bge-reranker-v2-m3:/app/models/bge-reranker-v2-m3
+
     ports:
       - "8000:8000"
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -272,6 +294,7 @@ services:
         condition: service_healthy
       starrocks-init:
         condition: service_completed_successfully
+
     deploy:
       resources:
         reservations:
@@ -279,8 +302,10 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
     networks:
       - rag_network
+
     restart: unless-stopped
 
   # ============================================

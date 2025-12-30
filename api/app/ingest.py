@@ -30,8 +30,29 @@ def load_embedding_model(model_name: str = "BAAI/bge-m3", device: str = "cuda"):
     """Load BGE-M3 embedding model on GPU"""
     global bge_m3_model
     logger.info(f"Loading embedding model: {model_name} on {device}")
-    bge_m3_model = BGEM3FlagModel(model_name, use_fp16=True, device=device)
-    logger.info("Embedding model loaded successfully")
+    # Local model path (mounted into the container)
+    local_path = Path("/app/models/bge-m3")
+    if local_path.exists():
+        logger.info(f"Loading embedding model from local path: {local_path} on {device}")
+        try:
+            bge_m3_model = BGEM3FlagModel(
+                str(local_path),
+                use_fp16=True,
+                device=device
+            )
+            logger.info("Embedding model loaded (local) successfully")
+            return
+        except Exception as e:
+            logger.error(f"Failed loading local embedding model: {e}. Trying HF Hub...")
+
+    # Fallback: load from HF Hub
+    logger.info(f"Loading embedding model from Hub: {model_name} on {device}")
+    bge_m3_model = BGEM3FlagModel(
+        model_name,
+        use_fp16=True,
+        device=device
+    )
+    logger.info("Embedding model loaded (hub) successfully")
 
 
 def compute_file_hash(file_path: str) -> str:
