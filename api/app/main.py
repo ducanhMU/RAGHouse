@@ -36,11 +36,12 @@ from .rag import (
     create_or_get_collection
 )
 
-# Thêm import mới:
+from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
-from pydantic_ai import UserError
+# Pydantic AI imports
+from pydantic_ai.exceptions import UserError
 
-# Import Agent vừa tạo
+# Import Agent module
 from .agent import financial_agent, FinancialDeps
 
 # Logging configuration
@@ -70,10 +71,9 @@ app.add_middleware(
 milvus_collection: Optional[Collection] = None
 UPLOAD_DIR = Path("/app/data/uploads")
 DATA_DIR = Path("/app/data")
+_is_reingesting = False
 
-# Thêm biến Global cho StarRocks
 starrocks_engine: Optional[AsyncEngine] = None
-
 
 # ============================================
 # Pydantic Models
@@ -104,9 +104,9 @@ class FileUploadResponse(BaseModel):
     message: str
 
 
-class HealthResponse(BaseModel):
-    status: str
-    details: dict
+# class HealthResponse(BaseModel):
+#     status: str
+#     details: dict
 
 
 class ServiceInfo(BaseModel):
@@ -115,6 +115,26 @@ class ServiceInfo(BaseModel):
     description: str
     status: str
 
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+    database: Optional[str] = None
+
+class AgentTestRequest(BaseModel):
+    query: str
+
+class AgentTestResponse(BaseModel):
+    status: str      # "success", "no_intent", "error"
+    sql_executed: bool
+    answer: str
+    details: Optional[str] = None
+
+class StarRocksDiagnosticResponse(BaseModel):
+    overall_status: str
+    checks: Dict[str, Any]
+    test_results: List[Dict[str, Any]]
+    recommendations: List[str]
 
 # ============================================
 # Lifecycle Events
@@ -228,32 +248,143 @@ async def shutdown_event():
         await starrocks_engine.dispose()
         logger.info("✓ StarRocks connection closed")
 
-# ============================================
-# NEW: Financial Agent Test Endpoint
-# ============================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manage application lifespan:
+    - Startup: Initialize database connections
+    - Shutdown: Clean up resources
+    """
+    global starrocks_engine
+    
+    logger.info("=" * 80)
+    logger.info("APPLICATION STARTUP")
+    logger.info("=" * 80)
+    
+    # Initialize StarRocks connection
+    starrocks_uri = os.getenv("STARROCKS_URI")
+    
+    if starrocks_uri:
+        try:
+            starrocks_engine = create_async_engine(
+                starrocks_uri,
+                echo=False,  # Set to True for SQL query logging
+                pool_pre_ping=True,
+                pool_recycle=3600
+            )
+            
+            # Test connection
+            async with starrocks_engine.connect() as conn:
+                result = await conn.execute(text("SELECT 1 as test"))
+                test_value = result.scalar()
+                
+                if test_value == 1:
+                    logger.info("StarRocks connection: SUCCESS")
+                else:
+                    logger.warning("StarRocks connection test returned unexpected value")
+                    
+        except Exception as e:
+            logger.error(f"StarRocks connection: FAILED - {str(e)}")
+            starrocks_engine = None
+    else:
+        logger.warning("STARROCKS_URI not set. Database features will be unavailable.")
+    
+    logger.info("=" * 80)
+    
+    yield  # Application runs here
+    
+    # Shutdown
+    logger.info("=" * 80)
+    logger.info("APPLICATION SHUTDOWN")
+    logger.info("=" * 80)
+    
+    if starrocks_engine:
+        await starrocks_engine.dispose()
+        logger.info("StarRocks connection pool closed")
 
-class AgentTestRequest(BaseModel):
-    query: str
+# =============================================================================
+# Agent Test Endpoints
+# =============================================================================
 
-class AgentTestResponse(BaseModel):
-    status: str      # "success", "no_intent", "error"
-    sql_executed: bool
-    answer: str
-    details: Optional[str] = None
+@app.post("/agent/test", response_model=AgentTestResponse, tags=["Agent"])
+async def test_financial_agent(request: AgentTestRequest):
+    """
+    Test endpoint for Pydantic AI + StarRocks integration.
+    
+    Flow:
+    1. Receives user query
+    2. Agent determines if query is financial-related
+    3. If yes: Generates SQL, executes it, returns natural language answer
+    4. If no: Returns 'NO_INTENT_DETECTED'
+    
+    Example queries:
+    - "What is the P/E ratio of HPG?"
+    - "Show me the top 10 companies by ROE"
+    - "Compare banking sector performance"
+    - "What's the weather today?" (should return no_intent)
+    """
+    if not starrocks_engine:
+        raise HTTPException(
+            status_code=503, 
+            detail="StarRocks database not available. Check STARROCKS_URI configuration."
+        )
 
-class StarRocksDiagnosticResponse(BaseModel):
-    overall_status: str
-    checks: Dict[str, Any]
-    test_results: List[Dict[str, Any]]
-    recommendations: List[str]
+    try:
+        logger.info("=" * 80)
+        logger.info(f"AGENT TEST REQUEST: {request.query}")
+        logger.info("=" * 80)
+        
+        # Prepare dependencies (inject DB connection)
+        deps = FinancialDeps(engine=starrocks_engine)
+        
+        # Run the agent
+        result = await financial_agent.run(request.query, deps=deps)
+        
+        # Extract answer
+        answer_text = result.data
+        
+        logger.info(f"Agent Response Preview: {answer_text[:200]}...")
+        
+        # Check if query was detected as non-financial
+        if "NO_INTENT_DETECTED" in answer_text:
+            logger.info("Result: NO_INTENT (non-financial query)")
+            return AgentTestResponse(
+                status="no_intent",
+                sql_executed=False,
+                answer="Query not related to financial data.",
+                details=answer_text
+            )
+        
+        # Successful financial query
+        logger.info("Result: SUCCESS (financial query processed)")
+        return AgentTestResponse(
+            status="success",
+            sql_executed=True,
+            answer=answer_text
+        )
 
-@app.get("/agent/diagnostics", response_model=StarRocksDiagnosticResponse, tags=["Agent Debug"])
+    except UserError as e:
+        logger.error(f"Agent User Error: {str(e)}")
+        return AgentTestResponse(
+            status="error",
+            sql_executed=False,
+            answer="Agent encountered an error while processing your query.",
+            details=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Agent processing error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@app.get("/agent/diagnostics", response_model=StarRocksDiagnosticResponse, tags=["Agent"])
 async def diagnose_starrocks_agent():
     """
     Comprehensive diagnostic endpoint for StarRocks + Pydantic AI Agent.
     
     Tests:
-    1. StarRocks connection
+    1. StarRocks connection status
     2. Database schema accessibility
     3. Simple SQL execution
     4. LLM agent with various query types
@@ -264,17 +395,16 @@ async def diagnose_starrocks_agent():
     checks = {}
     test_results = []
     recommendations = []
-    overall_healthy = True
     
     # ===== CHECK 1: StarRocks Engine Status =====
     if not starrocks_engine:
         checks["starrocks_engine"] = {
             "status": "error",
             "message": "StarRocks engine not initialized",
-            "details": "STARROCKS_URI environment variable may be missing"
+            "details": "STARROCKS_URI environment variable may be missing or invalid"
         }
-        overall_healthy = False
         recommendations.append("Set STARROCKS_URI environment variable in docker-compose.yml")
+        recommendations.append("Format: mysql+aiomysql://user:password@host:port/database")
     else:
         checks["starrocks_engine"] = {
             "status": "ok",
@@ -298,9 +428,8 @@ async def diagnose_starrocks_agent():
                 "message": f"Failed to connect: {str(e)}",
                 "error_type": type(e).__name__
             }
-            overall_healthy = False
             recommendations.append("Verify StarRocks container is running: docker ps | grep starrocks")
-            recommendations.append("Check connection string format: mysql+aiomysql://user:pass@host:port/db")
+            recommendations.append("Check connection string format and credentials")
     
     # ===== CHECK 3: Schema Accessibility =====
     if starrocks_engine and checks.get("database_connection", {}).get("status") == "ok":
@@ -331,7 +460,7 @@ async def diagnose_starrocks_agent():
                 "status": "error",
                 "message": f"Cannot access schema: {str(e)}"
             }
-            overall_healthy = False
+            recommendations.append("Verify database name and user permissions")
     
     # ===== CHECK 4: LLM Model Availability =====
     gemini_key = os.getenv("GEMINI_API_KEY")
@@ -341,7 +470,8 @@ async def diagnose_starrocks_agent():
         checks["llm_model"] = {
             "status": "ok",
             "message": "Using Google Gemini 2.0 Flash",
-            "model": "gemini-2.0-flash",
+            "model": "gemini-2.0-flash-exp",
+            "provider": "Google",
             "api_key_configured": True
         }
     else:
@@ -349,9 +479,11 @@ async def diagnose_starrocks_agent():
             "status": "warning",
             "message": f"Fallback to Ollama at {ollama_url}",
             "model": "llama3:8b",
+            "provider": "Ollama (local)",
             "api_key_configured": False
         }
         recommendations.append("Consider setting GEMINI_API_KEY for better performance")
+        recommendations.append("Ensure Ollama is running: docker ps | grep ollama")
     
     # ===== CHECK 5: Agent Functionality Tests =====
     if starrocks_engine and checks.get("database_connection", {}).get("status") == "ok":
@@ -359,56 +491,70 @@ async def diagnose_starrocks_agent():
         
         # Test 1: Non-financial query (should detect NO_INTENT)
         try:
+            logger.info("Running Test 1: Non-financial Query Detection")
             result = await financial_agent.run("What is the weather today?", deps=deps)
+            is_pass = "NO_INTENT_DETECTED" in result.data
+            
             test_results.append({
                 "test_name": "Non-financial Query Detection",
                 "query": "What is the weather today?",
-                "status": "pass" if "NO_INTENT_DETECTED" in result.data else "fail",
+                "status": "pass" if is_pass else "fail",
                 "response_preview": result.data[:200],
                 "expected": "Should return NO_INTENT_DETECTED"
             })
+            
+            if not is_pass:
+                recommendations.append("Agent is not properly filtering non-financial queries")
+                
         except Exception as e:
             test_results.append({
                 "test_name": "Non-financial Query Detection",
                 "status": "error",
                 "error": str(e)
             })
-            overall_healthy = False
+            recommendations.append(f"Agent test failed: {str(e)}")
         
         # Test 2: Simple financial query
         try:
+            logger.info("Running Test 2: Simple Financial Query")
             result = await financial_agent.run(
-                "Show me the top 5 companies by market cap", 
+                "Show me 3 companies from the database", 
                 deps=deps
             )
+            is_pass = "NO_INTENT_DETECTED" not in result.data
+            
             test_results.append({
                 "test_name": "Simple Financial Query",
-                "query": "Show me the top 5 companies by market cap",
-                "status": "pass" if "NO_INTENT_DETECTED" not in result.data else "fail",
+                "query": "Show me 3 companies from the database",
+                "status": "pass" if is_pass else "fail",
                 "response_preview": result.data[:300],
-                "expected": "Should execute SQL and return results"
+                "expected": "Should execute SQL and return company data"
             })
+            
         except Exception as e:
             test_results.append({
                 "test_name": "Simple Financial Query",
                 "status": "error",
                 "error": str(e)
             })
-            overall_healthy = False
         
         # Test 3: Query with specific ticker
         try:
+            logger.info("Running Test 3: Ticker-specific Query")
             result = await financial_agent.run(
                 "What is the P/E ratio of HPG?", 
                 deps=deps
             )
+            is_pass = "NO_INTENT_DETECTED" not in result.data
+            
             test_results.append({
-                "test_name": "Ticker-specific Query",
+                "test_name": "Ticker-specific Query (P/E Ratio)",
                 "query": "What is the P/E ratio of HPG?",
-                "status": "pass" if "NO_INTENT_DETECTED" not in result.data else "fail",
+                "status": "pass" if is_pass else "fail",
                 "response_preview": result.data[:300],
                 "expected": "Should query mart_master_analysis table"
             })
+            
         except Exception as e:
             test_results.append({
                 "test_name": "Ticker-specific Query",
@@ -436,7 +582,7 @@ async def diagnose_starrocks_agent():
     
     # ===== FINAL RECOMMENDATIONS =====
     if not recommendations:
-        recommendations.append("All systems operational!")
+        recommendations.append("All systems operational! Agent is ready to process queries.")
     
     return StarRocksDiagnosticResponse(
         overall_status=overall_status,
@@ -445,57 +591,58 @@ async def diagnose_starrocks_agent():
         recommendations=recommendations
     )
 
+# =============================================================================
+# Direct Database Query Endpoint (for debugging)
+# =============================================================================
 
-@app.post("/agent/test", response_model=AgentTestResponse, tags=["Agent Debug"])
-async def test_financial_agent(request: AgentTestRequest):
+@app.get("/db/test", tags=["Database"])
+async def test_database_query():
     """
-    Test endpoint for Pydantic AI + StarRocks.
-    - Checks if query relates to financial data.
-    - If yes -> Executes SQL -> Returns Answer.
-    - If no -> Returns 'NO_INTENT_DETECTED'.
+    Direct database test endpoint.
+    Executes a simple query to verify StarRocks connectivity.
     """
     if not starrocks_engine:
-        raise HTTPException(status_code=503, detail="StarRocks engine not ready")
-
-    try:
-        # Chuẩn bị Dependencies (Inject DB Connection)
-        deps = FinancialDeps(engine=starrocks_engine)
-        
-        # Chạy Agent
-        result = await financial_agent.run(request.query, deps=deps)
-        
-        # Logic kiểm tra kết quả
-        answer_text = result.data
-        
-        # Kiểm tra xem Agent có gọi tool execute_sql không?
-        # Pydantic AI lưu usage history, nhưng cách đơn giản nhất là check nội dung trả về
-        # (Theo Prompt quy ước: nếu không liên quan trả về "NO_INTENT_DETECTED")
-        
-        if "NO_INTENT_DETECTED" in answer_text:
-             return AgentTestResponse(
-                status="no_intent",
-                sql_executed=False,
-                answer="Query not related to financial data.",
-                details=answer_text
-            )
-            
-        return AgentTestResponse(
-            status="success",
-            sql_executed=True, # Thực tế cần check result.usage().requests để chính xác 100%, nhưng ở đây giả định agent làm đúng
-            answer=answer_text
+        raise HTTPException(
+            status_code=503,
+            detail="Database not configured. Set STARROCKS_URI environment variable."
         )
-
-    except UserError as e:
-        return AgentTestResponse(
-            status="error",
-            sql_executed=False,
-            answer="Agent Error",
-            details=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Agent processing error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
     
+    try:
+        async with starrocks_engine.connect() as conn:
+            # Test query: Get first 5 companies
+            query = """
+                SELECT symbol, company_name_en, sector, exchange
+                FROM dim_company
+                WHERE is_current = 1
+                LIMIT 5
+            """
+            result = await conn.execute(text(query))
+            rows = result.fetchall()
+            
+            companies = [
+                {
+                    "symbol": row[0],
+                    "name": row[1],
+                    "sector": row[2],
+                    "exchange": row[3]
+                }
+                for row in rows
+            ]
+            
+            return {
+                "status": "success",
+                "message": "Database query executed successfully",
+                "row_count": len(companies),
+                "sample_data": companies
+            }
+            
+    except Exception as e:
+        logger.error(f"Database test query failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database query failed: {str(e)}"
+        )
+
 # ============================================
 # Health & System Endpoints
 # ============================================

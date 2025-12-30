@@ -1,16 +1,24 @@
-# file api/app/agent.py
+# file: api/app/agent.py
 import os
 import logging
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
+from decimal import Decimal
+from datetime import datetime, date
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy import text
 from pydantic_ai import Agent, RunContext, ModelRetry
 from pydantic_ai.models.gemini import GeminiModel
-from pydantic_ai.models.ollama import OllamaModel
+from pydantic_ai.models.openai import OpenAIModel
 
-# Cấu hình Logging
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -18,6 +26,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 @dataclass
 class FinancialDeps:
+    """Dependencies injected into the agent context."""
     engine: AsyncEngine
 
 # =============================================================================
@@ -83,11 +92,11 @@ Your goal is to answer user questions by generating and executing SQL queries.
 ### 2. PRE-CALCULATED ANALYSIS TABLES (*** USE THESE FIRST ***)
 ### ──────────────────────────────────────────────────────────────────────────
 
-**mart_master_analysis** (⭐ MOST IMPORTANT TABLE)
+**mart_master_analysis** (MOST IMPORTANT TABLE)
 Purpose: Pre-calculated financial ratios per quarter. Use this for P/E, ROE, Growth questions!
 
 Columns:
-- `company_key` (BIGINT) → Join with dim_company
+- `company_key` (BIGINT) -> Join with dim_company
 - `year` (INT), `quarter` (INT) - Reporting period
 - `symbol` (VARCHAR) - Denormalized ticker
 
@@ -139,6 +148,7 @@ LIMIT 1;
 
 **mart_peer_comparison**
 Purpose: Sector/Industry peer comparisons
+
 - `sector` (VARCHAR), `industry` (VARCHAR)
 - `year` (INT), `quarter` (INT)
 - `avg_pe`, `median_pe`, `min_pe`, `max_pe` (DECIMAL)
@@ -230,7 +240,7 @@ Purpose: Sector/Industry peer comparisons
 ### ──────────────────────────────────────────────────────────────────────────
 
 **fact_macro_timeseries**
-- `indicator_key` (BIGINT) → Join with dim_macro_indicator
+- `indicator_key` (BIGINT) -> Join with dim_macro_indicator
 - `date` (DATE), `year` (INT), `quarter` (INT)
 - `value` (DECIMAL)
 - `change_mom` (DECIMAL) - Month-over-Month change (%)
@@ -265,16 +275,16 @@ Purpose: Sector/Industry peer comparisons
 
 ### Strategy Selection:
 1. **For Ratio/Metric Questions** (P/E, ROE, Growth, Margins):
-   → Query `mart_master_analysis` FIRST
+   -> Query `mart_master_analysis` FIRST
    
 2. **For Raw Financial Data** (Revenue, Debt, Assets):
-   → Query `fact_income_statement`, `fact_balance_sheet`, `fact_cash_flow`
+   -> Query `fact_income_statement`, `fact_balance_sheet`, `fact_cash_flow`
    
 3. **For Price/Trading Data**:
-   → Query `fact_daily_market`
+   -> Query `fact_daily_market`
    
 4. **For Sector Comparisons**:
-   → Query `mart_peer_comparison` or `fact_sector_benchmark`
+   -> Query `mart_peer_comparison` or `fact_sector_benchmark`
 
 ### Join Pattern:
 ```sql
@@ -373,27 +383,40 @@ Response: "NO_INTENT_DETECTED"
 # 3. Model Selection Logic (Gemini -> Fallback Ollama)
 # =============================================================================
 def get_model():
+    """
+    Initialize the LLM model with fallback logic.
+    Priority: Gemini (if API key exists) -> Ollama (local)
+    """
     gemini_key = os.getenv("GEMINI_API_KEY")
     
     if gemini_key:
-        logger.info("🤖 Agent Strategy: Using Google Gemini 2.0 Flash")
+        logger.info("Agent Strategy: Using Google Gemini 2.0 Flash")
         return GeminiModel(
             'gemini-2.0-flash', 
             api_key=gemini_key
         )
     else:
-        logger.warning("🤖 Agent Strategy: Fallback to Local Ollama (Llama 3)")
-        return OllamaModel(
-            model_name='llama3:8b',
-            base_url=os.getenv("OLLAMA_URL", "http://localhost:11434")
+        logger.warning("Agent Strategy: Fallback to Local Ollama")
+        ollama_base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        
+        # Ensure the URL ends with /v1 for OpenAI compatibility
+        if not ollama_base_url.endswith("/v1"):
+            ollama_base_url = f"{ollama_base_url}/v1"
+        
+        logger.info(f"Ollama endpoint: {ollama_base_url}")
+        
+        return OpenAIModel(
+            'llama3:8b',  # Ensure this model is pulled in Ollama
+            base_url=ollama_base_url,
+            api_key='ollama'  # Dummy key required by OpenAI client
         )
 
-# Khởi tạo Agent
+# Initialize Agent
 financial_agent = Agent(
     model=get_model(),
     deps_type=FinancialDeps,
     system_prompt=DB_SCHEMA_DESCRIPTION,
-    retries=2 # Cho phép retry nếu tool lỗi
+    retries=2
 )
 
 # =============================================================================
@@ -402,7 +425,7 @@ financial_agent = Agent(
 @financial_agent.tool
 async def execute_sql(ctx: RunContext[FinancialDeps], query: str) -> str:
     """
-    Execute a SQL query against the StarRocks database.
+    Execute a SQL query against the StarRocks database with comprehensive error handling.
     
     Args:
         query: The MySQL-compatible SQL query string.
@@ -410,24 +433,40 @@ async def execute_sql(ctx: RunContext[FinancialDeps], query: str) -> str:
     Returns:
         A string representation of the result rows (List of Dicts) or an error message.
     """
-    logger.info(f"🔍 Agent executing SQL: {query}")
+    logger.info("=" * 80)
+    logger.info("SQL EXECUTION REQUEST")
+    logger.info("=" * 80)
+    logger.info(f"Query:\n{query}")
+    logger.info("-" * 80)
     
     # 1. Basic Safety Check
-    forbidden_keywords = ["DROP", "DELETE", "UPDATE", "ALTER", "TRUNCATE", "GRANT", "INSERT"]
-    if any(word in query.upper() for word in forbidden_keywords):
-        return "Error: Read-only access. Modification queries are not allowed."
+    forbidden_keywords = ["DROP", "DELETE", "UPDATE", "ALTER", "TRUNCATE", "GRANT", "INSERT", "CREATE"]
+    query_upper = query.upper()
+    
+    for keyword in forbidden_keywords:
+        if keyword in query_upper:
+            error_msg = f"Error: Read-only access. '{keyword}' operations are not allowed."
+            logger.error(error_msg)
+            return error_msg
 
     try:
-        # 2. Execution
+        # 2. Database Connection and Execution
         async with ctx.deps.engine.connect() as conn:
+            logger.info("Database connection established")
+            
+            # Execute query
             result = await conn.execute(text(query))
             
             # 3. Fetch Data
-            keys = result.keys()
+            keys = list(result.keys())
             rows = result.fetchall()
             
+            logger.info(f"Query executed successfully. Rows returned: {len(rows)}")
+            
             if not rows:
-                return "Query executed successfully. Result: No data found matching the criteria."
+                message = "Query executed successfully. Result: No data found matching the criteria."
+                logger.warning(message)
+                return message
             
             # 4. Format Output (Context Window Safety)
             MAX_ROWS_TO_RETURN = 50
@@ -436,21 +475,176 @@ async def execute_sql(ctx: RunContext[FinancialDeps], query: str) -> str:
             for i, row in enumerate(rows):
                 if i >= MAX_ROWS_TO_RETURN:
                     break
+                
                 row_dict = {}
                 for key, val in zip(keys, row):
-                    # Handle Decimal/Date serialization
-                    row_dict[key] = str(val) if val is not None else None
-                results.append(row_dict)
+                    # Handle different data types for serialization
+                    if val is None:
+                        row_dict[key] = None
+                    elif isinstance(val, (Decimal, int, float)):
+                        row_dict[key] = str(val)
+                    elif isinstance(val, (datetime, date)):
+                        row_dict[key] = val.isoformat()
+                    else:
+                        row_dict[key] = str(val)
                 
+                results.append(row_dict)
+            
+            # 5. Build response
             output_str = str(results)
             
             if len(rows) > MAX_ROWS_TO_RETURN:
-                output_str += f"\n... (Truncated. Total rows: {len(rows)}. Showing first {MAX_ROWS_TO_RETURN})"
-                
+                truncation_msg = f"\n\n[Truncated] Total rows: {len(rows)}. Showing first {MAX_ROWS_TO_RETURN} rows."
+                output_str += truncation_msg
+                logger.info(truncation_msg.strip())
+            
+            logger.info("=" * 80)
+            logger.info("SQL EXECUTION SUCCESS")
+            logger.info("=" * 80)
+            
             return output_str
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"❌ SQL Execution Error: {error_msg}")
-        # Return detailed error for self-correction
-        return f"SQL Execution Error: {error_msg}. Please check the schema and syntax, then retry with corrected query."
+        logger.error("=" * 80)
+        logger.error("SQL EXECUTION ERROR")
+        logger.error("=" * 80)
+        logger.error(f"Error Type: {type(e).__name__}")
+        logger.error(f"Error Message: {error_msg}")
+        logger.error("-" * 80)
+        
+        # Provide detailed error for self-correction
+        detailed_error = (
+            f"SQL Execution Error: {error_msg}\n\n"
+            f"Possible causes:\n"
+            f"1. Table or column name doesn't exist (check schema)\n"
+            f"2. Syntax error (verify MySQL compatibility)\n"
+            f"3. Invalid join condition or missing key\n"
+            f"4. Data type mismatch in WHERE clause\n\n"
+            f"Please verify the query against the schema and retry with corrections."
+        )
+        
+        return detailed_error
+
+# =============================================================================
+# 5. Health Check and Testing Functions
+# =============================================================================
+async def test_database_connection(engine: AsyncEngine) -> bool:
+    """
+    Test if the database connection is working properly.
+    
+    Args:
+        engine: SQLAlchemy async engine
+        
+    Returns:
+        True if connection successful, False otherwise
+    """
+    try:
+        logger.info("Testing database connection...")
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT 1 as test"))
+            row = result.fetchone()
+            
+            if row and row[0] == 1:
+                logger.info("Database connection test: SUCCESS")
+                return True
+            else:
+                logger.error("Database connection test: FAILED (unexpected result)")
+                return False
+                
+    except Exception as e:
+        logger.error(f"Database connection test: FAILED - {str(e)}")
+        return False
+
+async def test_schema_access(engine: AsyncEngine) -> Dict[str, bool]:
+    """
+    Test access to key tables in the schema.
+    
+    Args:
+        engine: SQLAlchemy async engine
+        
+    Returns:
+        Dictionary with table names and their accessibility status
+    """
+    tables_to_test = [
+        "dim_company",
+        "mart_master_analysis",
+        "fact_income_statement",
+        "fact_balance_sheet",
+        "fact_daily_market"
+    ]
+    
+    results = {}
+    
+    logger.info("Testing schema table access...")
+    
+    for table in tables_to_test:
+        try:
+            async with engine.connect() as conn:
+                query = f"SELECT COUNT(*) as cnt FROM {table} LIMIT 1"
+                result = await conn.execute(text(query))
+                row = result.fetchone()
+                
+                results[table] = True
+                logger.info(f"  ✓ {table}: Accessible (row count check passed)")
+                
+        except Exception as e:
+            results[table] = False
+            logger.error(f"  ✗ {table}: Not accessible - {str(e)}")
+    
+    return results
+
+async def run_diagnostic_tests(engine: AsyncEngine):
+    """
+    Run comprehensive diagnostic tests on the database and agent setup.
+    
+    Args:
+        engine: SQLAlchemy async engine
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("RUNNING DIAGNOSTIC TESTS")
+    logger.info("=" * 80 + "\n")
+    
+    # Test 1: Basic Connection
+    connection_ok = await test_database_connection(engine)
+    
+    # Test 2: Schema Access
+    schema_results = await test_schema_access(engine)
+    
+    # Test 3: Sample Query
+    logger.info("\nTesting sample query execution...")
+    try:
+        async with engine.connect() as conn:
+            query = "SELECT symbol, company_name_en FROM dim_company WHERE is_current = 1 LIMIT 5"
+            result = await conn.execute(text(query))
+            rows = result.fetchall()
+            
+            logger.info(f"Sample query returned {len(rows)} companies:")
+            for row in rows:
+                logger.info(f"  - {row[0]}: {row[1]}")
+                
+    except Exception as e:
+        logger.error(f"Sample query failed: {str(e)}")
+    
+    # Summary
+    logger.info("\n" + "=" * 80)
+    logger.info("DIAGNOSTIC SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Connection Status: {'✓ OK' if connection_ok else '✗ FAILED'}")
+    
+    accessible_tables = sum(1 for v in schema_results.values() if v)
+    total_tables = len(schema_results)
+    logger.info(f"Schema Access: {accessible_tables}/{total_tables} tables accessible")
+    
+    logger.info("=" * 80 + "\n")
+
+# =============================================================================
+# 6. Export Functions
+# =============================================================================
+__all__ = [
+    'financial_agent',
+    'FinancialDeps',
+    'test_database_connection',
+    'test_schema_access',
+    'run_diagnostic_tests'
+]
