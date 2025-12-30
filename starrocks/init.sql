@@ -1,4 +1,3 @@
-
 CREATE DATABASE IF NOT EXISTS analytics;
 USE analytics;
 
@@ -17,7 +16,8 @@ CREATE TABLE IF NOT EXISTS dim_company (
     foreign_room        DECIMAL(5, 4) DEFAULT "0",
     is_active           TINYINT DEFAULT "1",
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_company_symbol (symbol) USING BITMAP
 ) ENGINE = OLAP
 PRIMARY KEY (company_key)
 DISTRIBUTED BY HASH(company_key) BUCKETS 4
@@ -28,8 +28,6 @@ PROPERTIES (
     "compression" = "LZ4"
 );
 
-CREATE INDEX idx_company_symbol ON dim_company (symbol) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS dim_period (
     period_key          BIGINT NOT NULL,
     year                SMALLINT NOT NULL,
@@ -38,7 +36,9 @@ CREATE TABLE IF NOT EXISTS dim_period (
     start_date          DATE,
     end_date            DATE,
     is_latest_quarter   TINYINT DEFAULT "0",
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_period_year (year) USING BITMAP,
+    INDEX idx_period_quarter (quarter) USING BITMAP
 ) ENGINE = OLAP
 PRIMARY KEY (period_key)
 DISTRIBUTED BY HASH(period_key) BUCKETS 4
@@ -46,9 +46,6 @@ PROPERTIES (
     "replication_num" = "1",
     "storage_format" = "DEFAULT"
 );
-
-CREATE INDEX idx_period_year ON dim_period (year) USING BITMAP;
-CREATE INDEX idx_period_quarter ON dim_period (quarter) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS dim_period_mapping (
     current_period_key  BIGINT NOT NULL,
@@ -66,7 +63,6 @@ CREATE TABLE IF NOT EXISTS fact_income_statement (
     company_key                     BIGINT NOT NULL,
     period_key                      BIGINT NOT NULL,
     report_date                     DATE NOT NULL,
-    
     revenue                         DECIMAL(24, 2) DEFAULT "0",
     cogs                            DECIMAL(24, 2) DEFAULT "0",
     gross_profit                    DECIMAL(24, 2) DEFAULT "0",
@@ -86,7 +82,9 @@ CREATE TABLE IF NOT EXISTS fact_income_statement (
     depreciation_amortization_total DECIMAL(24, 2) DEFAULT "0",
     ebit                            DECIMAL(24, 2) DEFAULT "0",
     raw_json                        JSON,
-    created_at                      DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at                      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_is_company (company_key) USING BITMAP,
+    INDEX idx_is_period (period_key) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, period_key, report_date)
 PARTITION BY RANGE(report_date) () 
@@ -103,14 +101,10 @@ PROPERTIES (
     "dynamic_partition.buckets" = "8"
 );
 
-CREATE INDEX idx_is_company ON fact_income_statement (company_key) USING BITMAP;
-CREATE INDEX idx_is_period ON fact_income_statement (period_key) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS fact_balance_sheet (
     company_key                 BIGINT NOT NULL,
     period_key                  BIGINT NOT NULL,
     report_date                 DATE NOT NULL,
-    
     cash                        DECIMAL(24, 2) DEFAULT "0",
     short_term_invest           DECIMAL(24, 2) DEFAULT "0",
     receivables                 DECIMAL(24, 2) DEFAULT "0",
@@ -120,7 +114,6 @@ CREATE TABLE IF NOT EXISTS fact_balance_sheet (
     lease_assets                DECIMAL(24, 2) DEFAULT "0",
     intangible_assets           DECIMAL(24, 2) DEFAULT "0",
     total_assets                DECIMAL(24, 2) DEFAULT "0",
-    
     payables                    DECIMAL(24, 2) DEFAULT "0",
     short_term_debt             DECIMAL(24, 2) DEFAULT "0",
     lease_liabilities_current   DECIMAL(24, 2) DEFAULT "0",
@@ -128,14 +121,14 @@ CREATE TABLE IF NOT EXISTS fact_balance_sheet (
     lease_liabilities_long      DECIMAL(24, 2) DEFAULT "0",
     total_current_liab          DECIMAL(24, 2) DEFAULT "0",
     total_liabilities           DECIMAL(24, 2) DEFAULT "0",
-    
     share_capital               DECIMAL(24, 2) DEFAULT "0",
     retained_earnings           DECIMAL(24, 2) DEFAULT "0",
     total_equity                DECIMAL(24, 2) DEFAULT "0",
     bvps                        DECIMAL(18, 4) DEFAULT "0",
-    
     raw_json                    JSON,
-    created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_bs_company (company_key) USING BITMAP,
+    INDEX idx_bs_period (period_key) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, period_key, report_date)
 PARTITION BY RANGE(report_date) () 
@@ -152,20 +145,15 @@ PROPERTIES (
     "dynamic_partition.buckets" = "8"
 );
 
-CREATE INDEX idx_bs_company ON fact_balance_sheet (company_key) USING BITMAP;
-CREATE INDEX idx_bs_period ON fact_balance_sheet (period_key) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS fact_cash_flow (
     company_key                 BIGINT NOT NULL,
     period_key                  BIGINT NOT NULL,
     report_date                 DATE NOT NULL,
-    
     cfo                         DECIMAL(24, 2) DEFAULT "0",
     depreciation                DECIMAL(24, 2) DEFAULT "0",
     cfi                         DECIMAL(24, 2) DEFAULT "0",
     capex                       DECIMAL(24, 2) DEFAULT "0",
     acquisitions                DECIMAL(24, 2) DEFAULT "0",
-    
     cff                         DECIMAL(24, 2) DEFAULT "0",
     dividends_paid              DECIMAL(24, 2) DEFAULT "0",
     debt_issued                 DECIMAL(24, 2) DEFAULT "0",
@@ -173,11 +161,12 @@ CREATE TABLE IF NOT EXISTS fact_cash_flow (
     lease_payment_interest      DECIMAL(24, 2) DEFAULT "0",
     lease_payment_principal     DECIMAL(24, 2) DEFAULT "0",
     equity_issued               DECIMAL(24, 2) DEFAULT "0",
-    
     fcf                         DECIMAL(24, 2) DEFAULT "0",
     net_change                  DECIMAL(24, 2) DEFAULT "0",
     raw_json                    JSON,
-    created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cf_company (company_key) USING BITMAP,
+    INDEX idx_cf_period (period_key) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, period_key, report_date)
 PARTITION BY RANGE(report_date) () 
@@ -194,13 +183,9 @@ PROPERTIES (
     "dynamic_partition.buckets" = "8"
 );
 
-CREATE INDEX idx_cf_company ON fact_cash_flow (company_key) USING BITMAP;
-CREATE INDEX idx_cf_period ON fact_cash_flow (period_key) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS fact_daily_market (
     company_key             BIGINT NOT NULL,
     date                    DATE NOT NULL,
-    
     open                    DECIMAL(18, 2) DEFAULT "0",
     high                    DECIMAL(18, 2) DEFAULT "0",
     low                     DECIMAL(18, 2) DEFAULT "0",
@@ -216,7 +201,9 @@ CREATE TABLE IF NOT EXISTS fact_daily_market (
     foreign_net_buy         DECIMAL(24, 2) DEFAULT "0",
     room_left               DECIMAL(5, 4) DEFAULT "0",
     margin_ratio            DECIMAL(5, 4) DEFAULT "0",
-    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_market_company (company_key) USING BITMAP,
+    INDEX idx_market_date (date) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, date)
 PARTITION BY RANGE(date) () 
@@ -233,13 +220,9 @@ PROPERTIES (
     "dynamic_partition.buckets" = "16"
 );
 
-CREATE INDEX idx_market_company ON fact_daily_market (company_key) USING BITMAP;
-CREATE INDEX idx_market_date ON fact_daily_market (date) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS fact_risk_metrics (
     company_key             BIGINT NOT NULL,
     date                    DATE NOT NULL,
-    
     beta                    DECIMAL(8, 4) DEFAULT "0",
     volatility_30d          DECIMAL(8, 4) DEFAULT "0",
     volatility_90d          DECIMAL(8, 4) DEFAULT "0",
@@ -251,7 +234,9 @@ CREATE TABLE IF NOT EXISTS fact_risk_metrics (
     return_1y               DECIMAL(10, 6) DEFAULT "0",
     volume_avg_30d          DECIMAL(20, 2) DEFAULT "0",
     volume_avg_90d          DECIMAL(20, 2) DEFAULT "0",
-    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_risk_company (company_key) USING BITMAP,
+    INDEX idx_risk_date (date) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, date)
 PARTITION BY RANGE(date) () 
@@ -267,9 +252,6 @@ PROPERTIES (
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "16"
 );
-
-CREATE INDEX idx_risk_company ON fact_risk_metrics (company_key) USING BITMAP;
-CREATE INDEX idx_risk_date ON fact_risk_metrics (date) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS dim_macro_indicator (
     indicator_key       BIGINT NOT NULL,
@@ -282,7 +264,8 @@ CREATE TABLE IF NOT EXISTS dim_macro_indicator (
     source              VARCHAR(100),
     category            VARCHAR(50),
     is_active           TINYINT DEFAULT "1",
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_indicator_code (indicator_code) USING BITMAP
 ) ENGINE = OLAP
 PRIMARY KEY (indicator_key)
 DISTRIBUTED BY HASH(indicator_key) BUCKETS 4
@@ -291,18 +274,17 @@ PROPERTIES (
     "storage_format" = "DEFAULT"
 );
 
-CREATE INDEX idx_indicator_code ON dim_macro_indicator (indicator_code) USING BITMAP;
-
 CREATE TABLE IF NOT EXISTS fact_macro_timeseries (
     indicator_key       BIGINT NOT NULL,
     date                DATE NOT NULL,
-    
     value               DECIMAL(24, 4) DEFAULT "0",
     yoy                 DECIMAL(10, 4) DEFAULT "0",
     mom                 DECIMAL(10, 4) DEFAULT "0",
     qoq                 DECIMAL(10, 4) DEFAULT "0",
     note                VARCHAR(500),
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_macro_indicator (indicator_key) USING BITMAP,
+    INDEX idx_macro_date (date) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (indicator_key, date)
 PARTITION BY RANGE(date) () 
@@ -318,9 +300,6 @@ PROPERTIES (
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "8"
 );
-
-CREATE INDEX idx_macro_indicator ON fact_macro_timeseries (indicator_key) USING BITMAP;
-CREATE INDEX idx_macro_date ON fact_macro_timeseries (date) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS fact_bond_data (
     bond_key            BIGINT NOT NULL,
@@ -339,7 +318,8 @@ CREATE TABLE IF NOT EXISTS fact_bond_data (
     duration            DECIMAL(10, 4) DEFAULT "0",
     modified_duration   DECIMAL(10, 4) DEFAULT "0",
     convexity           DECIMAL(12, 6) DEFAULT "0",
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_bond_company (company_key) USING BITMAP
 ) ENGINE = OLAP
 PRIMARY KEY (bond_key)
 DISTRIBUTED BY HASH(bond_key) BUCKETS 4
@@ -347,8 +327,6 @@ PROPERTIES (
     "replication_num" = "1",
     "storage_format" = "DEFAULT"
 );
-
-CREATE INDEX idx_bond_company ON fact_bond_data (company_key) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS fact_forecast (
     company_key         BIGINT NOT NULL,
@@ -362,7 +340,8 @@ CREATE TABLE IF NOT EXISTS fact_forecast (
     source              VARCHAR(50),
     model_version       VARCHAR(50),
     note                VARCHAR(500),
-    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_forecast_company (company_key) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, year, quarter, scenario, kpi)
 DISTRIBUTED BY HASH(company_key) BUCKETS 4
@@ -370,8 +349,6 @@ PROPERTIES (
     "replication_num" = "1",
     "storage_format" = "DEFAULT"
 );
-
-CREATE INDEX idx_forecast_company ON fact_forecast (company_key) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS fact_budget (
     company_key         BIGINT NOT NULL,
@@ -417,7 +394,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     quarter                 TINYINT NOT NULL,
     report_date             DATE NOT NULL,
     price                   DECIMAL(18, 2) DEFAULT "0",
-    
     pe_ttm                  DECIMAL(10, 4) DEFAULT "0",
     pb                      DECIMAL(10, 4) DEFAULT "0",
     ps                      DECIMAL(10, 4) DEFAULT "0",
@@ -428,7 +404,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     market_cap_b            DECIMAL(18, 4) DEFAULT "0",
     enterprise_value        DECIMAL(26, 2) DEFAULT "0",
     dividend_yield          DECIMAL(8, 4) DEFAULT "0",
-    
     roe_ttm                 DECIMAL(10, 4) DEFAULT "0",
     roa_ttm                 DECIMAL(10, 4) DEFAULT "0",
     roic                    DECIMAL(10, 4) DEFAULT "0",
@@ -439,7 +414,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     asset_turnover          DECIMAL(10, 4) DEFAULT "0",
     equity_multiplier       DECIMAL(10, 4) DEFAULT "0",
     dupont_roe              DECIMAL(10, 4) DEFAULT "0",
-    
     revenue_growth_yoy      DECIMAL(10, 4) DEFAULT "0",
     profit_growth_yoy       DECIMAL(10, 4) DEFAULT "0",
     eps_growth_yoy          DECIMAL(10, 4) DEFAULT "0",
@@ -448,7 +422,6 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     revenue_cagr_3y         DECIMAL(10, 4) DEFAULT "0",
     profit_cagr_3y          DECIMAL(10, 4) DEFAULT "0",
     eps_cagr_3y             DECIMAL(10, 4) DEFAULT "0",
-    
     debt_to_equity          DECIMAL(10, 4) DEFAULT "0",
     debt_to_assets          DECIMAL(10, 4) DEFAULT "0",
     interest_coverage       DECIMAL(10, 4) DEFAULT "0",
@@ -458,14 +431,12 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     working_capital         DECIMAL(24, 2) DEFAULT "0",
     net_debt                DECIMAL(24, 2) DEFAULT "0",
     net_debt_to_ebitda      DECIMAL(10, 4) DEFAULT "0",
-    
     fcf_ttm                 DECIMAL(24, 2) DEFAULT "0",
     fcf_yield               DECIMAL(10, 4) DEFAULT "0",
     fcf_conversion          DECIMAL(10, 4) DEFAULT "0",
     cfo_to_revenue          DECIMAL(10, 4) DEFAULT "0",
     capex_to_revenue        DECIMAL(10, 4) DEFAULT "0",
     accrual_ratio           DECIMAL(10, 4) DEFAULT "0",
-    
     receivables_turnover    DECIMAL(10, 4) DEFAULT "0",
     inventory_turnover      DECIMAL(10, 4) DEFAULT "0",
     payables_turnover       DECIMAL(10, 4) DEFAULT "0",
@@ -473,31 +444,28 @@ CREATE TABLE IF NOT EXISTS mart_master_analysis (
     days_inventory          DECIMAL(10, 2) DEFAULT "0",
     days_payables           DECIMAL(10, 2) DEFAULT "0",
     cash_conversion_cycle   DECIMAL(10, 2) DEFAULT "0",
-    
     piotroski_f_score       TINYINT DEFAULT "0",
     altman_z_score          DECIMAL(10, 4) DEFAULT "0",
     beneish_m_score         DECIMAL(10, 4) DEFAULT "0",
     sloan_ratio             DECIMAL(10, 4) DEFAULT "0",
-    
     beta                    DECIMAL(8, 4) DEFAULT "0",
     volatility_30d          DECIMAL(8, 4) DEFAULT "0",
     volume_avg_30d          DECIMAL(20, 2) DEFAULT "0",
-    
     foreign_ownership       DECIMAL(8, 4) DEFAULT "0",
     foreign_net_buy_ttm     DECIMAL(24, 2) DEFAULT "0",
     room_left               DECIMAL(8, 4) DEFAULT "0",
-    
     roe_vs_sector           DECIMAL(10, 4) DEFAULT "0",
     margin_vs_sector        DECIMAL(10, 4) DEFAULT "0",
     pe_vs_sector            DECIMAL(10, 4) DEFAULT "0",
     growth_vs_sector        DECIMAL(10, 4) DEFAULT "0",
     sector_rank             SMALLINT DEFAULT "0",
-    
     lease_adjusted_net_debt DECIMAL(24, 2) DEFAULT "0",
     tax_shield              DECIMAL(24, 2) DEFAULT "0",
-    
     created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_mart_company (company_key) USING BITMAP,
+    INDEX idx_mart_pe (pe_ttm) USING BITMAP,
+    INDEX idx_mart_roe (roe_ttm) USING BITMAP
 ) ENGINE = OLAP
 DUPLICATE KEY (company_key, year, quarter, report_date)
 PARTITION BY RANGE(report_date) ()
@@ -513,10 +481,6 @@ PROPERTIES (
     "dynamic_partition.prefix" = "p",
     "dynamic_partition.buckets" = "16"
 );
-
-CREATE INDEX idx_mart_company ON mart_master_analysis (company_key) USING BITMAP;
-CREATE INDEX idx_mart_pe ON mart_master_analysis (pe_ttm) USING BITMAP;
-CREATE INDEX idx_mart_roe ON mart_master_analysis (roe_ttm) USING BITMAP;
 
 CREATE TABLE IF NOT EXISTS audit_log (
     log_id              BIGINT NOT NULL,
