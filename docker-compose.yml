@@ -206,6 +206,7 @@ services:
     container_name: rag_starrocks_init
     volumes:
       - ./starrocks/init.sql:/init.sql
+      - ./starrocks/gen.sql:/gen.sql
     networks:
       - rag_network
     depends_on:
@@ -228,6 +229,9 @@ services:
         
         echo "Executing init.sql..."
         mysql -h starrocks-fe -P 9030 -u root < /init.sql
+
+        echo "Executing gen.sql (Data Insertion)..."
+        mysql -h starrocks-fe -P 9030 -u root < /gen.sql
         
         echo "Initialization completed."
 
@@ -253,7 +257,7 @@ services:
       HF_HUB_CACHE: /app/cache/huggingface/hub
       TRANSFORMERS_CACHE: /app/cache/huggingface/transformers
       HF_DATASETS_CACHE: /app/cache/huggingface/datasets
-      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
       # Nếu bạn có token để tăng tốc download (nếu cần)
       HF_TOKEN: ${HF_TOKEN:-}
 
