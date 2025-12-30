@@ -593,7 +593,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip_address          VARCHAR(50),
     timestamp           DATETIME DEFAULT CURRENT_TIMESTAMP
 ) ENGINE = OLAP
-PRIMARY KEY (log_id)
+DUPLICATE KEY (log_id, user_id) -- <<< CHANGED: Using Duplicate Key (Sort Keys)
 PARTITION BY RANGE(timestamp) ()
 DISTRIBUTED BY HASH(log_id) BUCKETS 4
 PROPERTIES (
@@ -667,7 +667,6 @@ GROUP BY c.sector, m.date;
 CREATE USER IF NOT EXISTS 'rag_user'@'%' IDENTIFIED BY 'rag_password';
 GRANT SELECT, INSERT, UPDATE, DELETE ON analytics.* TO 'rag_user'@'%';
 GRANT SELECT ON information_schema.* TO 'rag_user'@'%';
-FLUSH PRIVILEGES;
 
 -- ========================================
 -- END OF FIXED SCHEMA
