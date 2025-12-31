@@ -45,13 +45,11 @@ VALUES
 
 
 INSERT INTO dim_period_mapping (current_period_key, prev_period_key, year_diff)
-SELECT 
-    p1.period_key as current_period_key,
-    p2.period_key as prev_period_key,
-    1 as year_diff
-FROM dim_period p1
-JOIN dim_period p2 ON p1.year = p2.year + 1 AND p1.quarter = p2.quarter
-WHERE p1.year > 2022;
+VALUES
+(202401, 202301, 1),
+(202402, 202302, 1),
+(202403, 202303, 1),
+(202404, 202304, 1);
 
 
 INSERT INTO fact_income_statement (company_key, period_key, report_date, revenue, cogs, gross_profit, 
