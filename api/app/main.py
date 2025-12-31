@@ -104,22 +104,15 @@ class FileUploadResponse(BaseModel):
     message: str
 
 
-# class HealthResponse(BaseModel):
-#     status: str
-#     details: dict
-
+class HealthResponse(BaseModel):
+    status: str
+    details: dict
 
 class ServiceInfo(BaseModel):
     name: str
     url: str
     description: str
     status: str
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
-    database: Optional[str] = None
 
 class AgentTestRequest(BaseModel):
     query: str
